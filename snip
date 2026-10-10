@@ -1,0 +1,14 @@
+#!/bin/sh
+# region screenshot straight to the clipboard - distinct from this dir's
+# `screenshot` tool (which saves a file); this is for "grab a bit of the
+# screen, paste it somewhere" and never touches disk.
+#
+# Needs slurp (region select) + grim (capture) + wl-copy (Wayland
+# clipboard) - all three already used elsewhere on this box.
+
+for t in slurp grim wl-copy; do
+	command -v "$t" >/dev/null 2>&1 || { echo "snip: need '$t' on PATH" >&2; exit 1; }
+done
+
+geom=$(slurp) || exit 1
+grim -g "$geom" - | wl-copy --type image/png

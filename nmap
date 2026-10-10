@@ -1,0 +1,40 @@
+#!/bin/sh
+# friendlier front end for the real nmap (on PATH as /usr/bin/nmap,
+# this script lives here, not symlinked over it - no collision in
+# practice). Presets for the scans actually reached for day to day;
+# anything else, just call real nmap directly with its full flags.
+#
+# usage: nmap                  pick a preset + target interactively
+#        nmap PRESET TARGET    skip the prompts
+#        nmap -- ARGS...       passthrough to the real /usr/bin/nmap
+
+command -v nmap >/dev/null 2>&1 || { echo "nmap: need the real nmap on PATH" >&2; exit 1; }
+REAL=$(command -v nmap)
+
+if [ "$1" = "--" ]; then
+	shift
+	exec "$REAL" "$@"
+fi
+
+preset=$1
+target=$2
+
+if [ -z "$preset" ]; then
+	echo "presets: [1] quick (top ports, fast)  [2] full TCP  [3] ping sweep (who's up)  [4] service/version detect"
+	printf "preset [1]: "
+	read -r preset
+	[ -n "$preset" ] || preset=1
+fi
+if [ -z "$target" ]; then
+	printf "target (host, CIDR, or range): "
+	read -r target
+	[ -n "$target" ] || exit 1
+fi
+
+case "$preset" in
+	1|quick) exec "$REAL" -T4 -F "$target" ;;
+	2|full)  exec "$REAL" -p- "$target" ;;
+	3|ping|sweep) exec "$REAL" -sn "$target" ;;
+	4|service|version) exec "$REAL" -sV "$target" ;;
+	*) echo "nmap: unknown preset '$preset'" >&2; exit 2 ;;
+esac

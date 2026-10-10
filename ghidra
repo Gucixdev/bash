@@ -1,0 +1,23 @@
+#!/bin/sh
+# launch Ghidra (reverse engineering), optionally straight into a
+# binary. Not installed on this box as of writing - real package is
+# `ghidra` in the official extra repo (not AUR): `sudo pacman -S ghidra`.
+#
+# usage: ghidra [FILE]   FILE is just opened in the file manager for you
+#                        to import manually - Ghidra's own project/import
+#                        flow isn't a single CLI arg, not guessing at one.
+
+bin=
+for cand in ghidraRun ghidra; do
+	command -v "$cand" >/dev/null 2>&1 && { bin=$cand; break; }
+done
+
+if [ -z "$bin" ]; then
+	echo "ghidra: not found on PATH - install with: sudo pacman -S ghidra" >&2
+	exit 1
+fi
+
+if [ -n "$1" ] && [ -f "$1" ]; then
+	echo "ghidra: opening Ghidra - import '$1' yourself via File > Import File (no single-arg CLI import worth guessing at)"
+fi
+exec "$bin"

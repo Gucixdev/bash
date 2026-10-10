@@ -1,0 +1,39 @@
+#!/bin/sh
+# quick packet capture picker: pick an interface, pick a filter preset,
+# tcpdump runs in the foreground until Ctrl-C. Not a Wireshark
+# replacement - for "what's this box actually sending right now".
+#
+# usage: sniff                 pick interface + preset interactively
+#        sniff IFACE           pick preset, that interface
+#        sniff IFACE FILTER    run directly, no prompts (raw tcpdump filter)
+
+command -v tcpdump >/dev/null 2>&1 || { echo "sniff: need 'tcpdump' on PATH (needs root/cap_net_raw to run)" >&2; exit 1; }
+
+iface=$1
+if [ -z "$iface" ]; then
+	echo "interfaces:"
+	ip -o link show 2>/dev/null | awk -F': ' '{print "  " $2}'
+	printf "interface: "
+	read -r iface
+	[ -n "$iface" ] || exit 1
+fi
+
+filter=$2
+if [ -z "$filter" ]; then
+	echo "presets: [1] everything  [2] http/https  [3] dns  [4] not ssh (your own session)"
+	printf "preset [1]: "
+	read -r choice
+	case "$choice" in
+		2) filter="port 80 or port 443" ;;
+		3) filter="port 53" ;;
+		4) filter="not port 22" ;;
+		*) filter="" ;;
+	esac
+fi
+
+echo "tcpdump -i $iface -n ${filter:-(no filter)} - Ctrl-C to stop"
+if [ -n "$filter" ]; then
+	sudo tcpdump -i "$iface" -n "$filter"
+else
+	sudo tcpdump -i "$iface" -n
+fi

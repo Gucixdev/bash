@@ -41,7 +41,10 @@ report() {
 		size=$(du -sh "$entry" 2>/dev/null | cut -f1)
 		printf '%2d) %-50s %s\n' "$i" "$entry" "${size:-?}"
 	done
-	[ "$i" -eq 0 ] && echo "nothing found outside the blocklist"
+	if [ "$i" -eq 0 ]; then
+		echo "nothing found outside the blocklist"
+	fi
+	return 0
 }
 
 case "${1:-}" in
