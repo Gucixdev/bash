@@ -6,7 +6,7 @@ instead of reimplementing it, fall back to the next-best backend when
 it is missing, and run on their own once copied out of this repo.
 
 ```sh
-git clone https://github.com/Gucixdev/setup && cd setup/bash
+git clone https://github.com/Gucixdev/bash && cd bash
 ./logcollector -n       # try one: a summary of what went wrong in the last day
 ln -s "$PWD/logcollector" ~/.local/bin/    # put any tool on PATH
 ```
