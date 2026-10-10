@@ -8,29 +8,28 @@ Pick the one you want, copy it, run it — nothing else to install first.
 
 - **Standalone by construction.** Several tools share an interactive-UI
   layer (`lib/lazytui.sh` — selection menus, previews, keybindings), but
-  no tool `source`s it at runtime. `./vendor` copies in exactly the
-  functions a tool actually calls, as a clearly-marked block, so every
-  script still runs on its own once copied elsewhere.
-- **Wrap the real thing, don't reinvent it.** `ezgh` drives `gh`,
-  `ezssh` drives real `ssh`/`scp`/`rsync`, `ezcontainers` wraps whatever
-  of Docker/Podman is actually installed. When the real tool is
-  missing, fall back to the next-best thing (curl against a public
-  REST API, a different backend) rather than failing outright.
+  no tool `source`s it at runtime. Each one carries its own copy of the
+  functions it calls, as a clearly-marked block, so every script still
+  runs on its own once copied elsewhere. `lib/lazytui.sh` is the
+  reference copy; there is no sync tool, so a fix means editing the
+  library and the blocks that need it.
+- **Wrap the real thing, don't reinvent it.** `ezcontainers` wraps
+  whatever of Docker/Podman is actually installed, `logcollector` reads
+  journalctl and falls back to `/var/log` plus `dmesg`. When the real
+  tool is missing, fall back to the next-best thing (curl against a
+  public REST API, a different backend) rather than failing outright.
 - **Fallback over hard failure.** A missing optional dependency should
   degrade gracefully with a clear message, not crash. A missing
   *required* one fails fast with the install command, not a guess.
 - **No secrets in the repo.** Tokens come from the environment
-  (`GH_TOKEN`, `HF_TOKEN` — see `.env.example`), never a committed file.
+  (`GH_TOKEN`, `HF_TOKEN` — see `.env.example`; `gitgrab` uses `GH_TOKEN` for private repos), never a committed file.
 
 ## Quick start
 
 ```sh
 cp .env.example .env    # fill in tokens if you have them, or just export them
-./ezgh                  # or any other tool below
+./logcollector -n       # or any other tool below
 ```
-
-If you edit `lib/lazytui.sh`, run `./vendor` to refresh every tool's
-copied-in block (it's idempotent — safe to run any time).
 
 ## The tools
 
@@ -41,11 +40,7 @@ copied-in block (it's idempotent — safe to run any time).
 | `ezbacksnap` | Btrfs snapshots on a schedule + a snapshot before every update, single-file restore, rotating rsync backups — a Timeshift replacement. |
 | `ezcontainers` | Terminal manager for containers/images/volumes/networks — one tool for Docker *and* Podman, drives whichever is installed. |
 | `flatseal` | Terminal manager for Flatpak apps and their permissions. |
-| `ezgh` | Browse your GitHub repos/issues/PRs/workflow runs. Uses `gh` if present, falls back to the public REST API via curl otherwise. |
-| `ezhf` | Browse the Hugging Face Hub and your local cache; same real-tool-first-curl-fallback pattern as `ezgh`. |
-| `ezlog` | Read journal/unit/kernel/plain logs with fzf, coloured by severity, live or snapshot. |
-| `ezman` | Read, write, and build this repo's own man pages from each tool's `<manwriter>` header. |
-| `ezssh` | Manage SSH hosts, tunnels, and keys; edits `~/.ssh/config` with a dated backup before every change. |
+| `ezhf` | Browse the Hugging Face Hub and your local cache; uses the real `huggingface-cli` when present, curl against the public API otherwise. |
 
 ### Standalone utilities
 
@@ -54,19 +49,18 @@ copied-in block (it's idempotent — safe to run any time).
 | `btth` | Bluetooth device picker over `bluetoothctl`. |
 | `wifi` | Wi-Fi picker — tries NetworkManager, then iwd, then wpa_supplicant. |
 | `cleaner` | System cleanup wrapping the real tool for each kind of bloat (package cache, orphans, etc.), package-manager backend auto-detected. |
-| `lock` | Screen lock via this project's own vendored `slock`. |
 | `scenario` | Keyboard/mouse macro record + playback, picks a backend (evemu, etc.) that works across X11 and Wayland. |
 | `screenshot` | Screenshot on Wayland or X11 with whatever's installed. |
 | `snip` | Region screenshot straight to the clipboard (no file written) — pairs with `screenshot`. |
 | `trash` | A real freedesktop.org Trash spec implementation (not a `trash-cli` wrapper). |
+| `gitgrab` | Download one file from a GitHub repo (URL or `owner/repo path [ref]`), no clone. `GH_TOKEN` enables private repos. |
+| `logcollector` | Support bundle for a time window: journal/kernel/failed units/package history/disk+memory, secrets redacted, one archive plus a summary of the most repeated errors. |
+| `manwriter` | Turn a script's `<manwriter>` header comment into a man page on demand (`manwriter new` writes a skeleton). Nothing generated is committed. |
 | `todo` | Minimal todo.txt-convention task capture. |
-| `refreshfork` | Bring a fork up to date with upstream, showing the diff before touching anything. |
 | `bdfeditor` | Terminal editor for BDF bitmap fonts (Python). |
-| `ghidra` | Launches Ghidra; tells you the real install command if it's missing. |
 | `metadata_cleaner` | Strip EXIF/metadata from a file — prefers `mat2`/`exiftool`, falls back to ffmpeg/ImageMagick. |
 | `nmap` | Friendlier presets over real `nmap` (quick/full/ping-sweep/service-detect); `nmap -- ARGS` passes straight through. |
 | `sniff` | Quick `tcpdump` capture with interface/filter presets. |
-| `ezlink` | Finds config sitting loose outside this repo's dotfiles pattern and offers to move+symlink it in. |
 
 ### `installer/`
 
@@ -88,8 +82,8 @@ need root/network/a display to test honestly.
 
 ```
 ez*, and the standalone utilities   — the tools themselves
-lib/                                 — lt_* UI helpers, vendored in by ./vendor
-docs/                                — man pages, generated by ezman from each tool's <manwriter> header
+lib/                                 — lt_* UI helpers (reference copy of what tools carry)
+docs/                                — plain-text notes for the lib/ helpers
 installer/                           — one-shot clone+build+run scripts
 tests/                               — bats
 ```

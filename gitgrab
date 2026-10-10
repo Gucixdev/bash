@@ -1,0 +1,108 @@
+#!/bin/sh
+# <manwriter>
+# download one file from a GitHub repo - no clone, no history, just
+# the file. Takes either a github.com URL (blob/raw) or owner/repo plus
+# a path inside it. Private repos work when GH_TOKEN is set; never
+# overwrites an existing file unless told to.
+#
+# usage: gitgrab URL [-o OUT] [-f]
+#        gitgrab OWNER/REPO PATH [REF] [-o OUT] [-f]
+#
+#   URL    https://github.com/o/r/blob/REF/PATH  or a raw.githubusercontent.com URL
+#   REF    branch, tag or commit (default: the repo's default branch)
+#   -o OUT where to write it (default: its basename in the current
+#          directory; "-" prints to stdout)
+#   -f     overwrite OUT if it exists
+# </manwriter>
+
+out=""
+force=0
+args=""
+n=0
+
+# options may come before or after the positional arguments
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	-o) out="$2"; shift 2 ;;
+	-f) force=1; shift ;;
+	-h) sed -n '/<manwriter>/,/<\/manwriter>/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'
+	    exit 0 ;;
+	-) args="$args
+$1"; n=$((n + 1)); shift ;;
+	-*) echo "gitgrab: unknown option $1" >&2; exit 2 ;;
+	*) args="$args
+$1"; n=$((n + 1)); shift ;;
+	esac
+done
+
+if [ "$n" -lt 1 ] || [ "$n" -gt 3 ]; then
+	echo "usage: gitgrab URL [-o OUT] [-f]  |  gitgrab OWNER/REPO PATH [REF] [-o OUT] [-f]" >&2
+	exit 2
+fi
+
+a1="$(printf '%s\n' "$args" | sed -n 2p)"
+a2="$(printf '%s\n' "$args" | sed -n 3p)"
+a3="$(printf '%s\n' "$args" | sed -n 4p)"
+
+case "$a1" in
+https://github.com/*/blob/* | http://github.com/*/blob/*)
+	rest="${a1#*github.com/}"
+	owner="${rest%%/*}"; rest="${rest#*/}"
+	repo="${rest%%/*}"; rest="${rest#*/blob/}"
+	ref="${rest%%/*}"
+	path="${rest#*/}"
+	url="https://raw.githubusercontent.com/$owner/$repo/$ref/$path" ;;
+https://raw.githubusercontent.com/* | https://github.com/*/raw/*)
+	url="$a1" ;;
+*/*)
+	if [ -z "$a2" ]; then
+		echo "gitgrab: OWNER/REPO needs a PATH inside the repo" >&2
+		exit 2
+	fi
+	url="https://raw.githubusercontent.com/$a1/${a3:-HEAD}/$a2" ;;
+*)
+	echo "gitgrab: want a github.com URL or OWNER/REPO PATH, got '$a1'" >&2
+	exit 2 ;;
+esac
+
+[ -n "$out" ] || out="$(basename "${url%%\?*}")"
+
+if [ "$out" != "-" ] && [ -e "$out" ] && [ "$force" -ne 1 ]; then
+	echo "gitgrab: $out exists (use -f to overwrite)" >&2
+	exit 1
+fi
+
+# fetch URL -> stdout; token goes in a header, never on the command line URL
+fetch() {
+	if command -v curl >/dev/null 2>&1; then
+		if [ -n "$GH_TOKEN" ]; then
+			curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$1"
+		else
+			curl -fsSL "$1"
+		fi
+	elif command -v wget >/dev/null 2>&1; then
+		if [ -n "$GH_TOKEN" ]; then
+			wget -qO- --header="Authorization: Bearer $GH_TOKEN" "$1"
+		else
+			wget -qO- "$1"
+		fi
+	else
+		echo "gitgrab: need curl or wget (pacman -S curl)" >&2
+		return 127
+	fi
+}
+
+if [ "$out" = "-" ]; then
+	fetch "$url" || { echo "gitgrab: could not fetch $url" >&2; exit 1; }
+	exit 0
+fi
+
+tmp="$out.gitgrab.$$"
+if fetch "$url" > "$tmp" && [ -s "$tmp" ]; then
+	mv -f "$tmp" "$out"
+	echo "$out"
+else
+	rm -f "$tmp"
+	echo "gitgrab: could not fetch $url (wrong path/ref, or private repo without GH_TOKEN)" >&2
+	exit 1
+fi

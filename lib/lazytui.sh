@@ -1,39 +1,13 @@
 #!/bin/sh
-# <manwriter>
-# ezlog - read any log with fzf: journal, units, kernel and plain log
-# files, coloured by severity, live or as a snapshot. Built on
-# lib/lazytui.sh; replaces the old `log`.
+# lazytui.sh - the lt_* terminal-UI helpers (selection menus with
+# preview and key hints, prompts, confirmations) that the interactive
+# tools share. Tools never source this file at run time: each carries
+# a marked block with the functions it calls, so every tool still runs
+# standalone. This is the reference copy of those blocks.
 #
-#   ezlog                    pick a source, then read it
-#   ezlog SOURCE [MODE] [LEVEL]
-#
-# Sources are listed in one searchable list: the systemd journal (this
-# boot, everything, previous boot, errors, user), the kernel, every
-# service unit, and log files found under LOG_DIRS (top of the script).
-# Without systemd only the files (and dmesg) are offered, so it works
-# everywhere. Compressed logs (.gz) open as snapshots.
-#
-# In the reader, type to filter (exact match), arrows scroll, Ctrl-/ shows
-# the whole line wrapped, Tab marks lines and Ctrl-Y copies them. MODE is
-# static (last LINES_MAX lines) or follow (live, Ctrl-F toggles). LEVEL
-# keeps only errors (Alt-E), warnings and above (Alt-W) or everything
-# (Alt-A). Lines mentioning error/fail/fatal/panic/denied are red,
-# warn/timeout/deprecated yellow, started/connected/success green.
-#
-# @flag SOURCE:journal:boot, journal:all, journal:prev, journal:err, journal:user, kernel, unit:NAME or file:PATH
-# @flag MODE:static or follow
-# @flag LEVEL:all, warn or err
-# </manwriter>
+# Public:   lt_select lt_input lt_confirm lt_wizard lt_realbin
+# Internal: _lt_hint _lt_trim _lt_script _lt_fallback
 
-# ---- edit me ---------------------------------------------------------
-LINES_MAX="${EZLOG_LINES:-5000}"                        # lines loaded per source
-LOG_DIRS="${EZLOG_DIRS:-/var/log $HOME/.local/state}"   # searched for *.log files
-LOG_DEPTH="${EZLOG_DEPTH:-2}"
-# ----------------------------------------------------------------------
-
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-SELF=$HERE/$(basename -- "$0")
-# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
 # _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
 # (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
 # (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
@@ -61,6 +35,18 @@ _lt_trim() { printf %s "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 
 # _lt_script FILE CMD -> FILE runs CMD "$@" (keeps quoting out of fzf binds)
 _lt_script() { printf '%s "$@"\n' "$2" >"$1"; }
+
+lt_confirm() {   # lt_confirm "question" -> 0 on y
+	printf '%s [y/N] ' "$1" >&2
+	read -r _lt_a || return 1
+	case $_lt_a in y | Y | yes | YES | t | T | tak) return 0 ;; *) return 1 ;; esac
+}
+
+lt_input() {   # lt_input "prompt" [default] -> stdout
+	printf '%s%s: ' "$1" "${2:+ [$2]}" >&2
+	read -r _lt_a || return 1
+	printf '%s\n' "${_lt_a:-${2:-}}"
+}
 
 lt_select() {
 	_lt_mode=raw _lt_refresh=${LT_REFRESH:-0} _lt_seed= _lt_more= _lt_reload= _lt_preview= _lt_keys= \
@@ -217,140 +203,58 @@ _lt_fallback() {
 	for _lt_i in $_lt_ans; do sed -n "${_lt_i}p" "$_lt_tmp/fb"; done | cut -f"$_lt_key"
 }
 
-# <<< lazytui <<<
-have() { command -v "$1" >/dev/null 2>&1; }
-ERE_ERR='error|fail|fatal|panic|critical|denied|segfault|oops|traceback|exception'
-ERE_WARN="warn|timeout|timed out|deprecated|unable|refused|$ERE_ERR"
-
-# _color: severity colouring, one awk pass
-_color() {
-	awk -v err="$ERE_ERR" -v warn='warn|timeout|timed out|deprecated|unable|refused' -v ok='started|connected|success|listening|ready|reached target' '
-	{
-		l = tolower($0); c = ""
-		if (l ~ err) c = "\033[31m"
-		else if (l ~ warn) c = "\033[33m"
-		else if (l ~ ok) c = "\033[32m"
-		if (c != "") printf "%s%s\033[0m\n", c, $0; else print
-		fflush()   # live sources: do not sit on lines in a pipe buffer
-	}'
-}
-
-# _raw SPEC MODE LEVEL -> the log lines, uncoloured
-_raw() {
-	spec=$1 mode=${2:-static} level=${3:-all}
-	n=$LINES_MAX
-	case $spec in
-	journal:* | unit:* | kernel)
-		if ! have journalctl; then
-			[ "$spec" = kernel ] || { echo "ezlog: journalctl not found (no systemd)" >&2; return 1; }
-			if [ "$mode" = follow ]; then dmesg -w 2>/dev/null; else dmesg -T 2>/dev/null | tail -n "$n"; fi
-			return
+# lt_wizard: steps on stdin, one per line:
+#   var|prompt              free text
+#   var|prompt|a,b,c        pick one (fzf)
+#   var|prompt|a,b,c|def    same, with default
+# prints eval-able VAR='value' lines; Esc goes back a step, Esc on the
+# first step cancels (return 1). Usage: eval "$(lt_wizard <<EOF ... EOF)"
+lt_wizard() {
+	_lt_wd=$(mktemp -d) || return 1
+	cat >"$_lt_wd/steps"
+	_lt_total=$(wc -l <"$_lt_wd/steps")
+	_lt_i=1
+	while [ "$_lt_i" -le "$_lt_total" ]; do
+		IFS='|' read -r _lt_var _lt_q _lt_ch _lt_def <<EOF
+$(sed -n "${_lt_i}p" "$_lt_wd/steps")
+EOF
+		_lt_prev=
+		[ -f "$_lt_wd/v.$_lt_i" ] && _lt_prev=$(cat "$_lt_wd/v.$_lt_i")
+		_lt_hdr="[$_lt_i/$_lt_total] $_lt_q"
+		if [ -n "$_lt_ch" ]; then
+			_lt_pick=${_lt_prev:-$_lt_def}
+			_lt_ans=$( { [ -n "$_lt_pick" ] && printf '%s\n' "$_lt_pick"; printf '%s\n' "$_lt_ch" | tr ',' '\n' | grep -vxF -- "$_lt_pick"; } | fzf --layout=reverse-list --header="$_lt_hdr" --footer='↑↓ move · enter accept · esc back' --no-multi) || _lt_ans=__back__
+		else
+			_lt_ans=$(printf '' | fzf --print-query --no-info --bind=enter:accept-or-print-query --header="$_lt_hdr" --footer='type · enter accept · esc back' --query="${_lt_prev:-$_lt_def}" | head -1) || _lt_ans=__back__
 		fi
-		set -- -o short-iso --no-pager
-		case $spec in
-			journal:boot) set -- "$@" -b ;;
-			journal:prev) set -- "$@" -b -1 ;;
-			journal:err)  set -- "$@" -b -p err ;;
-			journal:user) set -- "$@" --user ;;
-			journal:all)  ;;
-			unit:*)       set -- "$@" -u "${spec#unit:}" ;;
-			kernel)       set -- "$@" -k -b ;;
-		esac
-		case $level in err) [ "$spec" = journal:err ] || set -- "$@" -p err ;; warn) set -- "$@" -p warning ;; esac
-		if [ "$mode" = follow ]; then journalctl "$@" -n "$n" -f; else journalctl "$@" -n "$n"; fi ;;
-	file:*)
-		f=${spec#file:}
-		[ -r "$f" ] || { echo "ezlog: cannot read $f (try sudo)" >&2; return 1; }
-		{
-			case $f in
-				*.gz) zcat "$f" | tail -n "$n" ;;
-				*)    if [ "$mode" = follow ]; then tail -n "$n" -F "$f"; else tail -n "$n" "$f"; fi ;;
-			esac
-		} | case $level in
-			err)  grep --line-buffered -iE "$ERE_ERR" ;;
-			warn) grep --line-buffered -iE "$ERE_WARN" ;;
-			*)    cat ;;
-		esac ;;
-	*) echo "ezlog: unknown source $spec" >&2; return 1 ;;
-	esac
-}
-
-_copy() {
-	if [ -n "${WAYLAND_DISPLAY:-}" ] && have wl-copy; then wl-copy
-	elif have xclip; then xclip -selection clipboard
-	elif have xsel; then xsel -bi
-	else cat >/dev/null; fi
-}
-
-_view() {
-	spec=$1 mode=${2:-static} level=${3:-all}
-	case $mode in follow) other=static ;; *) other=follow ;; esac
-	hdr="$spec · $mode · $level"
-	bar1='type to filter · ↑↓ scroll · tab mark · ^/ full line · esc quit'
-	bar2="^F $other · M-A all · M-W warn+ · M-E errors · ^Y copy marked · M-B sources"
-	# The producer runs in its own session so it can be killed as a whole
-	# when fzf exits; otherwise `tail -F` / `journalctl -f` would outlive it.
-	fifo=$(mktemp -u) && mkfifo "$fifo" || exit 1
-	if have setsid; then setsid "$SELF" _stream "$spec" "$mode" "$level" >"$fifo" 2>&1 &
-	else "$SELF" _stream "$spec" "$mode" "$level" >"$fifo" 2>&1 & fi
-	prod=$!
-	fzf --ansi --tac --no-sort --exact --multi \
-		--header="$hdr" --footer="$bar1
-$bar2" \
-		--preview='printf "%s\n" {}' --preview-window='down,4,wrap,hidden' \
-		--bind='ctrl-/:toggle-preview' \
-		--bind="ctrl-f:become(kill -- -$prod 2>/dev/null; rm -f $fifo; $SELF _view '$spec' $other $level)" \
-		--bind="alt-a:become(kill -- -$prod 2>/dev/null; rm -f $fifo; $SELF _view '$spec' $mode all)" \
-		--bind="alt-w:become(kill -- -$prod 2>/dev/null; rm -f $fifo; $SELF _view '$spec' $mode warn)" \
-		--bind="alt-e:become(kill -- -$prod 2>/dev/null; rm -f $fifo; $SELF _view '$spec' $mode err)" \
-		--bind="alt-b:become(kill -- -$prod 2>/dev/null; rm -f $fifo; $SELF)" \
-		--bind="ctrl-y:execute-silent(printf '%s\n' {+} | $SELF _copy)" \
-		<"$fifo" >/dev/null
-	kill -- "-$prod" 2>/dev/null || kill "$prod" 2>/dev/null
-	rm -f "$fifo"
-	exit 0
-}
-
-# _sources -> KEY<TAB>display, one per source
-_sources() {
-	C=$(printf '\033[36m'); G=$(printf '\033[32m'); D=$(printf '\033[90m'); Z=$(printf '\033[0m')
-	if have journalctl; then
-		printf '%s\t%s%-8s%s %s\n' journal:boot "$C" journal "$Z" "this boot" \
-			journal:all "$C" journal "$Z" "everything" \
-			journal:prev "$C" journal "$Z" "previous boot" \
-			journal:err "$C" journal "$Z" "errors, this boot" \
-			journal:user "$C" journal "$Z" "user session" \
-			kernel "$C" kernel "$Z" "kernel messages, this boot"
-		if have systemctl; then
-			systemctl list-units --type=service --all --no-legend --plain 2>/dev/null | awk -v g="$G" -v d="$D" -v z="$Z" '{
-				c = ($3 == "active") ? g : d
-				printf "unit:%s\t%sunit    %s %-40.40s %s%s%s\n", $1, "\033[35m", z, $1, c, $3 " " $4, z }'
+		if [ "$_lt_ans" = __back__ ]; then
+			[ "$_lt_i" -eq 1 ] && { rm -rf "$_lt_wd"; return 1; }
+			_lt_i=$((_lt_i - 1)); continue
 		fi
-	else
-		printf '%s\t%s%-8s%s %s\n' kernel "$C" kernel "$Z" "dmesg"
-	fi
-	for d in $LOG_DIRS; do
-		[ -d "$d" ] || continue
-		find "$d" -maxdepth "$LOG_DEPTH" -type f \( -name '*.log' -o -name '*.log.*' -o -name syslog -o -name messages \) -readable -size +0 2>/dev/null
-	done | sort -u | while read -r f; do
-		printf 'file:%s\t\033[33mfile    \033[0m %s\n' "$f" "$f"
+		printf '%s' "$_lt_ans" >"$_lt_wd/v.$_lt_i"
+		_lt_i=$((_lt_i + 1))
 	done
+	_lt_i=1
+	while [ "$_lt_i" -le "$_lt_total" ]; do
+		_lt_var=$(sed -n "${_lt_i}p" "$_lt_wd/steps" | cut -d'|' -f1)
+		printf "%s='%s'\n" "$_lt_var" "$(sed "s/'/'\\\\''/g" "$_lt_wd/v.$_lt_i")"
+		_lt_i=$((_lt_i + 1))
+	done
+	rm -rf "$_lt_wd"
 }
 
-case ${1:-} in
-	_view)    shift; _view "$@" ;;
-	_copy)    _copy; exit 0 ;;
-	_stream)  shift; _raw "$@" | _color; exit 0 ;;
-	_sources) _sources; exit 0 ;;
-	_preview) shift; LINES_MAX=60 _raw "$1" static all 2>&1 | _color; exit 0 ;;
-	"")       ;;
-	-h | --help) sed -n '2,/^# <\/manwriter>/p' "$0" | sed 's/^# \{0,1\}//; /manwriter>/d'; exit 0 ;;
-	*)        _view "$@" ;;
-esac
+# lt_realbin NAME -> path of the real NAME in PATH, skipping this script
+# itself. For tools that wrap a program of the same name (a script called
+# docker or flatpak) so they never call themselves.
+lt_realbin() {
+	_lt_old=$IFS; IFS=:
+	for _lt_d in $PATH; do
+		IFS=$_lt_old
+		_lt_c=$_lt_d/$1
+		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && ! [ "$_lt_c" -ef "$0" ]; then printf '%s\n' "$_lt_c"; return 0; fi
+		IFS=:
+	done
+	IFS=$_lt_old
+	return 1
+}
 
-LT_KEYS="enter: >$SELF _view                                          # Read
-alt-f: >sh -c 'exec \"\$0\" _view \"\$1\" follow' $SELF               # Follow
-alt-e: >sh -c 'exec \"\$0\" _view \"\$1\" static err' $SELF           # Errors only"
-export LT_KEYS
-lt_select --seed "$SELF _sources" --nth 2 --header 'log sources' --prompt 'source> ' \
-	--preview "$SELF _preview" --keys - >/dev/null || true

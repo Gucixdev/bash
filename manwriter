@@ -1,0 +1,113 @@
+#!/bin/sh
+# <manwriter>
+# turn the comment block between "# <manwriter>" and "# </manwriter>"
+# at the top of a script into a real man(7) page, so the header is
+# the single source of truth for what a tool does. Lines starting with
+# "@flag NAME:description" become entries under OPTIONS; the first line
+# is taken as the one-line NAME description.
+#
+# usage: manwriter [-d DIR] [-s SECTION] FILE...
+#        manwriter new NAME SECTION "description" ["FLAG:desc" ...]
+#
+#   -d DIR      write NAME.SECTION into DIR (default: current directory)
+#   -s SECTION  man section (default 1)
+#   new         write a skeleton page by hand, no script needed
+# </manwriter>
+
+# page OUT NAME SECTION DESC BODYFILE [FLAG:desc]...
+page() {
+	out=$1 name=$2 section=$3 desc=$4 bodyf=$5
+	shift 5
+	upper="$(printf %s "$name" | tr a-z A-Z)"
+	{
+		printf '.TH %s %s "%s" "" ""\n' "$upper" "$section" "$(date +%Y-%m-%d)"
+		printf '.SH NAME\n%s \\- %s\n.SH SYNOPSIS\n' "$name" "$desc"
+		if [ "$#" -eq 0 ]; then
+			printf '.B %s\n' "$name"
+		else
+			first=1
+			for spec in "$@"; do
+				[ "$first" -eq 1 ] || printf '.br\n'
+				first=0
+				printf '.B %s %s\n' "$name" "${spec%%:*}"
+			done
+		fi
+		printf '.SH DESCRIPTION\n'
+		if [ -n "$bodyf" ] && [ -s "$bodyf" ]; then
+			printf '.nf\n'
+			sed -e 's/\\/\\\\/g' -e 's/^\./\\\&./' -e "s/^'/\\\\\\&'/" "$bodyf"
+			printf '.fi\n'
+		else
+			printf 'TODO: real description here.\n'
+		fi
+		if [ "$#" -gt 0 ]; then
+			printf '.SH OPTIONS\n'
+			for spec in "$@"; do
+				printf '.TP\n.B %s\n%s\n' "${spec%%:*}" "${spec#*:}"
+			done
+		fi
+	} > "$out"
+}
+
+usage() {
+	sed -n '/<manwriter>/,/<\/manwriter>/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'
+}
+
+if [ "$1" = new ]; then
+	shift
+	if [ "$#" -lt 3 ]; then
+		echo 'usage: manwriter new NAME SECTION "description" ["FLAG:desc" ...]' >&2
+		exit 2
+	fi
+	name=$1 section=$2 desc=$3
+	shift 3
+	page "$name.$section" "$name" "$section" "$desc" "" "$@"
+	echo "$name.$section"
+	exit 0
+fi
+
+dir="."
+section=1
+while getopts d:s:h opt; do
+	case "$opt" in
+	d) dir="$OPTARG" ;;
+	s) section="$OPTARG" ;;
+	h) usage; exit 0 ;;
+	*) exit 2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+if [ "$#" -eq 0 ]; then
+	usage >&2
+	exit 2
+fi
+
+mkdir -p "$dir" || exit 1
+tmp="$(mktemp -d)" || exit 1
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+rc=0
+for f in "$@"; do
+	n="$(basename -- "$f")"
+	if [ ! -f "$f" ]; then
+		echo "manwriter: $f: no such file" >&2
+		rc=1
+		continue
+	fi
+	awk '/^# <\/manwriter>/{exit} f{sub(/^# ?/,""); print} /^# <manwriter>/{f=1}' "$f" > "$tmp/sec"
+	if [ ! -s "$tmp/sec" ]; then
+		echo "manwriter: skip $n (no <manwriter> section)" >&2
+		continue
+	fi
+	desc="$(head -n 1 "$tmp/sec" | sed -E 's/^(real )?[A-Za-z0-9_-]+ +- +//')"
+	grep '^@flag ' "$tmp/sec" | sed 's/^@flag //' > "$tmp/flags"
+	sed '1d; /^@flag /d' "$tmp/sec" | cat -s > "$tmp/body"
+	set --
+	while IFS= read -r l; do
+		set -- "$@" "$l"
+	done < "$tmp/flags"
+	page "$dir/$n.$section" "$n" "$section" "$desc" "$tmp/body" "$@"
+	echo "$dir/$n.$section"
+done
+exit "$rc"

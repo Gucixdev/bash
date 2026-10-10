@@ -1,0 +1,199 @@
+#!/bin/sh
+# <manwriter>
+# collect a support bundle from this machine for a time window: boot
+# log, warnings and errors, kernel ring buffer, failed units, package
+# manager history, core dumps, disk/memory state. Everything passes
+# through a redaction filter (tokens, passwords, private keys, auth
+# headers) before it touches disk, so the archive is safe to attach to
+# a bug report. Prints a summary: counts per severity and the most
+# repeated messages.
+#
+# Backends are picked at runtime: journalctl, else /var/log/*; dmesg
+# (or journalctl -k when the kernel buffer is restricted); pacman,
+# apt/dpkg or dnf history. A missing source is noted in the bundle
+# and skipped, never fatal.
+#
+# usage: logcollector [-s SINCE] [-o DIR] [-I] [-n]
+#
+#   -s SINCE  start of the window, anything journalctl --since takes
+#             ("2 hours ago", "yesterday", "2026-10-01"); default "1 day ago"
+#   -o DIR    write the bundle under DIR (default: current directory)
+#   -I        also redact IPv4 addresses and MAC addresses
+#   -n        print the summary only, write no archive
+# </manwriter>
+
+since="1 day ago"
+outdir="$PWD"
+redact_ip=0
+dry=0
+
+while getopts s:o:Inh opt; do
+	case "$opt" in
+	s) since="$OPTARG" ;;
+	o) outdir="$OPTARG" ;;
+	I) redact_ip=1 ;;
+	n) dry=1 ;;
+	h) sed -n '/<manwriter>/,/<\/manwriter>/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'
+	   exit 0 ;;
+	*) echo "usage: logcollector [-s SINCE] [-o DIR] [-I] [-n]" >&2
+	   exit 2 ;;
+	esac
+done
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Reads stdin, writes redacted stdout. One awk so a multi-line private
+# key block is dropped as a unit, not line by line.
+redact() {
+	awk -v ip="$redact_ip" '
+	/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { inkey = 1; print "[REDACTED private key]"; next }
+	inkey { if ($0 ~ /-----END [A-Z ]*PRIVATE KEY-----/) inkey = 0; next }
+	{
+		line = $0
+		gsub(/gh[pousr]_[A-Za-z0-9]{20,}/, "[REDACTED token]", line)
+		gsub(/github_pat_[A-Za-z0-9_]{20,}/, "[REDACTED token]", line)
+		gsub(/hf_[A-Za-z0-9]{20,}/, "[REDACTED token]", line)
+		gsub(/sk-[A-Za-z0-9_-]{20,}/, "[REDACTED token]", line)
+		gsub(/AKIA[0-9A-Z]{16}/, "[REDACTED aws key]", line)
+		gsub(/xox[abprs]-[A-Za-z0-9-]{10,}/, "[REDACTED token]", line)
+		gsub(/[Bb]earer +[A-Za-z0-9._~+\/=-]{8,}/, "Bearer [REDACTED]", line)
+		gsub(/[Aa]uthorization: *[^ ]+( +[^ ]+)?/, "Authorization: [REDACTED]", line)
+		# consume the line left to right so an already-redacted value is not matched again
+		res = ""
+		rest = line
+		while (match(rest, /([Pp]ass(word|wd)?|[Ss]ecret|[Tt]oken|[Aa]pi[_-]?[Kk]ey)[=:] *[^ &"\047]+/)) {
+			s = substr(rest, RSTART, RLENGTH)
+			sub(/[=:] *.*/, "=[REDACTED]", s)
+			res = res substr(rest, 1, RSTART - 1) s
+			rest = substr(rest, RSTART + RLENGTH)
+		}
+		line = res rest
+		gsub(/:\/\/[^\/ :@]+:[^\/ @]+@/, "://[REDACTED]@", line)
+		if (ip == 1) {
+			gsub(/[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/, "[ip]", line)
+			gsub(/[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}/, "[mac]", line)
+		}
+		print line
+	}'
+}
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/logcollector.XXXXXX")" || exit 1
+trap 'rm -rf "$work"' EXIT INT TERM
+b="$work/bundle"
+mkdir -p "$b"
+skipped="$b/SKIPPED.txt"
+: > "$skipped"
+
+# collect NAME CMD... : run CMD, redact, store as NAME; note failures
+collect() {
+	name="$1"
+	shift
+	if ! have "$1"; then
+		echo "$name: $1 not installed" >> "$skipped"
+		return 1
+	fi
+	if "$@" 2>/dev/null | redact > "$b/$name" && [ -s "$b/$name" ]; then
+		return 0
+	fi
+	rm -f "$b/$name"
+	echo "$name: no output (needs privileges, or nothing logged)" >> "$skipped"
+	return 1
+}
+
+{
+	echo "collected: $(date '+%Y-%m-%d %H:%M:%S %z')"
+	echo "window:    since $since"
+	echo "host:      $(uname -n)"
+	echo "kernel:    $(uname -sr)"
+	echo "arch:      $(uname -m)"
+	[ -r /etc/os-release ] && . /etc/os-release && echo "distro:    ${PRETTY_NAME:-unknown}"
+	echo "uptime:    $(uptime -p 2>/dev/null || uptime)"
+} > "$b/system.txt"
+
+collect disk.txt df -h
+collect memory.txt free -h
+collect block-devices.txt lsblk
+
+if have journalctl; then
+	collect boot.log journalctl -b --no-pager -o short-iso --since "$since"
+	collect warnings.log journalctl -p warning --no-pager -o short-iso --since "$since"
+	collect errors.log journalctl -p err --no-pager -o short-iso --since "$since"
+	collect kernel.log journalctl -k --no-pager -o short-iso --since "$since"
+	collect failed-units.txt systemctl --failed --no-pager --plain
+else
+	for f in /var/log/messages /var/log/syslog; do
+		if [ -r "$f" ]; then
+			redact < "$f" | tail -n 5000 > "$b/syslog.log"
+			break
+		fi
+	done
+	[ -s "$b/syslog.log" ] || echo "syslog.log: no journalctl and no readable /var/log/{messages,syslog}" >> "$skipped"
+	collect kernel.log dmesg
+fi
+# the kernel ring buffer is root-only on many systems; journalctl -k covers that case
+[ -e "$b/kernel.log" ] || collect kernel.log dmesg
+
+if have pacman && [ -r /var/log/pacman.log ]; then
+	redact < /var/log/pacman.log | tail -n 300 > "$b/package-history.log"
+elif [ -r /var/log/dpkg.log ]; then
+	redact < /var/log/dpkg.log | tail -n 300 > "$b/package-history.log"
+elif have dnf; then
+	collect package-history.log dnf history list
+fi
+
+have coredumpctl && collect coredumps.txt coredumpctl list --no-pager --since "$since"
+
+# --- summary ---------------------------------------------------------
+{
+	echo "logcollector summary (since $since)"
+	echo
+	for lvl in err warning; do
+		f="$b/$( [ "$lvl" = err ] && echo errors.log || echo warnings.log )"
+		if [ -s "$f" ]; then
+			n="$(wc -l < "$f" | tr -d ' ')"
+		else
+			n=0
+		fi
+		printf '%-8s %s lines\n' "$lvl" "$n"
+	done
+	if [ -s "$b/failed-units.txt" ]; then
+		echo
+		echo "failed units:"
+		awk '$0 ~ /\.[a-z]+ +loaded/ { sub(/^[ ●]+/, ""); print "  " $0 }' "$b/failed-units.txt" | head -n 10
+	fi
+	if [ -s "$b/errors.log" ]; then
+		echo
+		echo "most repeated errors:"
+		# drop timestamp + host, collapse digits so "pid 123" and "pid 456" group together
+		awk '{ $1 = ""; $2 = ""; print }' "$b/errors.log" \
+			| sed 's/\[[0-9]*\]//; s/[0-9][0-9]*/N/g' \
+			| sort | uniq -c | sort -rn | head -n 8 \
+			| sed 's/^ */  /'
+	fi
+	if [ -s "$skipped" ]; then
+		echo
+		echo "skipped:"
+		sed 's/^/  /' "$skipped"
+	fi
+} > "$b/SUMMARY.txt"
+[ -s "$skipped" ] || rm -f "$skipped"
+
+cat "$b/SUMMARY.txt"
+
+if [ "$dry" -eq 1 ]; then
+	exit 0
+fi
+
+mkdir -p "$outdir" || exit 1
+stamp="$(date +%Y%m%d-%H%M%S)"
+base="logcollector-$(uname -n)-$stamp"
+mv "$b" "$work/$base"
+if have zstd; then
+	arch="$outdir/$base.tar.zst"
+	tar -C "$work" -cf - "$base" | zstd -q -o "$arch"
+else
+	arch="$outdir/$base.tar.gz"
+	tar -C "$work" -czf "$arch" "$base"
+fi
+echo
+echo "bundle: $arch"
