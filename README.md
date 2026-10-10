@@ -18,7 +18,7 @@ ln -s "$PWD/logcollector" ~/.local/bin/    # put any tool on PATH
 
 - **One file, no runtime dependency on this repo.** Interactive tools
   carry the few `lt_*` UI functions they call (selection menus with
-  preview and key hints) as a marked block copied from `lib/lazytui.sh`,
+  preview and key hints) as a marked block copied from `lib/lazytui`,
   so a tool still runs after being copied to another machine.
 - **Wrap the real thing.** `ezcontainers` drives whichever of Docker and
   Podman is installed, `flatseal` drives `flatpak`, `wifi` drives
@@ -35,7 +35,7 @@ Every tool prints its header with `--help`.
 
 ## Interactive managers
 
-Built on `lib/lazytui.sh`: arrows or Tab to move, space to mark rows
+Built on `lib/lazytui`: arrows or Tab to move, space to mark rows
 like nnn, `/` to search, a key bar always showing what is available.
 
 | Tool | What it does | Needs |
@@ -65,6 +65,26 @@ like nnn, `/` to search, a key bar always showing what is available.
 | `fixmedia` | Repair broken video, audio and images into `fixed-NAME`: re-mux, then re-encode; images re-saved. `-c` only checks. |
 | `manwriter` | Turn a script's header comment into a man page: `manwriter -d man tool...`. `manwriter new` writes a skeleton. |
 
+## Libraries
+
+`lib/` holds helpers other scripts call. Each is a command, so they work
+from any language, not only sh:
+
+```sh
+settings set myapp theme dark          # ~/.config/myapp/settings, mode 600
+settings get myapp theme               # MYAPP_THEME in the environment wins
+eval "$(settings export myapp)"        # MYAPP_THEME='dark'
+
+eval "$(wizard <<'STEPS'
+name|Your name
+shell|Shell|bash,zsh,fish|zsh
+STEPS
+)"                                     # fzf if installed, numbered prompt if not
+
+evq push -q jobs "resize a.png"        # file-backed FIFO, safe for many consumers
+dspq -j 3 "$url|$dest|label"           # parallel, atomic, resumable downloads
+```
+
 ## Installers
 
 `installer/` has clone, build and run scripts for things that do not
@@ -75,10 +95,12 @@ belong on `$PATH`: `comfysetup` (ComfyUI in a minimal container),
 
 ```
 <tool>           the tools, one file each
-lib/lazytui.sh   reference copy of the lt_* UI helpers tools carry
+lib/lazytui      reference copy of the lt_* UI helpers tools carry
+lib/settings     per-app KEY=VALUE settings: get, set, unset, list, export
+lib/wizard       ask a list of questions, print answers as eval-able assignments
 lib/dspq, evq    download queue and event queue for shell scripts
 installer/       one-shot clone, build, run scripts
-tests/           bats: parsing, --help, shellcheck, behaviour of the offline tools
+tests/           bats: libs, every tool's offline behaviour, --help, shellcheck
 ```
 
 ## Ideas

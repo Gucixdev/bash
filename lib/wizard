@@ -1,0 +1,123 @@
+#!/bin/sh
+# wizard - ask a series of questions, print the answers as shell assignments.
+#
+# usage: wizard [STEPS_FILE]        steps on stdin when no file is given
+#        eval "$(wizard <<'STEPS' ... STEPS)"
+#
+# One step per line:
+#   var|prompt                   free text
+#   var|prompt|a,b,c             pick one
+#   var|prompt|a,b,c|default     pick one, preselected
+#
+# Output is VAR='value' lines, quoted for eval. fzf is used when it is
+# installed, otherwise a numbered plain prompt; both go back one step
+# (Esc, or `<` in plain mode). End of input or Esc on the first step
+# cancels with exit 1 and prints nothing.
+#
+# WIZARD_ANSWERS=FILE answers from a file, one line per step, with no
+# terminal (tests, unattended runs). WIZARD_PLAIN=1 skips fzf.
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+d=$(mktemp -d) || exit 1
+trap 'rm -rf "$d"' EXIT INT TERM
+
+if [ $# -ge 1 ]; then
+	[ -r "$1" ] || { echo "wizard: cannot read $1" >&2; exit 2; }
+	grep -v '^[[:space:]]*\(#\|$\)' "$1" > "$d/steps"
+else
+	grep -v '^[[:space:]]*\(#\|$\)' > "$d/steps"
+fi
+total=$(wc -l < "$d/steps" | tr -d ' ')
+[ "$total" -gt 0 ] || { echo "wizard: no steps" >&2; exit 2; }
+
+# every variable name must be a plain identifier: the output is eval'd
+bad=$(cut -d'|' -f1 "$d/steps" | grep -v '^[A-Za-z_][A-Za-z0-9_]*$' | head -n 1)
+[ -z "$bad" ] || { echo "wizard: bad variable name '$bad'" >&2; exit 2; }
+
+use_fzf=0
+if [ -z "${WIZARD_ANSWERS:-}" ] && [ -z "${WIZARD_PLAIN:-}" ] && command -v fzf >/dev/null 2>&1 && [ -r /dev/tty ]; then
+	use_fzf=1
+fi
+
+in_list() {   # VALUE LIST(comma separated)
+	printf '%s\n' "$2" | tr ',' '\n' | grep -qxF -- "$1"
+}
+
+i=1
+while [ "$i" -le "$total" ]; do
+	step=$(sed -n "${i}p" "$d/steps")
+	var=$(printf '%s' "$step" | cut -d'|' -f1)
+	q=$(printf '%s' "$step" | cut -d'|' -f2)
+	ch=$(printf '%s' "$step" | cut -d'|' -f3)
+	def=$(printf '%s' "$step" | cut -d'|' -f4)
+	prev=
+	[ -f "$d/v.$i" ] && prev=$(cat "$d/v.$i")
+	pick=${prev:-$def}
+
+	if [ -n "${WIZARD_ANSWERS:-}" ]; then
+		[ "$(wc -l < "$WIZARD_ANSWERS")" -ge "$i" ] || { echo "wizard: no answer for step $i ($var)" >&2; exit 1; }
+		ans=$(sed -n "${i}p" "$WIZARD_ANSWERS")
+		[ -n "$ans" ] || ans=$pick
+		if [ -n "$ch" ] && ! in_list "$ans" "$ch"; then
+			echo "wizard: '$ans' is not one of: $ch" >&2
+			exit 2
+		fi
+	elif [ "$use_fzf" -eq 1 ]; then
+		hdr="[$i/$total] $q"
+		if [ -n "$ch" ]; then
+			ans=$( { [ -n "$pick" ] && printf '%s\n' "$pick"; printf '%s\n' "$ch" | tr ',' '\n' | grep -vxF -- "$pick"; } |
+				fzf --layout=reverse-list --header="$hdr" --footer='↑↓ move · enter accept · esc back' --no-multi) || ans=__back__
+		else
+			ans=$(printf '' | fzf --print-query --no-info --bind=enter:accept-or-print-query --header="$hdr" \
+				--footer='type · enter accept · esc back' --query="$pick" | head -n 1) || ans=__back__
+		fi
+		if [ "$ans" = __back__ ]; then
+			[ "$i" -eq 1 ] && exit 1
+			i=$((i - 1))
+			continue
+		fi
+	else
+		printf '[%s/%s] %s' "$i" "$total" "$q" >&2
+		[ -n "$pick" ] && printf ' [%s]' "$pick" >&2
+		if [ -n "$ch" ]; then
+			printf '\n' >&2
+			n=0
+			for c in $(printf '%s' "$ch" | tr ',' ' '); do
+				n=$((n + 1))
+				printf '  %d) %s\n' "$n" "$c" >&2
+			done
+		fi
+		printf ' > ' >&2
+		# stdin may carry the steps, so answers come from the terminal when there is one
+		if ( exec < /dev/tty ) 2>/dev/null; then
+			IFS= read -r ans < /dev/tty || { echo >&2; exit 1; }
+		else
+			IFS= read -r ans || { echo >&2; exit 1; }
+		fi
+		if [ "$ans" = "<" ]; then
+			[ "$i" -gt 1 ] && i=$((i - 1))
+			continue
+		fi
+		[ -n "$ans" ] || ans=$pick
+		if [ -n "$ch" ]; then
+			case $ans in
+			'' | *[!0-9]*) ;;
+			*) ans=$(printf '%s' "$ch" | tr ',' '\n' | sed -n "${ans}p") ;;
+			esac
+			if [ -z "$ans" ] || ! in_list "$ans" "$ch"; then
+				echo "  pick one of: $ch" >&2
+				continue
+			fi
+		fi
+	fi
+	printf '%s' "$ans" > "$d/v.$i"
+	i=$((i + 1))
+done
+
+i=1
+while [ "$i" -le "$total" ]; do
+	var=$(sed -n "${i}p" "$d/steps" | cut -d'|' -f1)
+	printf "%s='%s'\n" "$var" "$(sed "s/'/'\\\\''/g" "$d/v.$i")"
+	i=$((i + 1))
+done

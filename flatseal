@@ -1,6 +1,6 @@
 #!/bin/sh
 # flatseal - terminal manager for Flatpak apps and their permissions, in
-# one tool, built on lib/lazytui.sh. It wraps the real flatpak, which it
+# one tool, built on lib/lazytui. It wraps the real flatpak, which it
 # finds in PATH skipping itself.
 #
 #   flatseal [apps | perms APP | global | audit | who KEY | APP-ID]
@@ -17,7 +17,7 @@ REFRESH_MS="${FLATPAK_REFRESH:-1500}"   # auto-refresh, milliseconds, 0 = off
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SELF=$HERE/$(basename -- "$0")
-# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# >>> lazytui (copy of lib/lazytui) >>>
 # _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
 # (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
 # (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.

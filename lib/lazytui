@@ -1,5 +1,5 @@
 #!/bin/sh
-# lazytui.sh - the lt_* terminal-UI helpers (selection menus with
+# lazytui - the lt_* terminal-UI helpers (selection menus with
 # preview and key hints, prompts, confirmations) that the interactive
 # tools share. Tools never source this file at run time: each carries
 # a marked block with the functions it calls, so every tool still runs

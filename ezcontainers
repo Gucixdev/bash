@@ -1,6 +1,6 @@
 #!/bin/sh
 # ezcontainers (short name: ezcon) - terminal manager for containers, images, volumes and
-# networks, built on lib/lazytui.sh. One tool for both Docker and Podman
+# networks, built on lib/lazytui. One tool for both Docker and Podman
 # (pods too); it wraps the real binary, found in PATH skipping this script,
 # so it never calls itself.
 #
@@ -17,7 +17,7 @@ SHELL_CMD='command -v bash >/dev/null && exec bash || exec sh'   # for "shell"
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SELF=$HERE/$(basename -- "$0")
-# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# >>> lazytui (copy of lib/lazytui) >>>
 # _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
 # (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
 # (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.

@@ -37,6 +37,6 @@ setup() {
 	command -v shellcheck >/dev/null || skip "shellcheck not installed"
 	run shellcheck -S warning btth cleaner ezcontainers ezhf findfat fixmedia flatseal gitgrab logcollector \
 		manwriter metadata_cleaner morph nmap scenario screenshot sniff todo trash wifi \
-		lib/lazytui.sh lib/dspq lib/evq installer/blenderlauncher installer/comfysetup installer/tos
+		lib/lazytui lib/dspq lib/evq lib/settings lib/wizard installer/blenderlauncher installer/comfysetup installer/tos
 	[ "$status" -eq 0 ]
 }

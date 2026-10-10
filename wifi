@@ -6,7 +6,7 @@
 # Each path lets its own tool handle the password (nmcli --ask, iwd's
 # prompt) except wpa_cli, which has no prompt of its own, so the password
 # is read here without echo. The NetworkManager list is a fzf picker from
-# lib/lazytui.sh (numbered prompt when fzf is missing).
+# lib/lazytui (numbered prompt when fzf is missing).
 #
 # Needs an interactive terminal.
 #
@@ -21,7 +21,7 @@ case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print;
 # real, backend-agnostic device detection (sysfs, not any particular
 # manager) - a directory named "wireless" under a real net interface
 # means it's a real wifi device, regardless of who's managing it.
-# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# >>> lazytui (copy of lib/lazytui) >>>
 # _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
 # (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
 # (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.

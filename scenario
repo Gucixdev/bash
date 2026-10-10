@@ -15,7 +15,7 @@
 case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 # ---- edit me ---------------------------------------------------------
-# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# >>> lazytui (copy of lib/lazytui) >>>
 # _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
 # (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
 # (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
