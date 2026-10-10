@@ -1,5 +1,4 @@
 #!/bin/sh
-# <manwriter>
 # dq - a parallel, atomic download queue for shell scripts.
 #
 #   dq [-j N] ENTRY...          download each ENTRY; up to N at once (default 3)
@@ -17,7 +16,6 @@
 # worker writes "DIR/<label>" as "<cur> <total> <run|done|fail>" and NO bar is
 # drawn - for a caller that renders its own per-item UI (e.g. blender's TUI).
 # $HF_TOKEN (exported) is sent for huggingface.co URLs.
-# </manwriter>
 set -eu
 
 SELF=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")

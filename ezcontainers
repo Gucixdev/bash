@@ -1,46 +1,12 @@
 #!/bin/sh
-# <manwriter>
-# ezcon - terminal manager for containers, images, volumes and
+# ezcontainers (short name: ezcon) - terminal manager for containers, images, volumes and
 # networks, built on lib/lazytui.sh. One tool for both Docker and Podman
 # (pods too); it wraps the real binary, found in PATH skipping this script,
 # so it never calls itself.
 #
-#   ezcon [-e docker|podman|both|qemu] [containers|images|volumes|networks|pods|vms]
-#
-# Docker and Podman show up TOGETHER when both are installed: one list,
-# each row tagged with its engine, and every action goes to the row's own
-# engine (marked rows may even mix both). Tab cycles both -> docker ->
-# podman. -e (or EZCON_ENGINES) sets where it starts, e.g. `ezcon -e podman`.
-# Creating something (run, pull, create) asks which engine when both are in
-# use; prune and system prune run on every engine in use. Arrows or Tab move, space marks rows like nnn, / searches,
-# and every action runs on all marked rows (or the current one). The list
-# refreshes by itself every REFRESH_MS milliseconds (top of the script, or
-# LAZYCTL_REFRESH; 0 turns it off). Alt-1..5 switch views. The key bar
-# shows every key of the current view.
-#
-# Containers: logs (Enter), follow logs, shell, start, stop, restart,
-#   kill, pause, unpause, remove, inspect, stats, run a new one, prune.
-# Images: run, pull again (update), remove, history, inspect, search the
-#   registry and pull, prune dangling.
-# Volumes and networks: create, remove, inspect, prune.
-# Pods (podman): start, stop, restart, remove, create, inspect.
-# VMs (qemu, Alt-6 or `ezcon -e qemu`): every disk image in VM_IMAGES is a
-#   VM, with a NAME.conf in VM_CONF for its settings (RAM, CPUs, ISO, UEFI,
-#   display, ssh port, ...) - existing images work with the defaults. Start
-#   (headless or a window), ACPI shutdown, kill, reset, pause, ssh into the
-#   guest through a forwarded port, serial console, new VM wizard, attach an
-#   installer ISO, edit the config, disk snapshots (create, revert, drop),
-#   delete. Needs qemu and qemu-img; socat for shutdown, reset, pause and
-#   the serial console.
-#
-# Destructive actions (kill, remove, prune) ask first. When an action
-# fails its output is kept on screen until you press Enter.
-#
-# @flag -e ENGINE:docker or podman (default: docker if installed, else podman)
-# @flag VIEW:start in this view (default containers)
-# @flag ENTER:container logs / image run / inspect
-# @flag ALT-1..5:switch view
-# </manwriter>
+#   ezcontainers [-e docker|podman|both|qemu] [containers|images|volumes|networks|pods|vms]
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 # ---- edit me ---------------------------------------------------------
 REFRESH_MS="${LAZYCTL_REFRESH:-2000}"     # auto-refresh, milliseconds, 0 = off
@@ -65,7 +31,7 @@ _lt_hint() {
 		esac
 	done
 	case $_lt_h in
-		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		?) _lt_h=$(printf %s "$_lt_h" | tr '[:lower:]' '[:upper:]') ;;
 		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
 		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
 		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
@@ -630,6 +596,7 @@ vm_edit() {
 EOF
 	${EDITOR:-${VISUAL:-vi}} "$f"
 }
+# shellcheck disable=SC2154  # size/ram/cpus/iso/fw are assigned by the eval'd lt_wizard output
 vm_new() {
 	eval "$(lt_wizard <<'X'
 name|VM name

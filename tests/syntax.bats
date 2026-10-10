@@ -11,9 +11,6 @@ setup() {
 		[ -f "$f" ] && [ -x "$f" ] || continue
 		shebang=$(head -1 "$f")
 		case "$shebang" in
-			*python*) continue ;; # bdfeditor - not a shell script
-		esac
-		case "$shebang" in
 			*/sh|*env\ sh) sh -n "$f" ;;
 			*) bash -n "$f" ;;
 		esac
@@ -25,4 +22,19 @@ setup() {
 		[ -f "$f" ] && [ -x "$f" ] || continue
 		bash -n "$f"
 	done
+}
+
+@test "every top-level tool answers --help from its header" {
+	for f in btth cleaner ezcontainers flatseal metadata_cleaner nmap scenario sniff snip todo trash wifi \
+		ezhf screenshot gitgrab logcollector manwriter; do
+		run ./"$f" --help
+		[ "$status" -eq 0 ]
+		[ -n "$output" ]
+	done
+}
+
+@test "shellcheck: no warnings or errors" {
+	command -v shellcheck >/dev/null || skip "shellcheck not installed"
+	run make lint
+	[ "$status" -eq 0 ]
 }

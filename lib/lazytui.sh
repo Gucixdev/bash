@@ -22,7 +22,7 @@ _lt_hint() {
 		esac
 	done
 	case $_lt_h in
-		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		?) _lt_h=$(printf %s "$_lt_h" | tr '[:lower:]' '[:upper:]') ;;
 		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
 		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
 		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;

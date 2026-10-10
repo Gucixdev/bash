@@ -279,7 +279,7 @@ cmd_available() {
 	list_build $rr | _rows | _catfilter "$cat"
 }
 
-cmd_installed() { ls -1 "$DATA" 2>/dev/null | grep -v '^\.' ||: ; }
+cmd_installed() { ls -1 "$DATA" 2>/dev/null ||: ; }
 
 cmd_install() {
 	name=$1

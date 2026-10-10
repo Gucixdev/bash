@@ -1,11 +1,15 @@
 #!/bin/sh
-# quick packet capture picker: pick an interface, pick a filter preset,
-# tcpdump runs in the foreground until Ctrl-C. Not a Wireshark
-# replacement - for "what's this box actually sending right now".
+# sniff - quick packet capture over tcpdump.
 #
-# usage: sniff                 pick interface + preset interactively
-#        sniff IFACE           pick preset, that interface
-#        sniff IFACE FILTER    run directly, no prompts (raw tcpdump filter)
+# Pick an interface and a filter preset, tcpdump runs in the foreground
+# until Ctrl-C. Not a Wireshark replacement: for "what is this box sending
+# right now". Needs tcpdump and root or cap_net_raw.
+#
+# usage: sniff                 pick interface and preset interactively
+#        sniff IFACE           pick a preset for that interface
+#        sniff IFACE FILTER    run directly with a tcpdump filter
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 command -v tcpdump >/dev/null 2>&1 || { echo "sniff: need 'tcpdump' on PATH (needs root/cap_net_raw to run)" >&2; exit 1; }
 

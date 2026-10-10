@@ -1,13 +1,13 @@
 #!/bin/sh
-# <manwriter>
-# real trash-can, implementing the actual freedesktop.org Trash spec
-# directly (files/ + a matching .trashinfo per file) rather than
-# depending on trash-cli - not installed on this machine (checked by
-# hand) - so any real spec-compliant GUI file manager sees and can
-# restore what this deletes, not just this script itself.
+# trash - move files to the freedesktop.org Trash.
+#
+# Implements the Trash spec directly (files/ plus a .trashinfo per file),
+# so GUI file managers see and can restore what this deletes. Does not
+# depend on trash-cli.
 #
 # usage: trash FILE...
-# </manwriter>
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 trash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
 files_dir="$trash_dir/files"

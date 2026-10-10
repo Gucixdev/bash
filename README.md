@@ -1,89 +1,91 @@
-# ez* — fast, easy, standalone bash tools
+# bash
 
-A collection of terminal tools, each one a single file with zero
-runtime dependency on anything else in this repo or on each other.
-Pick the one you want, copy it, run it — nothing else to install first.
-
-## Philosophy
-
-- **Standalone by construction.** Several tools share an interactive-UI
-  layer (`lib/lazytui.sh` — selection menus, previews, keybindings), but
-  no tool `source`s it at runtime. Each one carries its own copy of the
-  functions it calls, as a clearly-marked block, so every script still
-  runs on its own once copied elsewhere. `lib/lazytui.sh` is the
-  reference copy; there is no sync tool, so a fix means editing the
-  library and the blocks that need it.
-- **Wrap the real thing, don't reinvent it.** `ezcontainers` wraps
-  whatever of Docker/Podman is actually installed, `logcollector` reads
-  journalctl and falls back to `/var/log` plus `dmesg`. When the real
-  tool is missing, fall back to the next-best thing (curl against a
-  public REST API, a different backend) rather than failing outright.
-- **Fallback over hard failure.** A missing optional dependency should
-  degrade gracefully with a clear message, not crash. A missing
-  *required* one fails fast with the install command, not a guess.
-- **No secrets in the repo.** Tokens come from the environment
-  (`GH_TOKEN`, `HF_TOKEN` — see `.env.example`; `gitgrab` uses `GH_TOKEN` for private repos), never a committed file.
-
-## Quick start
+Small terminal tools in POSIX `sh`, one file each. They wrap the real
+program (`flatpak`, `docker`/`podman`, `nmcli`, `grim`, `journalctl`)
+instead of reimplementing it, fall back to the next-best backend when
+it is missing, and run on their own once copied out of this repo.
 
 ```sh
-cp .env.example .env    # fill in tokens if you have them, or just export them
-./logcollector -n       # or any other tool below
+git clone <this repo> && cd bash
+make install            # symlinks into ~/.local/bin
+logcollector -n         # try one: a summary of what went wrong in the last day
 ```
 
-## The tools
+`make test` runs the bats suite, `make lint` runs shellcheck at
+warning level. Both run in CI.
 
-### Interactive managers (built on `lib/lazytui.sh`)
+## Principles
+
+- **One file, no runtime dependency on this repo.** Interactive tools
+  carry the few `lt_*` UI functions they call (selection menus with
+  preview and key hints) as a marked block copied from `lib/lazytui.sh`,
+  so a tool still runs after being copied to another machine.
+- **Wrap the real thing.** `ezcontainers` drives whichever of Docker and
+  Podman is installed, `flatseal` drives `flatpak`, `wifi` drives
+  NetworkManager, iwd or wpa_supplicant, whichever is running.
+- **Degrade, don't die.** A missing optional dependency means a simpler
+  path and a one-line message. A missing required one fails fast with the
+  install command.
+- **Show before doing.** Anything destructive lists what it will touch
+  and asks once. `cleaner` never removes packages on its own.
+- **No secrets in the repo.** Tokens come from the environment
+  (`GH_TOKEN`, `HF_TOKEN`, see `.env.example`).
+
+Every tool prints its header with `--help`.
+
+## Interactive managers
+
+Built on `lib/lazytui.sh`: arrows or Tab to move, space to mark rows
+like nnn, `/` to search, a key bar always showing what is available.
+
+| Tool | What it does | Needs |
+|---|---|---|
+| `ezcontainers` | Containers, images, volumes, networks, pods and QEMU VMs in one list. Docker and Podman rows show up together, each action goes to the row's own engine. | docker or podman, qemu for VMs, fzf |
+| `flatseal` | Flatpak apps and their permissions, layered the way flatpak layers them (manifest, global override, app override). Also scriptable: `flatseal allow\|deny\|default APP KEY`, `export`/`import`. | flatpak, fzf |
+| `ezhf` | Browse the Hugging Face Hub and the local cache, sizes first, download or delete marked files. | curl and jq (or python3), `hf` optional |
+| `scenario` | Record and replay keyboard and mouse input, one recorder per device. | evemu (root) or xnee |
+| `screenshot` | Full, screen, area, window or active window on Wayland or X11, to file and clipboard, with a notification. | grim/slurp, spectacle, maim, scrot, ... |
+
+## Utilities
 
 | Tool | What it does |
 |---|---|
-| `ezbacksnap` | Btrfs snapshots on a schedule + a snapshot before every update, single-file restore, rotating rsync backups — a Timeshift replacement. |
-| `ezcontainers` | Terminal manager for containers/images/volumes/networks — one tool for Docker *and* Podman, drives whichever is installed. |
-| `flatseal` | Terminal manager for Flatpak apps and their permissions. |
-| `ezhf` | Browse the Hugging Face Hub and your local cache; uses the real `huggingface-cli` when present, curl against the public API otherwise. |
+| `logcollector` | Support bundle for a time window: journal, warnings, errors, kernel log, failed units, package history, disk and memory. Secrets are redacted before anything is written, and it prints a summary of the most repeated errors. `-s "2 hours ago"`, `-I` also masks IPs and MACs. |
+| `gitgrab` | One file from a GitHub repo, no clone: `gitgrab owner/repo path/in/repo [ref]` or a `blob`/`raw` URL. `GH_TOKEN` opens private repos. |
+| `cleaner` | Bloat across package cache, journal, containers, Flatpak runtimes, language caches, `~/.cache` and Trash. Dry run first, one confirmation. Backend: pacman, apt, dnf, zypper, apk, xbps or portage. |
+| `trash` | The freedesktop.org Trash spec, implemented directly, so file managers can restore what it deletes. |
+| `todo` | todo.txt capture: `todo "task"`, `todo ls`, `todo done N`. |
+| `wifi` | Wi-Fi picker over NetworkManager, iwd or wpa_supplicant. |
+| `btth` | Bluetooth picker over `bluetoothctl`. |
+| `snip` | Region screenshot straight to the clipboard, no file. |
+| `metadata_cleaner` | Strip EXIF and other metadata into a new `clean-NAME` file. mat2 or exiftool, else ffmpeg or ImageMagick. |
+| `nmap` | Presets in front of the real nmap, `nmap -- ARGS` passes through. Installed as `nmap-presets` by `make install` so it does not shadow the real one. |
+| `sniff` | tcpdump with interface and filter presets. |
+| `manwriter` | Turn a script's header comment into a man page: `manwriter -d man tool...`. `manwriter new` writes a skeleton. |
 
-### Standalone utilities
+## Installers
 
-| Tool | What it does |
-|---|---|
-| `btth` | Bluetooth device picker over `bluetoothctl`. |
-| `wifi` | Wi-Fi picker — tries NetworkManager, then iwd, then wpa_supplicant. |
-| `cleaner` | System cleanup wrapping the real tool for each kind of bloat (package cache, orphans, etc.), package-manager backend auto-detected. |
-| `scenario` | Keyboard/mouse macro record + playback, picks a backend (evemu, etc.) that works across X11 and Wayland. |
-| `screenshot` | Screenshot on Wayland or X11 with whatever's installed. |
-| `snip` | Region screenshot straight to the clipboard (no file written) — pairs with `screenshot`. |
-| `trash` | A real freedesktop.org Trash spec implementation (not a `trash-cli` wrapper). |
-| `gitgrab` | Download one file from a GitHub repo (URL or `owner/repo path [ref]`), no clone. `GH_TOKEN` enables private repos. |
-| `logcollector` | Support bundle for a time window: journal/kernel/failed units/package history/disk+memory, secrets redacted, one archive plus a summary of the most repeated errors. |
-| `manwriter` | Turn a script's `<manwriter>` header comment into a man page on demand (`manwriter new` writes a skeleton). Nothing generated is committed. |
-| `todo` | Minimal todo.txt-convention task capture. |
-| `bdfeditor` | Terminal editor for BDF bitmap fonts (Python). |
-| `metadata_cleaner` | Strip EXIF/metadata from a file — prefers `mat2`/`exiftool`, falls back to ffmpeg/ImageMagick. |
-| `nmap` | Friendlier presets over real `nmap` (quick/full/ping-sweep/service-detect); `nmap -- ARGS` passes straight through. |
-| `sniff` | Quick `tcpdump` capture with interface/filter presets. |
-
-### `installer/`
-
-One-shot "clone, build, run" scripts for things that don't belong in
-`$PATH` day to day: `comfysetup` (ComfyUI in a minimal container image),
+`installer/` has clone, build and run scripts for things that do not
+belong on `$PATH`: `comfysetup` (ComfyUI in a minimal container),
 `blenderlauncher`, `tos` (TempleOS in QEMU).
 
-## Testing
-
-```sh
-bats tests/
-```
-
-`tests/syntax.bats` parses every script. `tests/new-tools.bats`
-exercises real error paths and dispatch logic for the tools that don't
-need root/network/a display to test honestly.
-
-## Structure
+## Layout
 
 ```
-ez*, and the standalone utilities   — the tools themselves
-lib/                                 — lt_* UI helpers (reference copy of what tools carry)
-docs/                                — plain-text notes for the lib/ helpers
-installer/                           — one-shot clone+build+run scripts
-tests/                               — bats
+<tool>           the tools, one file each
+lib/lazytui.sh   reference copy of the lt_* UI helpers tools carry
+lib/dspq, evq    download queue and event queue for shell scripts
+installer/       one-shot clone, build, run scripts
+tests/           bats: parsing, --help, shellcheck, behaviour of the offline tools
+docs/ideas.md    what is not built yet
 ```
+
+## Status
+
+Tested on Arch (CachyOS) with Hyprland. `wifi` (iwd, wpa_supplicant
+paths), `scenario` (cnee backend) and the non-pacman branches of
+`cleaner` follow the tools' documented syntax and have not been run on a
+live system. `make test` covers what can run without root, network or a
+display.
+
+MIT, see `LICENSE`.

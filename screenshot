@@ -1,32 +1,8 @@
 #!/bin/sh
-# <manwriter>
 # screenshot - take a screenshot on Wayland or X11 with whatever tools the
 # machine has.
 #
 #   screenshot [-d SECONDS] [-n] [MODE]
-#
-# MODE is full, screen, area, window or active. Without a MODE you get a
-# picker (lib/lazytui.sh). The file goes to DIR under a timestamped name,
-# is copied to the clipboard and announced with a notification; all of
-# that, the format and the delay are switches at the top of the script,
-# and each also has an environment override (SCREENSHOT_DIR, ...).
-#
-# Backends are tried in order and the first one installed wins:
-#   Wayland  grim (+ slurp to select, + hyprctl or swaymsg + jq for
-#            windows), else spectacle, gnome-screenshot or flameshot
-#   X11      maim, scrot or import (+ xdotool for the active window),
-#            else the same three desktop tools
-# A mode a backend can't do natively falls back to the closest one that
-# it can (window -> area), and says so.
-#
-# To add a MODE: add its name to MODES, its picker text to mode_help(),
-# and a case for it in capture_grim() / capture_x11(). To add a backend:
-# write capture_NAME() and add it to pick_backend().
-#
-# @flag MODE:full, screen (one monitor), area, window or active window
-# @flag -d SECONDS:wait before capturing
-# @flag -n:don't copy to the clipboard or notify
-# </manwriter>
 
 # ---- edit me ---------------------------------------------------------
 # >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
@@ -44,7 +20,7 @@ _lt_hint() {
 		esac
 	done
 	case $_lt_h in
-		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		?) _lt_h=$(printf %s "$_lt_h" | tr '[:lower:]' '[:upper:]') ;;
 		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
 		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
 		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
@@ -365,7 +341,7 @@ while [ $# -gt 0 ]; do
 	case $1 in
 		-d) DELAY=${2:?-d needs seconds}; shift 2 ;;
 		-n) COPY=0; NOTIFY=0; shift ;;
-		-h | --help) sed -n '2,/^# <\/manwriter>/p' "$0" | sed 's/^# \{0,1\}//; /manwriter>/d'; exit 0 ;;
+		-h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
 		-*) die "unknown option $1" ;;
 		*) MODE=$1; shift ;;
 	esac

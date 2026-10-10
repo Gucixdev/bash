@@ -1,5 +1,4 @@
 #!/bin/sh
-# <manwriter>
 # flatseal - terminal manager for Flatpak apps and their permissions, in
 # one tool, built on lib/lazytui.sh. It wraps the real flatpak, which it
 # finds in PATH skipping itself.
@@ -8,66 +7,8 @@
 #   flatseal allow|deny|default APP KEY...     scripting, no UI
 #   flatseal show APP|@global [modified]       the effective permissions as text
 #   flatseal export [FILE] | import FILE       copy your overrides out / back in
-#
-# Apps (the default view) lists what is installed. Arrows or Tab move,
-# space marks rows like nnn, / searches, and update / uninstall act on all
-# marked rows. Enter opens the permissions of the current app. The first row,
-# "All applications", is the global layer (like Flatseal): Enter opens the global
-# overrides; Uninstall / Update / Run do nothing useful on it.
-#
-# Permissions is Flatseal in the terminal. Every permission the app really
-# has is listed with its effective state, layered the way flatpak layers
-# them: the app's manifest, then your global overrides, then your overrides
-# for that app:
-#
-#   on   allowed        off   denied
-#   *    set by an override of this app      g   set by a global override
-#
-# Rows cover sockets, devices, shares, features, filesystems, persistent
-# dirs, environment variables and the D-Bus names, plus the usual
-# suspects the app doesn't mention. Broad ones that are on show in red.
-# Space marks rows; Enter toggles every marked row (or the current one).
-# Allow, deny and "default" (drop your override) all work on the layer you
-# are in, so denying something globally and re-allowing it for one app both
-# work - the two things Flatseal's users asked for most.
-#
-# Global is the same list for the "all applications" layer, i.e. plain
-# `flatpak override --user`. Everything is a per-user override, exactly
-# what Flatseal writes, and no manifest is ever touched.
-#
-# Beyond what Flatseal does:
-#   Portals    notifications, background, microphone, speakers, camera and location are rows too
-#              (the xdg-desktop-portal permission store); Flatseal can only edit them once the portal
-#              has stored something for the app, here they can be set any time.
-#   Audit      ALT-A: every app with a risk score (whole filesystem, session/system bus, all devices,
-#              sandbox escape via org.freedesktop.Flatpak, ...), riskiest first. CTRL-W: which apps
-#              have a given permission. Also `flatseal audit --plain` and `flatseal who KEY --plain`.
-#   Try once   ALT-T: run the app with the marked rows flipped, without saving anything.
-#   Bulk       ALT-P (in the apps list): allow / deny / drop one permission for all marked apps.
-#   Version    permissions the installed flatpak is too old to know are not listed.
-#   Scripts    allow / deny / default / show / export / import work without any UI.
-#
-# The lists refresh by themselves every REFRESH_MS milliseconds (top of
-# the script, or FLATPAK_REFRESH; 0 turns it off).
-#
-# @flag apps:installed apps (default)
-# @flag perms APP:permissions of an app (APP-ID alone works too)
-# @flag global:permissions of all apps at once
-# @flag ENTER:apps: open permissions, permissions: toggle marked rows
-# @flag CTRL-G:allow the marked rows
-# @flag CTRL-X:deny the marked rows
-# @flag CTRL-U:drop your override of the marked rows
-# @flag CTRL-N:add a permission that isn't listed
-# @flag CTRL-Z:reset every override of this layer (asks first)
-# @flag ALT-Z:undo the last change to this layer; up to 20 versions are kept in
-#             ~/.local/state/flatpak-tui/backups
-# @flag ALT-M:show only what is overridden
-# @flag ALT-G:switch to the global layer
-# @flag ALT-A:audit: risk score of every app; CTRL-W there: who has a permission
-# @flag ALT-T:run the app once with the marked rows flipped (not saved)
-# @flag ALT-P:apps: change one permission for all marked apps
-# @flag ALT-B:back to the app list
-# </manwriter>
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 # ---- edit me ---------------------------------------------------------
 REFRESH_MS="${FLATPAK_REFRESH:-1500}"   # auto-refresh, milliseconds, 0 = off
@@ -90,7 +31,7 @@ _lt_hint() {
 		esac
 	done
 	case $_lt_h in
-		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		?) _lt_h=$(printf %s "$_lt_h" | tr '[:lower:]' '[:upper:]') ;;
 		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
 		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
 		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
@@ -363,7 +304,7 @@ EOF
 _portal_rows() {
 	[ -z "${EZFP_NOPORTAL:-}" ] || return 0
 	flatpak permissions >/dev/null 2>&1 || return 0
-	_portals | while IFS='	' read -r key desc table id allow deny; do
+	_portals | while IFS='	' read -r key desc table id allow _; do
 		cur=$(flatpak permissions "$table" 2>/dev/null | awk -F'\t' -v id="$id" -v app="$1" '$2 == id && $3 == app { print $4; exit }')
 		if [ -z "$cur" ]; then printf '%s\toff\t0\t%s (not set: the app is asked)\n' "$key" "$desc"
 		elif [ "${cur%%,*}" = "${allow%% *}" ]; then printf '%s\ton\t2\t%s\n' "$key" "$desc"

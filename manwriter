@@ -1,10 +1,8 @@
 #!/bin/sh
-# <manwriter>
-# turn the comment block between "# <manwriter>" and "# </manwriter>"
-# at the top of a script into a real man(7) page, so the header is
-# the single source of truth for what a tool does. Lines starting with
-# "@flag NAME:description" become entries under OPTIONS; the first line
-# is taken as the one-line NAME description.
+# manwriter - turn the comment block at the top of a script (the lines
+# right after the shebang) into a man(7) page, so the header stays the
+# single source of truth. "name - description" on the first line becomes
+# NAME; lines starting with "@flag NAME:description" become OPTIONS.
 #
 # usage: manwriter [-d DIR] [-s SECTION] FILE...
 #        manwriter new NAME SECTION "description" ["FLAG:desc" ...]
@@ -12,13 +10,14 @@
 #   -d DIR      write NAME.SECTION into DIR (default: current directory)
 #   -s SECTION  man section (default 1)
 #   new         write a skeleton page by hand, no script needed
-# </manwriter>
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 # page OUT NAME SECTION DESC BODYFILE [FLAG:desc]...
 page() {
 	out=$1 name=$2 section=$3 desc=$4 bodyf=$5
 	shift 5
-	upper="$(printf %s "$name" | tr a-z A-Z)"
+	upper="$(printf %s "$name" | tr '[:lower:]' '[:upper:]')"
 	{
 		printf '.TH %s %s "%s" "" ""\n' "$upper" "$section" "$(date +%Y-%m-%d)"
 		printf '.SH NAME\n%s \\- %s\n.SH SYNOPSIS\n' "$name" "$desc"
@@ -50,7 +49,7 @@ page() {
 }
 
 usage() {
-	sed -n '/<manwriter>/,/<\/manwriter>/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'
+	awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 if [ "$1" = new ]; then
@@ -95,9 +94,9 @@ for f in "$@"; do
 		rc=1
 		continue
 	fi
-	awk '/^# <\/manwriter>/{exit} f{sub(/^# ?/,""); print} /^# <manwriter>/{f=1}' "$f" > "$tmp/sec"
+	awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$f" > "$tmp/sec"
 	if [ ! -s "$tmp/sec" ]; then
-		echo "manwriter: skip $n (no <manwriter> section)" >&2
+		echo "manwriter: skip $n (no header comment)" >&2
 		continue
 	fi
 	desc="$(head -n 1 "$tmp/sec" | sed -E 's/^(real )?[A-Za-z0-9_-]+ +- +//')"

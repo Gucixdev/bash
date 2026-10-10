@@ -1,9 +1,7 @@
 #!/bin/sh
-# <manwriter>
-# download one file from a GitHub repo - no clone, no history, just
-# the file. Takes either a github.com URL (blob/raw) or owner/repo plus
-# a path inside it. Private repos work when GH_TOKEN is set; never
-# overwrites an existing file unless told to.
+# gitgrab - download one file from a GitHub repo: no clone, no history.
+# Takes a github.com URL (blob or raw) or OWNER/REPO plus a path. Private
+# repos work when GH_TOKEN is set; never overwrites unless told to.
 #
 # usage: gitgrab URL [-o OUT] [-f]
 #        gitgrab OWNER/REPO PATH [REF] [-o OUT] [-f]
@@ -13,7 +11,8 @@
 #   -o OUT where to write it (default: its basename in the current
 #          directory; "-" prints to stdout)
 #   -f     overwrite OUT if it exists
-# </manwriter>
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 out=""
 force=0
@@ -25,7 +24,7 @@ while [ "$#" -gt 0 ]; do
 	case "$1" in
 	-o) out="$2"; shift 2 ;;
 	-f) force=1; shift ;;
-	-h) sed -n '/<manwriter>/,/<\/manwriter>/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'
+	-h) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 	    exit 0 ;;
 	-) args="$args
 $1"; n=$((n + 1)); shift ;;

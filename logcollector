@@ -1,26 +1,19 @@
 #!/bin/sh
-# <manwriter>
-# collect a support bundle from this machine for a time window: boot
-# log, warnings and errors, kernel ring buffer, failed units, package
-# manager history, core dumps, disk/memory state. Everything passes
-# through a redaction filter (tokens, passwords, private keys, auth
-# headers) before it touches disk, so the archive is safe to attach to
-# a bug report. Prints a summary: counts per severity and the most
-# repeated messages.
-#
-# Backends are picked at runtime: journalctl, else /var/log/*; dmesg
-# (or journalctl -k when the kernel buffer is restricted); pacman,
-# apt/dpkg or dnf history. A missing source is noted in the bundle
-# and skipped, never fatal.
+# logcollector - collect a support bundle for a time window: boot log,
+# warnings and errors, kernel log, failed units, package history, core
+# dumps, disk and memory. Everything passes a redaction filter (tokens,
+# passwords, private keys, auth headers) before it touches disk, so the
+# archive is safe to attach to a bug report. Prints a summary with counts
+# per severity and the most repeated errors.
 #
 # usage: logcollector [-s SINCE] [-o DIR] [-I] [-n]
-#
 #   -s SINCE  start of the window, anything journalctl --since takes
-#             ("2 hours ago", "yesterday", "2026-10-01"); default "1 day ago"
+#             ("2 hours ago", "yesterday"); default "1 day ago"
 #   -o DIR    write the bundle under DIR (default: current directory)
-#   -I        also redact IPv4 addresses and MAC addresses
+#   -I        also redact IPv4 and MAC addresses
 #   -n        print the summary only, write no archive
-# </manwriter>
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 since="1 day ago"
 outdir="$PWD"
@@ -33,7 +26,7 @@ while getopts s:o:Inh opt; do
 	o) outdir="$OPTARG" ;;
 	I) redact_ip=1 ;;
 	n) dry=1 ;;
-	h) sed -n '/<manwriter>/,/<\/manwriter>/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'
+	h) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 	   exit 0 ;;
 	*) echo "usage: logcollector [-s SINCE] [-o DIR] [-I] [-n]" >&2
 	   exit 2 ;;

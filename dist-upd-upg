@@ -1,2 +1,0 @@
-apt/dnf/pacman/flatpak update && upgrade 
-

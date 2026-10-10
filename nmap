@@ -1,15 +1,28 @@
 #!/bin/sh
-# friendlier front end for the real nmap (on PATH as /usr/bin/nmap,
-# this script lives here, not symlinked over it - no collision in
-# practice). Presets for the scans actually reached for day to day;
-# anything else, just call real nmap directly with its full flags.
+# nmap - presets in front of the real nmap.
 #
-# usage: nmap                  pick a preset + target interactively
-#        nmap PRESET TARGET    skip the prompts
-#        nmap -- ARGS...       passthrough to the real /usr/bin/nmap
+# Picks the first nmap on PATH that is not this script, so it is safe to
+# put on PATH under the name nmap. Presets cover the scans reached for
+# day to day; anything else goes straight through with `--`.
+#
+# usage: nmap                  pick a preset and a target interactively
+#        nmap PRESET TARGET    quick | full | ping | service
+#        nmap -- ARGS...       pass ARGS to the real nmap unchanged
 
-command -v nmap >/dev/null 2>&1 || { echo "nmap: need the real nmap on PATH" >&2; exit 1; }
-REAL=$(command -v nmap)
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+# first nmap on PATH that is not this script (this file may itself be on PATH as "nmap")
+self=$(readlink -f -- "$0" 2>/dev/null || echo "$0")
+REAL=
+oldifs=$IFS; IFS=:
+for d in $PATH; do
+	c="${d:-.}/nmap"
+	[ -x "$c" ] && [ -f "$c" ] || continue
+	[ "$(readlink -f -- "$c" 2>/dev/null || echo "$c")" = "$self" ] && continue
+	REAL=$c; break
+done
+IFS=$oldifs
+[ -n "$REAL" ] || { echo "nmap: need the real nmap on PATH" >&2; exit 1; }
 
 if [ "$1" = "--" ]; then
 	shift

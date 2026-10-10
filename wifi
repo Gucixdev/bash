@@ -1,6 +1,5 @@
 #!/bin/sh
-# <manwriter>
-# wifi - Wi-Fi picker over the real Linux Wi-Fi backends, first one that is
+# wifi - Wi-Fi picker over the Linux Wi-Fi backends, first one that is
 # running wins: NetworkManager (nmcli), then iwd (iwctl), then bare
 # wpa_supplicant (wpa_cli).
 #
@@ -9,13 +8,14 @@
 # is read here without echo. The NetworkManager list is a fzf picker from
 # lib/lazytui.sh (numbered prompt when fzf is missing).
 #
-# Needs a real interactive terminal.
+# Needs an interactive terminal.
 #
 # Verification note: the iwctl and wpa_cli paths follow those tools'
 # documented command syntax and were not run against a live setup; the
 # nmcli path was checked for syntax only (nmcli is not installed on the
 # machine it was written on).
-# </manwriter>
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 # real, backend-agnostic device detection (sysfs, not any particular
 # manager) - a directory named "wireless" under a real net interface
@@ -35,7 +35,7 @@ _lt_hint() {
 		esac
 	done
 	case $_lt_h in
-		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		?) _lt_h=$(printf %s "$_lt_h" | tr '[:lower:]' '[:upper:]') ;;
 		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
 		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
 		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;

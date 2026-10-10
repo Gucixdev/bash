@@ -91,7 +91,7 @@ setup() {
 
 @test "manwriter: builds a man page from a script header" {
 	tmp=$(mktemp -d)
-	printf '%s\n' '#!/bin/sh' '# <manwriter>' '# demo - does a thing' '#' '# usage: demo' '# @flag -v:be loud' '# </manwriter>' > "$tmp/demo"
+	printf '%s\n' '#!/bin/sh' '# demo - does a thing' '#' '# usage: demo' '# @flag -v:be loud' '' 'echo hi' > "$tmp/demo"
 	run ./manwriter -d "$tmp" "$tmp/demo"
 	[ "$status" -eq 0 ]
 	grep -q '^.SH NAME' "$tmp/demo.1"

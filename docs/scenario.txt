@@ -1,5 +1,0 @@
-scennario 
-
-ls 
-run 
-rec 

@@ -1,10 +1,12 @@
 #!/bin/sh
-# region screenshot straight to the clipboard - distinct from this dir's
-# `screenshot` tool (which saves a file); this is for "grab a bit of the
-# screen, paste it somewhere" and never touches disk.
+# snip - region screenshot straight to the clipboard, no file written.
 #
-# Needs slurp (region select) + grim (capture) + wl-copy (Wayland
-# clipboard) - all three already used elsewhere on this box.
+# Pairs with `screenshot`, which saves a file. Needs slurp (region
+# select), grim (capture) and wl-copy (Wayland clipboard).
+#
+# usage: snip
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 for t in slurp grim wl-copy; do
 	command -v "$t" >/dev/null 2>&1 || { echo "snip: need '$t' on PATH" >&2; exit 1; }

@@ -1,15 +1,13 @@
 #!/bin/sh
-# <manwriter>
-# real Bluetooth picker over bluetoothctl (BlueZ) - the one real
-# userspace Bluetooth stack on Linux, same "no reimplementation"
-# choice as this dir's own wifi script (iwctl/wpa_cli). Not
-# NetworkManager, for the same "just a frontend, not a real backend"
-# reason wifi's own comment already gives.
+# btth - Bluetooth device picker over bluetoothctl (BlueZ).
 #
-# Needs a real interactive terminal (dispatched via run_interactive by
-# this project's nnn, not captured output - see wifi's own note on
-# the same requirement).
-# </manwriter>
+# Scans for ten seconds, lists what it found as a numbered menu, then
+# pairs, trusts and connects the one you pick. Starts bluetooth.service
+# (through sudo) when it is not running. Needs an interactive terminal.
+#
+# usage: btth
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 if ! command -v bluetoothctl >/dev/null 2>&1; then
 	echo "bluetoothctl not found (needs BlueZ)"
@@ -21,7 +19,7 @@ if ! systemctl is-active --quiet bluetooth 2>/dev/null; then
 	sudo systemctl start bluetooth || { echo "could not start bluetooth.service"; exit 1; }
 fi
 
-echo "scanning for real Bluetooth devices (10s)..."
+echo "scanning for Bluetooth devices (10s)..."
 bluetoothctl --timeout 10 scan on >/dev/null 2>&1
 
 tmp_macs="$(mktemp)"
@@ -56,7 +54,7 @@ if [ -z "$mac" ]; then
 	exit 1
 fi
 
-echo "pairing/trusting/connecting to real device $mac..."
+echo "pairing/trusting/connecting to $mac..."
 bluetoothctl pair "$mac"
 bluetoothctl trust "$mac"
 bluetoothctl connect "$mac"

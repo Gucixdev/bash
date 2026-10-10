@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# <manwriter>
 # evq - a tiny file-backed event queue for shell scripts.
 #
 # Named queues live as one file per event under
@@ -10,14 +9,6 @@
 # by nanosecond timestamp. An event is one line of text
 # or, with stdin, whatever stdin holds.
 #
-# @flag push [-q NAME] [EVENT...]:append EVENT (or stdin) to the queue
-# @flag pop [-q NAME] [-w [SECS]]:print and remove the oldest event; -w blocks until one arrives (or SECS pass, exit 1)
-# @flag peek [-q NAME]:print the oldest event without removing it
-# @flag list [-q NAME]:print all pending events, oldest first
-# @flag count [-q NAME]:print the number of pending events
-# @flag listen [-q NAME] CMD...:run CMD with each event as its last argument, forever
-# @flag clear [-q NAME]:drop every pending event
-# </manwriter>
 set -euo pipefail
 
 root="${XDG_RUNTIME_DIR:-/tmp}/evq-$UID"
@@ -35,7 +26,7 @@ if [[ ${1:-} == -q ]]; then
     q="$2"; shift 2
 fi
 dir="$root/$q"
-mkdir -p -m 700 "$root" "$dir"
+mkdir -p "$root" "$dir" && chmod 700 "$root" "$dir"
 
 oldest() {
     local f

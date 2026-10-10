@@ -1,11 +1,14 @@
 #!/bin/sh
-# strip metadata (EXIF, author/GPS/camera tags, etc) from a file before
-# you send/post it. Prefers mat2 or exiftool if either is ever installed
-# (neither is, on this box, as of writing) - falls back to ffmpeg for
-# video/audio and ImageMagick for images, both already installed here.
-# Always writes a NEW file (never overwrites the original in place).
+# metadata_cleaner - strip metadata (EXIF, author, GPS, camera tags) from
+# files before you share them.
 #
-# usage: metadata_cleaner FILE [FILE...]
+# Uses mat2 or exiftool when installed, otherwise ffmpeg for audio/video
+# and ImageMagick for images. Always writes a new clean-NAME file next to
+# the original and never modifies the original.
+#
+# usage: metadata_cleaner FILE...
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 [ $# -gt 0 ] || { echo "usage: metadata_cleaner FILE [FILE...]" >&2; exit 2; }
 
