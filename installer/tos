@@ -41,12 +41,23 @@ make_disk() {
 	say "created blank disk: $DISK ($DISK_SIZE)"
 }
 
+disk_has_boot_sector() {
+	# qemu-img create makes a full-size SPARSE file immediately, so file
+	# size (even via stat, even with sparse awareness) can't tell "blank"
+	# from "installed" - a blank disk's size is already the full
+	# DISK_SIZE from the moment it's created. Check the actual MBR boot
+	# signature (bytes 510-511 == 0x55 0xAA) instead.
+	local sig
+	sig=$(dd if="$DISK" bs=1 skip=510 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+	[ "$sig" = "55aa" ]
+}
+
 run_vm() {
 	need qemu-system-x86_64
 	local extra=()
-	# first boot (disk still has no install on it) needs the ISO attached
-	# and set to boot first; once installed, boot straight from the disk.
-	if [ ! -s "$DISK" ] || [ "$(stat -c%s "$DISK" 2>/dev/null || echo 0)" -le 65536 ]; then
+	# first boot (no real install yet) needs the ISO attached and set to
+	# boot first; once installed, boot straight from the disk.
+	if ! disk_has_boot_sector; then
 		extra=(-cdrom "$ISO" -boot d)
 	fi
 	say "booting ($RAM MiB RAM, disk=$DISK)"
