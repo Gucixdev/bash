@@ -1,55 +1,55 @@
 .TH EZFLATPAK 1 "2026-09-20" "caveutils" "caveutils Manual"
 .SH NAME
-ezflatpak \- terminal manager for Flatpak apps and their permissions, in
+flatseal \- terminal manager for Flatpak apps and their permissions, in
 .SH SYNOPSIS
-.B ezflatpak apps
+.B flatseal apps
 .br
-.B ezflatpak perms APP
+.B flatseal perms APP
 .br
-.B ezflatpak global
+.B flatseal global
 .br
-.B ezflatpak audit [--plain]
+.B flatseal audit [--plain]
 .br
-.B ezflatpak who KEY [--plain]
+.B flatseal who KEY [--plain]
 .br
-.B ezflatpak allow|deny|default APP KEY...
+.B flatseal allow|deny|default APP KEY...
 .br
-.B ezflatpak show APP [modified]
+.B flatseal show APP [modified]
 .br
-.B ezflatpak export [FILE] | import FILE
+.B flatseal export [FILE] | import FILE
 .br
-.B ezflatpak ENTER
+.B flatseal ENTER
 .br
-.B ezflatpak CTRL-G
+.B flatseal CTRL-G
 .br
-.B ezflatpak CTRL-X
+.B flatseal CTRL-X
 .br
-.B ezflatpak CTRL-U
+.B flatseal CTRL-U
 .br
-.B ezflatpak CTRL-N
+.B flatseal CTRL-N
 .br
-.B ezflatpak CTRL-Z
+.B flatseal CTRL-Z
 .br
-.B ezflatpak ALT-Z
+.B flatseal ALT-Z
 .br
-.B ezflatpak ALT-M
+.B flatseal ALT-M
 .br
-.B ezflatpak ALT-G
+.B flatseal ALT-G
 .br
-.B ezflatpak ALT-A
+.B flatseal ALT-A
 .br
-.B ezflatpak ALT-T
+.B flatseal ALT-T
 .br
-.B ezflatpak ALT-P
+.B flatseal ALT-P
 .br
-.B ezflatpak ALT-B
+.B flatseal ALT-B
 .SH DESCRIPTION
-.B ezflatpak
+.B flatseal
 .nf
 one tool, built on lib/lazytui.sh. It wraps the real flatpak, which it
 finds in PATH skipping itself.
 
-  ezflatpak [apps | perms APP | global | APP-ID]
+  flatseal [apps | perms APP | global | APP-ID]
 
 Apps (the default view) lists what is installed. Arrows or Tab move,
 space marks rows like nnn, / searches, and update / uninstall act on all
@@ -83,7 +83,7 @@ Beyond what Flatseal does:
              portal has stored something for the app.
   Audit      ALT-A: every app with a risk score (whole filesystem, session/system bus, all devices,
              sandbox escape via org.freedesktop.Flatpak, ...), riskiest first. CTRL-W: which apps have
-             a given permission. Also `ezflatpak audit --plain` and `ezflatpak who KEY --plain`.
+             a given permission. Also `flatseal audit --plain` and `flatseal who KEY --plain`.
   Try once   ALT-T: run the app with the marked rows flipped, without saving anything.
   Bulk       ALT-P (apps list): allow / deny / drop one permission for all marked apps.
   Version    permissions the installed flatpak is too old to know are not listed.

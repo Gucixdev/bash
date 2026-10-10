@@ -1,13 +1,13 @@
 #!/bin/sh
 # <manwriter>
-# ezflatpak - terminal manager for Flatpak apps and their permissions, in
+# flatseal - terminal manager for Flatpak apps and their permissions, in
 # one tool, built on lib/lazytui.sh. It wraps the real flatpak, which it
 # finds in PATH skipping itself.
 #
-#   ezflatpak [apps | perms APP | global | audit | who KEY | APP-ID]
-#   ezflatpak allow|deny|default APP KEY...     scripting, no UI
-#   ezflatpak show APP|@global [modified]       the effective permissions as text
-#   ezflatpak export [FILE] | import FILE       copy your overrides out / back in
+#   flatseal [apps | perms APP | global | audit | who KEY | APP-ID]
+#   flatseal allow|deny|default APP KEY...     scripting, no UI
+#   flatseal show APP|@global [modified]       the effective permissions as text
+#   flatseal export [FILE] | import FILE       copy your overrides out / back in
 #
 # Apps (the default view) lists what is installed. Arrows or Tab move,
 # space marks rows like nnn, / searches, and update / uninstall act on all
@@ -41,7 +41,7 @@
 #              has stored something for the app, here they can be set any time.
 #   Audit      ALT-A: every app with a risk score (whole filesystem, session/system bus, all devices,
 #              sandbox escape via org.freedesktop.Flatpak, ...), riskiest first. CTRL-W: which apps
-#              have a given permission. Also `ezflatpak audit --plain` and `ezflatpak who KEY --plain`.
+#              have a given permission. Also `flatseal audit --plain` and `flatseal who KEY --plain`.
 #   Try once   ALT-T: run the app with the marked rows flipped, without saving anything.
 #   Bulk       ALT-P (in the apps list): allow / deny / drop one permission for all marked apps.
 #   Version    permissions the installed flatpak is too old to know are not listed.
@@ -287,7 +287,7 @@ lt_realbin() {
 }
 
 # <<< lazytui <<<
-FP=$(lt_realbin flatpak) || { echo "ezflatpak: the real flatpak was not found in PATH" >&2; exit 1; }
+FP=$(lt_realbin flatpak) || { echo "flatseal: the real flatpak was not found in PATH" >&2; exit 1; }
 flatpak() { "$FP" "$@"; }
 
 # permissions worth showing even when the app doesn't mention them:
@@ -475,7 +475,7 @@ _backup() {
 }
 _undo() {
 	d=$(_bdir "$1"); last=$(ls -1 "$d" 2>/dev/null | tail -n 1)
-	[ -n "$last" ] || { echo "ezflatpak: nothing to undo for $1" >&2; printf 'press Enter ' >&2; read -r _ </dev/tty; return 0; }
+	[ -n "$last" ] || { echo "flatseal: nothing to undo for $1" >&2; printf 'press Enter ' >&2; read -r _ </dev/tty; return 0; }
 	f=$(_ofile "$1"); mkdir -p "$(dirname "$f")"
 	cp "$d/$last" "$f.tmp.$$" && mv "$f.tmp.$$" "$f" && rm -f "$d/$last"
 	echo "restored the overrides of $1 from $last"
@@ -506,7 +506,7 @@ _opts() {
 			talk-name)          printf -- '--no-talk-name=%s' "$val" ;;
 			system-talk-name)   printf -- '--system-no-talk-name=%s' "$val" ;;
 			own-name | system-own-name | see-name | system-see-name | persist)
-				echo "ezflatpak: $kind can't be denied one by one - use ^U to drop its override or ^Z to reset" >&2
+				echo "flatseal: $kind can't be denied one by one - use ^U to drop its override or ^Z to reset" >&2
 				return 1 ;;
 			*)                  printf -- '--no%s=%s' "$kind" "$val" ;;
 		esac
@@ -517,9 +517,9 @@ _opts() {
 _apply() {
 	verb=$1; app=$2; shift 2
 	for key in "$@"; do
-		case $key in portal=*) _portal_set "$verb" "$app" "$key" || echo "ezflatpak: failed for $key" >&2; continue ;; esac
+		case $key in portal=*) _portal_set "$verb" "$app" "$key" || echo "flatseal: failed for $key" >&2; continue ;; esac
 		opt=$(_opts "$verb" "$key") || continue
-		_ov "$app" "$opt" || echo "ezflatpak: failed for $key" >&2
+		_ov "$app" "$opt" || echo "flatseal: failed for $key" >&2
 	done
 }
 
@@ -611,28 +611,28 @@ _who_rows() {
 }
 
 case ${1:-} in
-	# scripting: ezflatpak allow|deny|default APP KEY...   ezflatpak show APP [modified]
+	# scripting: flatseal allow|deny|default APP KEY...   flatseal show APP [modified]
 	allow | deny)
 		verb=$1; app=${2:-}
-		[ -n "$app" ] && [ $# -ge 3 ] || { echo "usage: ezflatpak $verb APP KEY...   (KEY like share=network, filesystem=home, portal=notifications/notification)" >&2; exit 2; }
+		[ -n "$app" ] && [ $# -ge 3 ] || { echo "usage: flatseal $verb APP KEY...   (KEY like share=network, filesystem=home, portal=notifications/notification)" >&2; exit 2; }
 		shift 2; _apply "$verb" "$app" "$@"; exit 0 ;;
 	default)
-		app=${2:-}; [ -n "$app" ] && [ $# -ge 3 ] || { echo "usage: ezflatpak default APP KEY...   (drops your override)" >&2; exit 2; }
+		app=${2:-}; [ -n "$app" ] && [ $# -ge 3 ] || { echo "usage: flatseal default APP KEY...   (drops your override)" >&2; exit 2; }
 		shift; exec "$SELF" _drop "$@" ;;
 	show)
-		app=${2:-}; [ -n "$app" ] || { echo "usage: ezflatpak show APP|@global [modified]" >&2; exit 2; }
+		app=${2:-}; [ -n "$app" ] || { echo "usage: flatseal show APP|@global [modified]" >&2; exit 2; }
 		_table "$app" | awk -F'\t' -v only="${3:-}" '
 			only == "modified" && $3 == 0 { next }
 			{ printf "%-3s %s %-46s %s\n", $2, ($3 == 2 ? "*" : $3 == 1 ? "g" : " "), $1, $4 }'
 		exit 0 ;;
 	# a copy of every override you set (they are plain files), and the way back
 	export)
-		out=${2:-ezflatpak-overrides-$(date +%Y%m%d).tar}
+		out=${2:-flatseal-overrides-$(date +%Y%m%d).tar}
 		tar -cf "$out" -C "$(_odir)/.." overrides && echo "wrote $out"; exit 0 ;;
 	import)
-		in=${2:-}; [ -f "$in" ] || { echo "usage: ezflatpak import FILE   (a file made by ezflatpak export)" >&2; exit 2; }
+		in=${2:-}; [ -f "$in" ] || { echo "usage: flatseal import FILE   (a file made by flatseal export)" >&2; exit 2; }
 		lt_confirm "replace ALL your overrides with the ones in $in? (a backup tar is written first)" || exit 0
-		bak=ezflatpak-overrides-before-import-$(date +%Y%m%d%H%M%S).tar
+		bak=flatseal-overrides-before-import-$(date +%Y%m%d%H%M%S).tar
 		tar -cf "$bak" -C "$(_odir)/.." overrides 2>/dev/null && echo "backup: $bak"
 		tar -xf "$in" -C "$(_odir)/.." && echo "imported $in"; exit 0 ;;
 	# run the app once with the marked rows flipped, nothing is saved
@@ -747,7 +747,7 @@ alt-b:  >$SELF apps               # Apps"
 			--prompt 'search> ' --nth 2 --seed "$SELF _audit" --keys - >/dev/null || true
 		exit 0 ;;
 	who)
-		key=${2:-}; [ -n "$key" ] || { echo "usage: ezflatpak who KEY   (e.g. share=network, filesystem=home)" >&2; exit 2; }
+		key=${2:-}; [ -n "$key" ] || { echo "usage: flatseal who KEY   (e.g. share=network, filesystem=home)" >&2; exit 2; }
 		if [ "${3:-}" = --plain ]; then _who_rows "$key" | cut -f2-; exit 0; fi
 		LT_KEYS="enter:  >$SELF perms      # Permissions
 alt-b:  >$SELF audit              # Audit"
@@ -756,10 +756,10 @@ alt-b:  >$SELF audit              # Audit"
 			--seed "$SELF _who $key" --keys - >/dev/null || true
 		exit 0 ;;
 	perms) app=${2:-}; mode=${3:-}
-		[ -n "$app" ] || { echo "usage: ezflatpak perms APP-ID" >&2; exit 2; } ;;
+		[ -n "$app" ] || { echo "usage: flatseal perms APP-ID" >&2; exit 2; } ;;
 	global) app=@global; mode=${2:-} ;;
 	*.*)    app=$view; mode=${2:-} ;;
-	*)      echo "usage: ezflatpak [apps | perms APP | global | audit [--plain] | who KEY [--plain] | APP-ID]" >&2; exit 2 ;;
+	*)      echo "usage: flatseal [apps | perms APP | global | audit [--plain] | who KEY [--plain] | APP-ID]" >&2; exit 2 ;;
 esac
 
 case $mode in only) other=all; mlabel='Show all' ;; *) other=only; mlabel='Only modified' ;; esac

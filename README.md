@@ -40,7 +40,7 @@ copied-in block (it's idempotent — safe to run any time).
 |---|---|
 | `ezbacksnap` | Btrfs snapshots on a schedule + a snapshot before every update, single-file restore, rotating rsync backups — a Timeshift replacement. |
 | `ezcontainers` | Terminal manager for containers/images/volumes/networks — one tool for Docker *and* Podman, drives whichever is installed. |
-| `ezflatpak` | Terminal manager for Flatpak apps and their permissions. |
+| `flatseal` | Terminal manager for Flatpak apps and their permissions. |
 | `ezgh` | Browse your GitHub repos/issues/PRs/workflow runs. Uses `gh` if present, falls back to the public REST API via curl otherwise. |
 | `ezhf` | Browse the Hugging Face Hub and your local cache; same real-tool-first-curl-fallback pattern as `ezgh`. |
 | `ezlog` | Read journal/unit/kernel/plain logs with fzf, coloured by severity, live or snapshot. |
