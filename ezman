@@ -313,7 +313,7 @@ _fulltext() {
 		f = $0; b = f; sub(/.*\//, "", b); sub(/\.(gz|bz2|xz|zst)$/, "", b)
 		n = b; sub(/\.[^.]*$/, "", n); s = b; sub(/.*\./, "", s)
 		printf "path:%s\t%-26.26s (%s) %s\n", f, n, s, f }' >"${TMPDIR:-/tmp}/ezman.$$"
-	if [ ! -s "${TMPDIR:-/tmp}/ezman.$$" ]; then echo "no page mentions '$term'" >&2; pause=1; read -r _ </dev/tty; rm -f "${TMPDIR:-/tmp}/ezman.$$"; exit 0; fi
+	if [ ! -s "${TMPDIR:-/tmp}/ezman.$$" ]; then echo "no page mentions '$term'" >&2; read -r _ </dev/tty; rm -f "${TMPDIR:-/tmp}/ezman.$$"; exit 0; fi
 	key=$(lt_select --seed "cat ${TMPDIR:-/tmp}/ezman.$$" --nth 2 --header "pages containing '$term'" --prompt 'page> ' --preview "$SELF _preview") || { rm -f "${TMPDIR:-/tmp}/ezman.$$"; exit 0; }
 	rm -f "${TMPDIR:-/tmp}/ezman.$$"
 	[ -n "$key" ] && _open "$key"
