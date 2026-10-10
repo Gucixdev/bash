@@ -25,8 +25,8 @@ setup() {
 }
 
 @test "every top-level tool answers --help from its header" {
-	for f in btth cleaner ezcontainers flatseal metadata_cleaner nmap scenario todo trash wifi \
-		ezhf screenshot gitgrab logcollector manwriter; do
+	for f in btth cleaner ezcontainers flatseal metadata_cleaner nmap scenario sniff todo trash wifi \
+		ezhf screenshot gitgrab logcollector manwriter findfat morph fixmedia; do
 		run ./"$f" --help
 		[ "$status" -eq 0 ]
 		[ -n "$output" ]
@@ -35,6 +35,8 @@ setup() {
 
 @test "shellcheck: no warnings or errors" {
 	command -v shellcheck >/dev/null || skip "shellcheck not installed"
-	run make lint
+	run shellcheck -S warning btth cleaner ezcontainers ezhf findfat fixmedia flatseal gitgrab logcollector \
+		manwriter metadata_cleaner morph nmap scenario screenshot sniff todo trash wifi \
+		lib/lazytui.sh lib/dspq lib/evq installer/blenderlauncher installer/comfysetup installer/tos
 	[ "$status" -eq 0 ]
 }

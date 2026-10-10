@@ -14,6 +14,7 @@
 # documented command syntax and were not run against a live setup; the
 # nmcli path was checked for syntax only (nmcli is not installed on the
 # machine it was written on).
+# shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose
 
 case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 

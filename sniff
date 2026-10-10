@@ -1,0 +1,184 @@
+#!/bin/sh
+# sniff - what is this machine talking to? Captures for a few seconds and
+# summarizes: totals, protocols, busiest conversations, services, DNS names.
+#
+# usage: sniff [-i IFACE] [-t SECONDS] [-f FILTER] [-w FILE]   capture, then summarize
+#        sniff -r FILE.pcap                                    summarize a capture
+#        sniff -                                               summarize `tcpdump -nn` text on stdin
+#        sniff conns                                           live connections per process
+#
+#   -i IFACE    interface (default: any)
+#   -t SECONDS  how long to capture (default 10)
+#   -f FILTER   tcpdump filter, e.g. 'port 443'
+#   -w FILE     keep the raw capture as a pcap
+#
+# Capturing needs root or cap_net_raw: when tcpdump is refused, sniff
+# retries once through sudo. `conns` needs neither (processes of other
+# users are only shown as root). Needs tcpdump for captures, ss for conns.
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+iface=any
+secs=10
+filter=
+keep=
+readf=
+
+# summarize: tcpdump -nn text on stdin -> report
+summarize() {
+	awk '
+	function human(n) {
+		if (n >= 1073741824) return sprintf("%.1f GiB", n / 1073741824)
+		if (n >= 1048576) return sprintf("%.1f MiB", n / 1048576)
+		if (n >= 1024) return sprintf("%.1f KiB", n / 1024)
+		return n " B"
+	}
+	function service(p) {
+		if (p in svc) return svc[p] " (" p ")"
+		return p
+	}
+	# addr -> host, port ("" when none); sets H and P
+	function split_addr(a, v6,    n, parts, i) {
+		sub(/:$/, "", a)
+		H = a; P = ""
+		if (v6) {
+			i = match(a, /\.[0-9]+$/)
+			if (i) { H = substr(a, 1, i - 1); P = substr(a, i + 1) }
+		} else {
+			n = split(a, parts, ".")
+			if (n == 5) { H = parts[1] "." parts[2] "." parts[3] "." parts[4]; P = parts[5] }
+		}
+	}
+	function top(arr, cnt, title, unit,    k, i, j, n, keys, tmp) {
+		n = 0
+		for (k in arr) keys[++n] = k
+		for (i = 2; i <= n; i++) {
+			tmp = keys[i]; j = i - 1
+			while (j > 0 && arr[keys[j]] < arr[tmp]) { keys[j + 1] = keys[j]; j-- }
+			keys[j + 1] = tmp
+		}
+		if (n == 0) return
+		print ""; print title
+		for (i = 1; i <= n && i <= cnt; i++) {
+			if (unit == "bytes") printf "  %10s  %s\n", human(arr[keys[i]]), keys[i]
+			else printf "  %10d  %s\n", arr[keys[i]], keys[i]
+		}
+	}
+	BEGIN {
+		svc[22]="ssh"; svc[53]="dns"; svc[67]="dhcp"; svc[68]="dhcp"; svc[80]="http"; svc[123]="ntp"
+		svc[443]="https"; svc[853]="dns-over-tls"; svc[5353]="mdns"; svc[1900]="ssdp"; svc[5222]="xmpp"
+		svc[25]="smtp"; svc[587]="smtp"; svc[993]="imaps"; svc[3478]="stun"; svc[8080]="http-alt"
+		svc[51820]="wireguard"; svc[1194]="openvpn"; svc[445]="smb"; svc[631]="ipp"
+	}
+	$2 == "IP" || $2 == "IP6" || $2 == "ARP," {
+		pk++
+		ts = $1 + 0
+		if (first == 0 || ts < first) first = ts
+		if (ts > last) last = ts
+		v6 = ($2 == "IP6")
+		len = 0
+		if (match($0, /length [0-9]+/)) { s = substr($0, RSTART + 7, RLENGTH - 7); len = s + 0 }
+		else if (match($0, /\([0-9]+\)$/)) { len = substr($0, RSTART + 1, RLENGTH - 2) + 0 }
+		bytes += len
+		if ($2 == "ARP,") { proto = "arp"; pb["arp"] += len; pc["arp"]++; next }
+		if ($0 ~ /Flags \[/) proto = "tcp"
+		else if ($0 ~ /ICMP/) proto = "icmp"
+		else if ($0 ~ /UDP|\?|[0-9]+\/[0-9]+\/[0-9]+/) proto = "udp"
+		else proto = "other"
+		pc[proto]++; pb[proto] += len
+		split_addr($3, v6); sh = H; sp = P
+		split_addr($5, v6); dh = H; dp = P
+		key = (sh < dh) ? sh " <-> " dh : dh " <-> " sh
+		conv[key] += len
+		if (sp != "" && dp != "") {
+			if (dp in svc) port = dp
+			else if (sp in svc) port = sp
+			else port = (sp + 0 < dp + 0) ? sp : dp
+			sv[proto "/" service(port)] += len
+		}
+		for (i = 6; i < NF; i++)
+			if ($i ~ /\?$/ && $(i + 1) ~ /\./) { dns[$(i + 1)]++; break }
+		next
+	}
+	END {
+		if (pk == 0) { print "no packets seen"; exit }
+		dur = last - first
+		printf "%d packets, %s", pk, human(bytes)
+		if (dur > 0) printf " in %.1fs (%s/s)", dur, human(bytes / dur)
+		print ""
+		print ""; print "protocols"
+		for (p in pc) printf "  %-6s %7d packets  %10s\n", p, pc[p], human(pb[p])
+		top(conv, 10, "busiest conversations", "bytes")
+		top(sv, 10, "services", "bytes")
+		top(dns, 10, "DNS names asked", "count")
+	}'
+}
+
+# conns: established sockets grouped by process
+conns() {
+	command -v ss >/dev/null 2>&1 || { echo "sniff: conns needs ss (iproute2)" >&2; exit 1; }
+	ss -H -n -t -u -p state established 2>/dev/null | awk '
+	{
+		peer = $4; proc = "(other user / kernel)"
+		if (match($0, /\(\("[^"]+"/)) proc = substr($0, RSTART + 3, RLENGTH - 4)
+		n[proc]++
+		r = peer; sub(/:[0-9]+$/, "", r)
+		if (!((proc SUBSEP r) in seen)) { seen[proc SUBSEP r] = 1; peers[proc] = peers[proc] (peers[proc] == "" ? "" : ", ") peer }
+		total++
+	}
+	END {
+		if (total == 0) { print "no established connections"; exit }
+		for (p in n) printf "%4d  %-24s %s\n", n[p], p, substr(peers[p], 1, 90)
+	}' | sort -rn
+}
+
+if [ "${1:-}" = conns ]; then
+	conns
+	exit 0
+fi
+
+while getopts i:t:f:w:r: opt; do
+	case "$opt" in
+	i) iface=$OPTARG ;;
+	t) secs=$OPTARG ;;
+	f) filter=$OPTARG ;;
+	w) keep=$OPTARG ;;
+	r) readf=$OPTARG ;;
+	*) echo "usage: sniff [-i IFACE] [-t SECONDS] [-f FILTER] [-w FILE] | -r FILE | - | conns" >&2; exit 2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+if [ "${1:-}" = "-" ]; then
+	summarize
+	exit 0
+fi
+
+command -v tcpdump >/dev/null 2>&1 || { echo "sniff: need tcpdump (pacman -S tcpdump / apt install tcpdump); \`sniff conns\` works without it" >&2; exit 1; }
+
+if [ -n "$readf" ]; then
+	[ -r "$readf" ] || { echo "sniff: cannot read $readf" >&2; exit 1; }
+	tcpdump -nn -tt -r "$readf" 2>/dev/null | summarize
+	exit 0
+fi
+
+case $secs in '' | *[!0-9]* | 0) echo "sniff: -t wants whole seconds" >&2; exit 2 ;; esac
+
+# permission probe: one packet or two seconds, stderr only
+sudo=
+probe=$(timeout 2 tcpdump -i "$iface" -nn -c 1 2>&1 >/dev/null)
+case $probe in
+	*ermission* | *"not permitted"*)
+		command -v sudo >/dev/null 2>&1 || { echo "sniff: capturing needs root or: sudo setcap cap_net_raw+ep \$(command -v tcpdump)" >&2; exit 1; }
+		sudo=sudo ;;
+	*"No such device"*) echo "sniff: no interface '$iface' (see: tcpdump -D)" >&2; exit 1 ;;
+esac
+
+echo "capturing ${secs}s on $iface${filter:+ ($filter)}..." >&2
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT INT TERM
+# shellcheck disable=SC2086  # the filter is an expression of several words on purpose
+$sudo timeout "$secs" tcpdump -i "$iface" -nn -tt -l -U -w "$tmp" $filter >/dev/null 2>&1
+[ -s "$tmp" ] || { echo "sniff: nothing captured" >&2; exit 1; }
+[ -n "$keep" ] && cp "$tmp" "$keep" && echo "saved capture to $keep" >&2
+tcpdump -nn -tt -r "$tmp" 2>/dev/null | summarize

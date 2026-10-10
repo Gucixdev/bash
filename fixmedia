@@ -1,0 +1,91 @@
+#!/bin/sh
+# fixmedia - try to repair broken audio, video and image files. The
+# original is never touched: the result is written as fixed-NAME next to it.
+#
+# Video and audio: re-mux without re-encoding first (fixes broken
+# containers and missing indexes), then a full re-encode if that is not
+# enough. Images: re-save through ImageMagick (reads truncated files and
+# writes a clean one), then ffmpeg.
+#
+# usage: fixmedia FILE...
+#        fixmedia -c FILE...     only check, report ok or broken
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+check=0
+[ "${1:-}" = "-c" ] && { check=1; shift; }
+[ $# -gt 0 ] || { echo "usage: fixmedia [-c] FILE..." >&2; exit 2; }
+
+is_image() {
+	case $(printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]') in
+	png | jpg | jpeg | webp | bmp | tif | tiff | avif | heic | ico | gif | ppm) return 0 ;;
+	esac
+	return 1
+}
+
+# healthy FILE: 0 when the file decodes without errors
+healthy() {
+	# decode every pixel to null: anything printed (e.g. "premature end of JPEG file") means damage
+	if is_image "$1" && have magick; then
+		[ -z "$(magick "$1" null: 2>&1)" ]
+	elif is_image "$1" && have convert; then
+		[ -z "$(convert "$1" null: 2>&1)" ]
+	elif have ffmpeg; then
+		[ -z "$(ffmpeg -v error -i "$1" -f null - 2>&1 | head -n 1)" ]
+	else
+		return 1
+	fi
+}
+
+rc=0
+for f in "$@"; do
+	if [ ! -f "$f" ]; then
+		echo "fixmedia: no such file: $f" >&2
+		rc=1
+		continue
+	fi
+	if healthy "$f"; then
+		echo "ok       $f"
+		continue
+	fi
+	if [ "$check" -eq 1 ]; then
+		echo "broken   $f"
+		rc=1
+		continue
+	fi
+	dir=$(dirname -- "$f")
+	base=$(basename -- "$f")
+	out="$dir/fixed-$base"
+	if [ -e "$out" ]; then
+		echo "skip     $f ($out exists)" >&2
+		rc=1
+		continue
+	fi
+	done=
+	if is_image "$f"; then
+		if have magick && magick "$f" "$out" 2>/dev/null && [ -s "$out" ]; then done="re-saved with ImageMagick"
+		elif have convert && convert "$f" "$out" 2>/dev/null && [ -s "$out" ]; then done="re-saved with ImageMagick"
+		elif have ffmpeg && ffmpeg -v error -err_detect ignore_err -i "$f" "$out" 2>/dev/null && [ -s "$out" ]; then done="re-encoded with ffmpeg"
+		fi
+	elif have ffmpeg; then
+		if ffmpeg -v error -err_detect ignore_err -i "$f" -c copy "$out" 2>/dev/null && [ -s "$out" ] && healthy "$out"; then
+			done="re-muxed, streams copied"
+		else
+			rm -f "$out"
+			if ffmpeg -v error -err_detect ignore_err -i "$f" "$out" 2>/dev/null && [ -s "$out" ]; then done="re-encoded"; fi
+		fi
+	else
+		echo "fixmedia: need ffmpeg (or ImageMagick for images)" >&2
+		exit 1
+	fi
+	if [ -n "$done" ]; then
+		echo "fixed    $f -> $out ($done)"
+	else
+		rm -f "$out"
+		echo "FAILED   $f (nothing could read it)" >&2
+		rc=1
+	fi
+done
+exit "$rc"

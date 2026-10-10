@@ -93,3 +93,47 @@ setup() {
 	grep -q 'be loud' "$tmp/demo.1"
 	rm -rf "$tmp"
 }
+
+@test "sniff: summarizes tcpdump text from stdin" {
+	run sh -c "printf '%s\n' \
+		'1696953601.1 IP 192.168.1.10.54321 > 142.250.74.46.443: Flags [P.], seq 1:518, ack 1, win 502, length 517' \
+		'1696953601.3 IP 192.168.1.10.41234 > 192.168.1.1.53: 12345+ A? example.com. (29)' \
+		| ./sniff -"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"2 packets"* ]]
+	[[ "$output" == *"tcp/https (443)"* ]]
+	[[ "$output" == *"example.com."* ]]
+}
+
+@test "findfat: lists the biggest file first" {
+	tmp=$(mktemp -d)
+	dd if=/dev/zero of="$tmp/big" bs=1k count=64 2>/dev/null
+	dd if=/dev/zero of="$tmp/small" bs=1k count=1 2>/dev/null
+	run ./findfat -file -n 1 "$tmp"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"/big"* ]]
+	[[ "$output" != *"/small"* ]]
+	rm -rf "$tmp"
+}
+
+@test "morph: refuses to overwrite and to cross kinds" {
+	tmp=$(mktemp -d)
+	: > "$tmp/a.png"; : > "$tmp/b.png"
+	run ./morph "$tmp/a.png" "$tmp/b.png"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"exists"* ]]
+	run ./morph "$tmp/a.png" "$tmp/a.mp3"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"cannot convert"* ]]
+	rm -rf "$tmp"
+}
+
+@test "fixmedia: -c reports a healthy image as ok" {
+	command -v convert >/dev/null || command -v magick >/dev/null || skip "ImageMagick not installed"
+	tmp=$(mktemp -d)
+	convert -size 4x4 xc:red "$tmp/a.png" 2>/dev/null || magick -size 4x4 xc:red "$tmp/a.png"
+	run ./fixmedia -c "$tmp/a.png"
+	[ "$status" -eq 0 ]
+	[[ "$output" == ok* ]]
+	rm -rf "$tmp"
+}

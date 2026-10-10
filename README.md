@@ -7,12 +7,12 @@ it is missing, and run on their own once copied out of this repo.
 
 ```sh
 git clone <this repo> && cd bash
-make install            # symlinks into ~/.local/bin
-logcollector -n         # try one: a summary of what went wrong in the last day
+./logcollector -n       # try one: a summary of what went wrong in the last day
+ln -s "$PWD/logcollector" ~/.local/bin/    # put any tool on PATH
 ```
 
-`make test` runs the bats suite, `make lint` runs shellcheck at
-warning level. Both run in CI.
+`bats tests/` runs the tests. Scripts are also kept clean under
+`shellcheck -S warning`.
 
 ## Principles
 
@@ -58,7 +58,11 @@ like nnn, `/` to search, a key bar always showing what is available.
 | `wifi` | Wi-Fi picker over NetworkManager, iwd or wpa_supplicant. |
 | `btth` | Bluetooth picker over `bluetoothctl`. |
 | `metadata_cleaner` | Strip EXIF and other metadata into a new `clean-NAME` file. mat2 or exiftool, else ffmpeg or ImageMagick. |
-| `nmap` | Presets in front of the real nmap, `nmap -- ARGS` passes through. Installed as `nmap-presets` by `make install` so it does not shadow the real one. |
+| `nmap` | Presets in front of the real nmap, `nmap -- ARGS` passes through. Finds the real nmap by skipping itself, so it is safe on PATH under that name, though linking it as `nmap-presets` keeps plain `nmap` untouched. |
+| `sniff` | What is this machine talking to: capture N seconds and get totals, protocol mix, busiest conversations, services and DNS names. `-r` reads a pcap, `-` reads `tcpdump -nn` text, `sniff conns` shows live connections per process without root. |
+| `findfat` | Biggest directories and files under a path, one filesystem only. `-dir`, `-file`, `-n COUNT`. |
+| `morph` | `mv` for formats: `morph a.png a.webp`, picks magick/ffmpeg/assimp/fontforge/pandoc by the two extensions. Never overwrites without `-f`. |
+| `fixmedia` | Repair broken video, audio and images into `fixed-NAME`: re-mux, then re-encode; images re-saved. `-c` only checks. |
 | `manwriter` | Turn a script's header comment into a man page: `manwriter -d man tool...`. `manwriter new` writes a skeleton. |
 
 ## Installers
@@ -75,15 +79,25 @@ lib/lazytui.sh   reference copy of the lt_* UI helpers tools carry
 lib/dspq, evq    download queue and event queue for shell scripts
 installer/       one-shot clone, build, run scripts
 tests/           bats: parsing, --help, shellcheck, behaviour of the offline tools
-docs/ideas.md    what is not built yet
 ```
+
+## Ideas
+
+Not built yet:
+
+- **lazytui in C/ANSI.** The shell library stays as the reference; a C
+  version of the same widgets (key hints bar, `raw` and `select` modes,
+  actions declared as `key = command`) is planned.
+- **dspq as a tool.** `lib/dspq` is a parallel, atomic download queue for
+  shell scripts; a front end with a progress view would sit on top.
 
 ## Status
 
 Tested on Arch (CachyOS) with Hyprland. `wifi` (iwd, wpa_supplicant
 paths), `scenario` (cnee backend) and the non-pacman branches of
 `cleaner` follow the tools' documented syntax and have not been run on a
-live system. `make test` covers what can run without root, network or a
-display.
+live system. The tests cover what can run without root, network or a display;
+`sniff` capture itself needs root and was verified on synthetic
+`tcpdump` output only.
 
 MIT, see `LICENSE`.

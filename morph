@@ -1,0 +1,86 @@
+#!/bin/sh
+# morph - mv for formats: convert a file to the format of the output name.
+# The backend is picked by what the two extensions are:
+#   images     magick, convert or ffmpeg
+#   audio/video  ffmpeg (video to audio keeps just the sound)
+#   3D models  assimp (obj fbx gltf glb stl ply dae 3ds)
+#   fonts      fontforge (ttf otf woff woff2)
+#   documents  pandoc (md html docx odt epub txt pdf)
+# Never overwrites an existing file unless -f is given.
+#
+# usage: morph [-f] IN OUT      morph photo.png photo.webp
+#        morph -l               list the backends found
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if [ "${1:-}" = "-l" ]; then
+	for t in magick convert ffmpeg assimp fontforge pandoc; do
+		if have "$t"; then echo "  ok       $t"; else echo "  missing  $t"; fi
+	done
+	exit 0
+fi
+
+force=0
+[ "${1:-}" = "-f" ] && { force=1; shift; }
+[ $# -eq 2 ] || { echo "usage: morph [-f] IN OUT   |   morph -l" >&2; exit 2; }
+in=$1 out=$2
+[ -f "$in" ] || { echo "morph: no such file: $in" >&2; exit 1; }
+if [ -e "$out" ] && [ "$force" -ne 1 ]; then
+	echo "morph: $out exists (use -f to overwrite)" >&2
+	exit 1
+fi
+
+ext() { printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]'; }
+kind() {
+	case $1 in
+	png | jpg | jpeg | webp | bmp | tif | tiff | avif | heic | ico | ppm | pgm | pbm | svg | gif) echo image ;;
+	mp3 | wav | flac | ogg | opus | m4a | aac | wma) echo audio ;;
+	mp4 | mkv | webm | mov | avi | flv) echo video ;;
+	obj | fbx | gltf | glb | stl | ply | dae | 3ds) echo model ;;
+	ttf | otf | woff | woff2) echo font ;;
+	md | html | htm | docx | odt | epub | txt | pdf | rst) echo doc ;;
+	*) echo unknown ;;
+	esac
+}
+
+ie=$(ext "$in") oe=$(ext "$out")
+ik=$(kind "$ie") ok=$(kind "$oe")
+[ "$ik" != unknown ] || { echo "morph: don't know the format of .$ie" >&2; exit 1; }
+[ "$ok" != unknown ] || { echo "morph: don't know the format of .$oe" >&2; exit 1; }
+
+# gif is both: video in, image out and the other way round are fine with ffmpeg
+if [ "$ie" = gif ] && [ "$ok" = video ]; then ik=video; fi
+if [ "$oe" = gif ] && [ "$ik" = video ]; then ok=video; fi
+
+need() { echo "morph: need $1 for $ik -> $ok (pacman -S $2 / apt install $2)" >&2; exit 1; }
+ow=; [ "$force" -eq 1 ] && ow=-y
+
+case "$ik:$ok" in
+image:image)
+	if have magick; then magick "$in" "$out"
+	elif have convert; then convert "$in" "$out"
+	elif have ffmpeg; then ffmpeg -v error ${ow:--n} -i "$in" "$out"
+	else need "ImageMagick or ffmpeg" imagemagick; fi ;;
+audio:audio | video:video | video:audio | audio:video)
+	[ "$ik:$ok" = audio:video ] && { echo "morph: cannot make video from audio" >&2; exit 1; }
+	have ffmpeg || need ffmpeg ffmpeg
+	if [ "$ik:$ok" = video:audio ]; then ffmpeg -v error ${ow:--n} -i "$in" -vn "$out"
+	else ffmpeg -v error ${ow:--n} -i "$in" "$out"; fi ;;
+model:model)
+	have assimp || need assimp assimp
+	assimp export "$in" "$out" ;;
+font:font)
+	have fontforge || need fontforge fontforge
+	fontforge -quiet -lang=ff -c 'Open($1); Generate($2)' "$in" "$out" ;;
+doc:doc)
+	have pandoc || need pandoc pandoc
+	pandoc "$in" -o "$out" ;;
+*)
+	echo "morph: cannot convert $ik (.$ie) to $ok (.$oe)" >&2
+	exit 1 ;;
+esac || { rm -f "$out"; echo "morph: conversion failed" >&2; exit 1; }
+
+[ -s "$out" ] || { rm -f "$out"; echo "morph: conversion produced no file" >&2; exit 1; }
+echo "$out"

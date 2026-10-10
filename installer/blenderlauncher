@@ -34,6 +34,8 @@
 #   3. download.blender.org/release/  (historical archive, 2.48+, HTML listing;
 #      EVERY patch per line, like BL v2's stable.py - not just the newest)
 # The merged list is cached at $BLENDER_HOME/cache/ for an hour.
+# shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose
+
 set -eu
 
 SELF=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")

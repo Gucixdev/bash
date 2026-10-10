@@ -7,6 +7,7 @@
 #
 # Public:   lt_select lt_input lt_confirm lt_wizard lt_realbin
 # Internal: _lt_hint _lt_trim _lt_script _lt_fallback
+# shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose
 
 # _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
 # (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap

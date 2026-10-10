@@ -16,6 +16,8 @@
 # worker writes "DIR/<label>" as "<cur> <total> <run|done|fail>" and NO bar is
 # drawn - for a caller that renders its own per-item UI (e.g. blender's TUI).
 # $HF_TOKEN (exported) is sent for huggingface.co URLs.
+# shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose
+
 set -eu
 
 SELF=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")

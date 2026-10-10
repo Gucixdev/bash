@@ -7,6 +7,7 @@
 #   flatseal allow|deny|default APP KEY...     scripting, no UI
 #   flatseal show APP|@global [modified]       the effective permissions as text
 #   flatseal export [FILE] | import FILE       copy your overrides out / back in
+# shellcheck disable=SC1007,SC2089,SC2090  # LT_KEYS keeps quoting for a later sh -c; a= b= sets several variables to empty on purpose
 
 case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 

@@ -7,6 +7,7 @@
 #   -d SECONDS  wait before capturing
 #   -c          clipboard only: nothing is written to disk
 #   -n          no clipboard copy, no notification
+# shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose
 
 # ---- edit me ---------------------------------------------------------
 # >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>

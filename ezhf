@@ -16,6 +16,7 @@
 # The cache is HF_HUB_CACHE, or HF_HOME/hub, or ~/.cache/huggingface/hub. A token in HF_TOKEN (or
 # HF_HOME/token) is used for private and gated repos. REPO is OWNER/NAME (or just NAME for old repos).
 #
+# shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose
 
 # >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
 # _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key

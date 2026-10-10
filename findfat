@@ -1,0 +1,55 @@
+#!/bin/sh
+# findfat - where did the disk go? The biggest files and directories under
+# a path, largest first, without crossing into other filesystems.
+#
+# usage: findfat [-dir | -file] [-n COUNT] [DIR]
+#
+#   -dir     only directories (sizes include everything below them)
+#   -file    only files
+#   -n COUNT how many to show (default 15)
+#   DIR      where to look (default: current directory)
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+want_dir=1
+want_file=1
+count=15
+while [ $# -gt 0 ]; do
+	case $1 in
+	-dir | -d) want_file=0; shift ;;
+	-file | -f) want_dir=0; shift ;;
+	-n) count=${2:-}; shift 2 ;;
+	-*) echo "findfat: unknown option $1" >&2; exit 2 ;;
+	*) break ;;
+	esac
+done
+case $count in '' | *[!0-9]* | 0) echo "findfat: -n wants a positive number" >&2; exit 2 ;; esac
+dir=${1:-.}
+[ -d "$dir" ] || { echo "findfat: $dir is not a directory" >&2; exit 1; }
+
+human() {
+	awk '{
+		b = $1
+		if (b >= 1073741824) printf "%8.1f GiB  ", b / 1073741824
+		else if (b >= 1048576) printf "%8.1f MiB  ", b / 1048576
+		else if (b >= 1024) printf "%8.1f KiB  ", b / 1024
+		else printf "%8d B    ", b
+		sub(/^[0-9]+\t/, ""); print
+	}'
+}
+
+if [ "$want_dir" -eq 1 ]; then
+	[ "$want_file" -eq 1 ] && echo "directories:"
+	# du -k is POSIX; cumulative size per directory, the top directory itself is skipped
+	du -x -k "$dir" 2>/dev/null | awk -v top="$dir" -F'\t' '$2 != top { printf "%d\t%s\n", $1 * 1024, $2 }' |
+		sort -rn | head -n "$count" | human
+fi
+if [ "$want_file" -eq 1 ]; then
+	[ "$want_dir" -eq 1 ] && echo && echo "files:"
+	if find "$dir" -maxdepth 0 -printf '' 2>/dev/null; then
+		find "$dir" -xdev -type f -printf '%s\t%p\n' 2>/dev/null
+	else
+		# no -printf (busybox, BSD): wc -c prints "bytes path"
+		find "$dir" -xdev -type f -exec wc -c {} + 2>/dev/null | awk '$2 != "total" { b = $1; sub(/^ *[0-9]+ /, ""); printf "%d\t%s\n", b, $0 }'
+	fi | sort -rn | head -n "$count" | human
+fi
