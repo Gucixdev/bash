@@ -261,7 +261,7 @@ lt_realbin() {
 	for _lt_d in $PATH; do
 		IFS=$_lt_old
 		_lt_c=$_lt_d/$1
-		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && ! [ "$_lt_c" -ef "$0" ]; then printf '%s\n' "$_lt_c"; return 0; fi
+		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && [ "$(readlink -f -- "$_lt_c" 2>/dev/null || echo "$_lt_c")" != "$(readlink -f -- "$0" 2>/dev/null || echo "$0")" ]; then printf '%s\n' "$_lt_c"; return 0; fi
 		IFS=:
 	done
 	IFS=$_lt_old

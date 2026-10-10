@@ -199,7 +199,7 @@ setup() {
 	printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "$tmp/curl"
 	printf '#!/bin/sh\n[ "$1 $2" = "auth token" ] && echo fromgh\n' > "$tmp/gh"
 	chmod +x "$tmp/curl" "$tmp/gh"
-	env -u GH_TOKEN PATH="$tmp:$PATH" run ./gitgrab o/r f -o -
+	PATH="$tmp:$PATH" run env -u GH_TOKEN ./gitgrab o/r f -o -
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"Authorization: Bearer fromgh"* ]]
 	rm -rf "$tmp"

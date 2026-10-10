@@ -186,3 +186,14 @@ teardown() {
 	[ "$status" -eq 2 ]
 	[[ "$output" == *"unknown arg"* ]]
 }
+
+@test "lazytui: lt_realbin skips the script itself and finds the real binary" {
+	mkdir "$tmp/bin" "$tmp/real"
+	printf '#!/bin/sh\n. "%s/lib/lazytui"\nlt_realbin mytool\n' "$PWD" > "$tmp/bin/mytool"
+	chmod +x "$tmp/bin/mytool"
+	printf '#!/bin/sh\necho real\n' > "$tmp/real/mytool"
+	chmod +x "$tmp/real/mytool"
+	PATH="$tmp/bin:$tmp/real:$PATH" run mytool
+	[ "$status" -eq 0 ]
+	[ "$output" = "$tmp/real/mytool" ]
+}
