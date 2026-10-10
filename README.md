@@ -73,7 +73,7 @@ DNS names asked
 - **Show before doing.** Anything destructive lists what it will touch
   and asks once. `cleaner` never removes packages on its own.
 - **No secrets in the repo.** Tokens come from the environment
-  (`GH_TOKEN`, `HF_TOKEN`, see `.env.example`).
+  (`GH_TOKEN`, `HF_TOKEN`, see `secrets.example`; the shell loads them from `~/.secrets`).
 
 Every tool prints its header with `--help`.
 
