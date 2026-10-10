@@ -1,0 +1,113 @@
+#!/bin/sh
+# <manwriter>
+# dq - a parallel, atomic download queue for shell scripts.
+#
+#   dq [-j N] ENTRY...          download each ENTRY; up to N at once (default 3)
+#   dq [-j N] -                 read ENTRYs from stdin, one per line
+#   dq [-j N] --state DIR ...   no bar; write per-item progress into DIR
+#
+# ENTRY is  url|dest[|label]   (dest = full path).
+#
+#   sequence : the list is a FIFO - workers pull from it in order
+#   parallel : -j N downloads run concurrently
+#   atomic   : each lands in <dest>.part, renamed onto <dest> only on success
+#   resumable: re-run with the same list; done files skip, .part continue
+#
+# Default: one aggregate pacmanbar for the whole queue. With --state DIR each
+# worker writes "DIR/<label>" as "<cur> <total> <run|done|fail>" and NO bar is
+# drawn - for a caller that renders its own per-item UI (e.g. blender's TUI).
+# $HF_TOKEN (exported) is sent for huggingface.co URLs.
+# </manwriter>
+set -eu
+
+SELF=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
+PB=$(dirname -- "$SELF")/pacmanbar
+export HF_TOKEN="${HF_TOKEN:-}"
+
+_key() { printf %s "$1" | tr -c 'A-Za-z0-9._-' _; }
+
+# --- hidden: print byte size of one ENTRY's url (or the file if complete) --
+if [ "${1:-}" = _size ]; then
+	e=$2; url=${e%%|*}; rest=${e#*|}; dst=${rest%%|*}
+	if [ -s "$dst" ]; then stat -c%s "$dst"; exit 0; fi
+	case $url in
+		*huggingface.co*) [ -n "$HF_TOKEN" ] \
+			&& curl -fsIL --max-time 25 -H "Authorization: Bearer $HF_TOKEN" "$url" \
+			|| curl -fsIL --max-time 25 "$url" ;;
+		*) curl -fsIL --max-time 25 "$url" ;;
+	esac | awk 'tolower($1)=="content-length:"{v=$2}END{gsub(/\r/,"",v);print v+0}'
+	exit 0
+fi
+
+# --- hidden per-item worker (re-invoked by xargs) -----------------------
+if [ "${1:-}" = _worker ]; then
+	e=$2; sd=${3:-}
+	url=${e%%|*}; rest=${e#*|}; dst=${rest%%|*}
+	case $rest in *"|"*) lbl=${rest##*|};; *) lbl=$(basename "$dst");; esac
+	st=; [ -n "$sd" ] && st="$sd/$(_key "$lbl")"
+	auth=; case $url in *huggingface.co*) [ -n "$HF_TOKEN" ] && auth="Authorization: Bearer $HF_TOKEN";; esac
+
+	if [ -s "$dst" ]; then
+		[ -n "$st" ] && { z=$(stat -c%s "$dst"); printf '%s %s done\n' "$z" "$z" > "$st"; }
+		exit 0
+	fi
+	mkdir -p "$(dirname "$dst")"
+	if [ -n "$auth" ]; then tot=$(curl -fsIL --max-time 25 -H "$auth" "$url" | awk 'tolower($1)=="content-length:"{v=$2}END{gsub(/\r/,"",v);print v+0}')
+	else tot=$(curl -fsIL --max-time 25 "$url" | awk 'tolower($1)=="content-length:"{v=$2}END{gsub(/\r/,"",v);print v+0}'); fi
+	tot=${tot:-0}
+
+	if [ -n "$auth" ]; then curl -fL --retry 3 -C - -sS -H "$auth" -o "$dst.part" "$url" & p=$!
+	else curl -fL --retry 3 -C - -sS -o "$dst.part" "$url" & p=$!; fi
+	while kill -0 "$p" 2>/dev/null; do
+		[ -n "$st" ] && printf '%s %s run\n' "$(stat -c%s "$dst.part" 2>/dev/null || echo 0)" "$tot" > "$st"
+		sleep 0.4
+	done
+	if wait "$p"; then
+		mv -f "$dst.part" "$dst"
+		[ -n "$st" ] && printf '%s %s done\n' "$tot" "$tot" > "$st"
+		exit 0
+	else
+		[ -n "$st" ] && printf '0 %s fail\n' "$tot" > "$st"
+		exit 1
+	fi
+fi
+
+# --- options ----------------------------------------------------------
+J=3; STATE=
+while [ $# -gt 0 ]; do case $1 in
+	-j)      J=$2; shift 2 ;;
+	--state) STATE=$2; mkdir -p "$STATE"; shift 2 ;;
+	--)      shift; break ;;
+	-)       break ;;
+	-*)      echo "dq: unknown option $1" >&2; exit 2 ;;
+	*)       break ;;
+esac; done
+[ $# -eq 0 ] && { sed -n '2,20p' "$0"; exit 0; }
+
+Q=$(mktemp); trap 'rm -f "$Q" "${D:-}"; kill "${mon:-}" 2>/dev/null || true' EXIT INT TERM
+if [ "$1" = - ]; then cat; else printf '%s\n' "$@"; fi | grep '|' > "$Q" || true
+grep -q . "$Q" || { echo "dq: no valid 'url|dest[|label]' entries" >&2; exit 2; }
+n=$(grep -c . "$Q")
+
+# --- aggregate bar (only without --state) ---------------------------
+if [ -z "$STATE" ] && [ -x "$PB" ]; then
+	D=$(mktemp)
+	while IFS= read -r e; do d=${e#*|}; printf '%s\n' "${d%%|*}"; done < "$Q" > "$D"
+	grand=$(tr '\n' '\0' < "$Q" | xargs -0 -P8 -n1 sh -c 'exec "$0" _size "$1"' "$SELF" | awk '{s+=$1}END{print s+0}')
+	( while :; do
+		have=$(while IFS= read -r d; do stat -c%s "$d" 2>/dev/null || stat -c%s "$d.part" 2>/dev/null || echo 0; done < "$D" | awk '{s+=$1}END{print s+0}')
+		"$PB" "$have" "${grand:-1}" "queue: $n files, -j$J"
+		[ "$have" -ge "${grand:-1}" ] && break
+		sleep 0.5
+	  done; printf '\n' >&2 ) &
+	mon=$!
+fi
+
+# --- run the workers - FIFO, up to J concurrent, each atomic ---------
+tr '\n' '\0' < "$Q" | xargs -0 -P"$J" -n1 sh -c 'exec "$0" _worker "$2" "$1"' "$SELF" "${STATE:-}"
+rc=$?
+
+kill "${mon:-}" 2>/dev/null || true; wait "${mon:-}" 2>/dev/null || true
+[ "$rc" -eq 0 ] && printf '\033[36m>>\033[0m queue done (%s files)\n' "$n" >&2 \
+                || printf '\033[31m!!\033[0m queue: some downloads failed - re-run to resume\n' >&2
+exit "$rc"

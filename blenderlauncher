@@ -1,0 +1,479 @@
+#!/bin/sh
+# blenderlauncher.sh - single-file Blender/Bforartists build download and
+# version manager. Same behavior as the old blender/{run,scripts/_lib,
+# scripts/dq,scripts/pacmanbar} split, consolidated into one file: no
+# separate dq/pacmanbar/_lib scripts, everything below is inlined as
+# functions. No fzf: the TUI is `dialog` (ncurses) - $SELF (this file's own
+# absolute path) is still what every re-invocation targets for the actual
+# download workers (xargs, for real parallel downloads via _dq).
+#
+# Data (installed builds + build-list cache) lives in ./.blenderlauncher/,
+# independent from the old blender/ dir's ./.blender/ - self-contained,
+# gitignore it. BLENDER_HOME= to move it elsewhere.
+#
+# No args -> dialog TUI with two sections: Installed (launch / remove what is on disk, usable right away)
+# and New (pick a category, then a build not installed yet; Enter installs + launches). Needs `dialog`
+# (pacman -S dialog). For scripting, use a subcommand instead:
+# Subcommands:
+#   tui | pick                             the dialog TUI (also the default)
+#   auto                                    non-interactive: newest stable daily, install+launch
+#   ls | list | available [-r] [category]   flat list: name  category  size  url
+#   installed                              locally installed build names
+#   install <name> [name...]               download + extract (queued if >1)
+#   launch  <name> [-- args...]            run the installed build's own binary
+#   remove  <name> [-y]                    delete an installed build
+#   dir     <name>                         print its install path
+#   refresh                                re-fetch all sources now
+#
+# Sources (all confirmed live, no auth):
+#   1. builder.blender.org/download/{daily,experimental,patch}/?format=json&v=1
+#      - daily serves ~8 current linux builds; patch is the big one (~130
+#        linux per-PR builds -> its own "Patch" category); experimental
+#        is an empty array right now (real, not a filter).
+#   2. api.github.com/repos/Bforartists/Bforartists/releases  (linux .tar.xz)
+#   3. download.blender.org/release/  (historical archive, 2.48+, HTML listing;
+#      EVERY patch per line, like BL v2's stable.py - not just the newest)
+# The merged list is cached at $BLENDER_HOME/cache/ for an hour.
+set -eu
+
+SELF=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
+HERE=$(dirname -- "$SELF")
+BLENDER_HOME=${BLENDER_HOME:-$HERE/.blenderlauncher}
+DATA="$BLENDER_HOME/versions"
+CACHE="$BLENDER_HOME/cache"
+LIST="$CACHE/builds.tsv"
+TTL=3600
+TAB="$(printf '\t')"
+mkdir -p "$DATA" "$CACHE"
+
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+say() { printf '\033[36m>>\033[0m %s\n' "$*" >&2; }
+_key() { printf %s "$1" | tr -c 'A-Za-z0-9._-' _; }   # matches _dq's state-file key
+
+# =========================================================================
+# inlined pacmanbar (was scripts/pacmanbar) - a podman/pacman-style bar
+# =========================================================================
+
+_pb_human() {   # bytes -> 12.3M
+	awk -v b="${1:-0}" 'BEGIN{
+		split("B K M G T P", u, " "); i = 1
+		while (b >= 1024 && i < 6) { b /= 1024; i++ }
+		printf (i == 1 ? "%d%s" : "%.1f%s"), b, u[i]
+	}'
+}
+
+_pb_draw() {   # cur total label [rate]
+	_c=$1; _t=$2; _l=$3; _r=${4:-}
+	[ "$_t" -gt 0 ] 2>/dev/null || _t=1
+	_p=$(( _c * 100 / _t )); [ "$_p" -gt 100 ] && _p=100
+	_cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+	_bw=$(( _cols - 58 ))
+	[ "$_bw" -lt 12 ] && _bw=12
+	[ "$_bw" -gt 60 ] && _bw=60
+	_fill=$(( _p * _bw / 100 ))
+	[ "$_fill" -gt "$_bw" ] && _fill=$_bw
+	_bar=$(printf "%${_fill}s" '' | tr ' ' '=')
+	[ "$_fill" -lt "$_bw" ] && { _bar="$_bar>"; _fill=$(( _fill + 1 )); }
+	_gap=$(printf "%$(( _bw - _fill ))s" '')
+	printf '\r\033[K %-24.24s [%s%s] %3d%%  %s/%s%s' \
+		"$_l" "$_bar" "$_gap" "$_p" "$(_pb_human "$_c")" "$(_pb_human "$_t")" \
+		"${_r:+  $_r}" >&2
+}
+
+# polls <file>'s size until it reaches <total>, drawing as it grows; returns
+# 0 on completion, 1 if it stalls for ~10s.
+_pb_watch() {
+	file=$1; total=$2; label=${3:-download}
+	last=0; lastt=$(date +%s.%N 2>/dev/null || date +%s); stall=0
+	while :; do
+		cur=$(stat -c %s "$file" 2>/dev/null || echo 0)
+		now=$(date +%s.%N 2>/dev/null || date +%s)
+		if [ "$last" -eq 0 ]; then
+			rate=
+		else
+			rate=$(awk -v d=$(( cur - last )) -v t="$now" -v lt="$lastt" 'BEGIN{
+				dt = t - lt; if (dt <= 0) dt = 1; r = d / dt
+				split("B K M G T", u, " "); i = 1
+				while (r >= 1024 && i < 5) { r /= 1024; i++ }
+				printf "%.1f%s/s", r, u[i]
+			}')
+		fi
+		_pb_draw "$cur" "$total" "$label" "$rate"
+		[ "$cur" -ge "$total" ] 2>/dev/null && { printf '\n' >&2; return 0; }
+		if [ "$cur" -eq "$last" ]; then stall=$(( stall + 1 )); else stall=0; fi
+		[ "$stall" -ge 50 ] && { printf '\n' >&2; return 1; }
+		last=$cur; lastt=$now
+		sleep 0.2
+	done
+}
+
+# =========================================================================
+# inlined dq (was scripts/dq) - parallel, atomic, resumable download queue
+# =========================================================================
+# _dq [-j N] ENTRY...|-   ENTRY = url|dest[|label]
+#   sequence : FIFO, workers pull in order
+#   parallel : -j N downloads run concurrently (real processes via xargs -P,
+#              re-invoking $SELF _dqworker - true parallelism, not a loop)
+#   atomic   : each lands in <dest>.part, renamed onto <dest> only on success
+#   resumable: re-run with the same list; done files skip, .part continues
+# One aggregate pacmanbar for the whole queue.
+_dq() {
+	J=3
+	while [ $# -gt 0 ]; do case $1 in
+		-j) J=$2; shift 2 ;;
+		--) shift; break ;;
+		-)  break ;;
+		*)  break ;;
+	esac; done
+
+	Q=$(mktemp); D=$(mktemp)
+	trap 'rm -f "$Q" "$D"; kill "${mon:-}" 2>/dev/null || true' EXIT INT TERM
+	if [ "$1" = - ]; then cat; else printf '%s\n' "$@"; fi | grep '|' > "$Q" || true
+	if ! grep -q . "$Q"; then echo "_dq: no valid 'url|dest[|label]' entries" >&2; rm -f "$Q" "$D"; trap - EXIT INT TERM; return 2; fi
+	n=$(grep -c . "$Q")
+
+	while IFS= read -r e; do d=${e#*|}; printf '%s\n' "${d%%|*}"; done < "$Q" > "$D"
+	grand=$(tr '\n' '\0' < "$Q" | xargs -0 -P8 -n1 sh -c 'exec "$0" _dqsize "$1"' "$SELF" | awk '{s+=$1}END{print s+0}')
+	( while :; do
+		have=$(while IFS= read -r d; do stat -c%s "$d" 2>/dev/null || stat -c%s "$d.part" 2>/dev/null || echo 0; done < "$D" | awk '{s+=$1}END{print s+0}')
+		_pb_draw "$have" "${grand:-1}" "queue: $n files, -j$J"
+		[ "$have" -ge "${grand:-1}" ] && break
+		sleep 0.5
+	  done; printf '\n' >&2 ) &
+	mon=$!
+
+	rc=0
+	tr '\n' '\0' < "$Q" | xargs -0 -P"$J" -n1 sh -c 'exec "$0" _dqworker "$1"' "$SELF" || rc=$?
+
+	kill "$mon" 2>/dev/null || true; wait "$mon" 2>/dev/null || true
+	rm -f "$Q" "$D"; trap - EXIT INT TERM
+	[ "$rc" -eq 0 ] && printf '\033[36m>>\033[0m queue done (%s files)\n' "$n" >&2 \
+	                || printf '\033[31m!!\033[0m queue: some downloads failed - re-run to resume\n' >&2
+	return "$rc"
+}
+
+_dqsize() {   # hidden: byte size of one ENTRY's url (or the file if complete)
+	e=$1; url=${e%%|*}; rest=${e#*|}; dst=${rest%%|*}
+	if [ -s "$dst" ]; then stat -c%s "$dst"; return 0; fi
+	curl -fsIL --max-time 25 "$url" | awk 'tolower($1)=="content-length:"{v=$2}END{gsub(/\r/,"",v);print v+0}'
+}
+
+_dqworker() {   # hidden per-item worker (re-invoked by xargs)
+	e=$1
+	url=${e%%|*}; rest=${e#*|}; dst=${rest%%|*}
+
+	if [ -s "$dst" ]; then return 0; fi
+	mkdir -p "$(dirname "$dst")"
+	curl -fL --retry 3 -C - -sS -o "$dst.part" "$url" || return 1
+	mv -f "$dst.part" "$dst"
+}
+
+# =========================================================================
+# inlined _lib (was scripts/_lib) - build sources, listing, install/launch
+# =========================================================================
+
+# <endpoint> <risk_id> <version> -> Stable | LTS | Daily | Patch | Experimental | Bforartists
+# `daily` serves only ~8 current linux builds; the bulk is `patch` (per-PR,
+# ~130 linux) - its own bucket here. Stable vs LTS has no API: the LTS line
+# list is manual (blender.org/download/lts), same as the Rust / BL v2.
+category() {
+	case $1 in
+		bforartists)  echo Bforartists; return;;
+		experimental) echo Experimental; return;;
+		patch)        echo Patch; return;;
+	esac
+	[ "$2" = stable ] || { echo Daily; return; }
+	case $3 in
+		2.83.*|2.93.*|3.3.*|3.6.*|4.2.*) echo LTS;;
+		*) echo Stable;;
+	esac
+}
+
+# source 1: builder.blender.org live JSON, one branch per call
+src_builder() {
+	curl -fsS --max-time 30 "https://builder.blender.org/download/$1/?format=json&v=1" \
+	| jq -r --arg ep "$1" '
+		.[] | select(.platform=="linux" and .architecture=="x86_64" and .file_extension=="xz")
+		| [ (.version+"-"+.risk_id+"-"+.branch), $ep, .risk_id, .version,
+		    (.file_size|tostring), .url ] | @tsv'
+}
+
+# source 2: Bforartists GitHub Releases (linux .tar.xz, back to v2.7.0)
+src_bforartists() {
+	curl -fsS --max-time 30 -H 'User-Agent: blender-sh' \
+	  'https://api.github.com/repos/Bforartists/Bforartists/releases?per_page=100' \
+	| jq -r '
+		.[] | .tag_name as $t
+		| .assets[]? | select(.name|test("^Bforartists-.*-linux\\.tar\\.xz$";"i"))
+		| [ (($t|ltrimstr("v"))+"-release-bforartists"), "bforartists", "release",
+		    ($t|ltrimstr("v")), (.size|tostring), .browser_download_url ] | @tsv'
+}
+
+# source 3, one minor line: EVERY linux patch release in it (2.83.0 .. 2.83.20) -
+# matches Blender Launcher V2's stable.py. Both archive naming conventions.
+_archdir() {
+	base=https://download.blender.org/release
+	curl -fsS --max-time 20 "$base/Blender$1.$2/" \
+	| grep -oiE 'href="blender-[0-9][^"]*lin[^"]*64[^"]*\.tar\.xz"' \
+	| sed -E 's/.*"(.*)"/\1/' \
+	| while IFS= read -r f; do
+		v=$(printf '%s\n' "$f" | sed -E 's/^blender-([^-]+)-.*/\1/')
+		printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$v-stable-v$1$2" daily stable "$v" - "$base/Blender$1.$2/$f"
+	done
+}
+
+# source 3: the archive root -> every real minor line >= 2.48, fanned out
+src_archive() {
+	curl -fsS --max-time 30 https://download.blender.org/release/ \
+	| grep -oE 'href="Blender[0-9]+\.[0-9]+/"' \
+	| sed -E 's/.*"Blender([0-9]+)\.([0-9]+)\/".*/\1 \2/' \
+	| awk '$1>2 || ($1==2 && $2>=48)' \
+	| xargs -P12 -n2 sh -c 'exec "$0" _archdir "$1" "$2"' "$SELF"
+}
+
+# "fast" = live JSON only (~1.5 s); "full" adds the archive fan-out (~+1.5 s)
+_gather() {
+	src_builder daily        ||:
+	src_builder experimental ||:
+	src_builder patch        ||:
+	src_bforartists          ||:
+	[ "${1:-}" = full ] && { src_archive ||: ; }
+}
+
+_dedup_sort() { awk -F"$TAB" 'NF>=6 && !seen[$1]++' | sort -t"$TAB" -k2,2 -k4,4rV; }
+
+# merged + deduped full list, cached for $TTL (first source wins a name clash)
+list_build() {
+	if [ "${1:-}" != -r ] && [ -f "$LIST" ]; then
+		age=$(( $(date +%s) - $(stat -c %Y "$LIST" 2>/dev/null || echo 0) ))
+		[ "$age" -lt "$TTL" ] && { cat "$LIST"; return; }
+	fi
+	say "fetching build lists (cached ${TTL}s)..."
+	_gather full | _dedup_sort > "$LIST.$$"
+	mv "$LIST.$$" "$LIST"
+	cat "$LIST"
+}
+
+# format a raw TSV stream into the display rows `ls`/`available` show.
+_rows() {
+	while IFS="$TAB" read -r name ep risk ver size url; do
+		if [ "$size" = - ]; then sz='       -'; else sz=$(printf '%5d MB' "$(( size / 1000000 ))"); fi
+		[ -d "$DATA/$name" ] && sz="$sz (installed)"
+		printf '%s\t%-14s %s\t%s\n' "$name" "$(category "$ep" "$risk" "$ver")" "$sz" "$url"
+	done
+}
+
+# keep only rows whose category (col 2's first word) matches - "" / All = all
+_catfilter() {
+	case ${1:-} in
+		''|[Aa]ll) cat ;;
+		*) awk -F"$TAB" -v c="$1" 'BEGIN{c=tolower(c)} { split($2,x," "); if (tolower(x[1])==c) print }' ;;
+	esac
+}
+
+# available [-r] [category]
+cmd_available() {
+	rr= cat=
+	for a in "$@"; do case $a in -r) rr=-r ;; *) cat=$a ;; esac; done
+	list_build $rr | _rows | _catfilter "$cat"
+}
+
+cmd_installed() { ls -1 "$DATA" 2>/dev/null | grep -v '^\.' ||: ; }
+
+cmd_install() {
+	name=$1
+	dest="$DATA/$name"
+	[ -e "$dest" ] && die "$name already installed  ($dest)"
+	row=$(list_build | awk -F"$TAB" -v n="$name" '$1==n{print;exit}')
+	[ -n "$row" ] || die "no available build '$name'  (see: $SELF ls)"
+	url=$(printf '%s' "$row" | cut -f6)
+	size=$(printf '%s' "$row" | cut -f5)
+	tmp="$DATA/.tmp-$$"
+	rm -rf "$tmp"; mkdir -p "$tmp"
+	trap 'rm -rf "$tmp"' EXIT INT TERM
+	[ "${size:--}" = - ] && size=$(curl -fsIL "$url" \
+		| awk 'tolower($1)=="content-length:"{print $2}' | tr -d '\r' | tail -1)
+	say "downloading $name"
+	if [ -n "${size:-}" ] && [ "$size" != - ]; then
+		curl -fL --retry 3 -sS -o "$tmp/b.tar.xz" "$url" & dl=$!
+		_pb_watch "$tmp/b.tar.xz" "$size" "$name" || :
+		wait "$dl" || die "download failed"
+		tar -xJf "$tmp/b.tar.xz" -C "$tmp"
+		rm -f "$tmp/b.tar.xz"
+	else
+		curl -fL --retry 3 "$url" | tar -xJ -C "$tmp"
+	fi
+	set -- "$tmp"/*/
+	{ [ $# -eq 1 ] && [ -d "$1" ]; } || die "unexpected archive layout ($# top-level dirs)"
+	mv "$1" "$dest"
+	rm -rf "$tmp"; trap - EXIT INT TERM
+	say "installed -> $dest"
+}
+
+# install several builds at once: download the tarballs in parallel via the
+# queue (_dq), then extract each atomically. $BLENDER_JOBS = concurrency.
+cmd_install_many() {
+	tmp="$DATA/.tmpq-$$"; mkdir -p "$tmp"
+	trap 'rm -rf "$tmp"' EXIT INT TERM
+	full=$(list_build)
+	q=
+	for name in "$@"; do
+		[ -d "$DATA/$name" ] && { say "have  $name"; continue; }
+		url=$(printf '%s\n' "$full" | awk -F"$TAB" -v n="$name" '$1==n{print $6; exit}')
+		[ -n "$url" ] || { say "unknown: $name (skipped)"; continue; }
+		q="$q$url|$tmp/$name.tar.xz|$name
+"
+	done
+	[ -n "$q" ] || { say "nothing to install"; return 0; }
+	printf '%s' "$q" | _dq -j "${BLENDER_JOBS:-3}" -
+	for name in "$@"; do
+		f="$tmp/$name.tar.xz"
+		[ -s "$f" ] || continue
+		[ -d "$DATA/$name" ] && continue
+		ex="$tmp/x-$name"; mkdir -p "$ex"
+		tar -xJf "$f" -C "$ex" 2>/dev/null || { say "extract failed: $name"; continue; }
+		inner=$(set -- "$ex"/*/; [ $# -eq 1 ] && [ -d "$1" ] && printf %s "$1")
+		[ -n "$inner" ] && mv "$inner" "$DATA/$name" && say "installed $name" \
+			|| say "bad archive layout: $name"
+	done
+	rm -rf "$tmp"; trap - EXIT INT TERM
+}
+
+cmd_launch() {
+	name=$1; shift
+	[ "${1:-}" = -- ] && shift
+	dir="$DATA/$name"
+	[ -d "$dir" ] || die "not installed: $name  (see: $SELF installed)"
+	cd "$dir"
+	for c in bforartists blender usr/bin/bforartists usr/bin/blender; do
+		[ -x "./$c" ] && exec "./$c" "$@"
+	done
+	die "no blender/bforartists binary under $dir"
+}
+
+cmd_remove() {
+	name=$1
+	dir="$DATA/$name"
+	[ -d "$dir" ] || die "not installed: $name"
+	if [ "${2:-}" != -y ]; then
+		printf 'remove %s ? [y/N] ' "$name" >&2
+		read -r a; [ "$a" = y ] || { say "kept"; return 0; }
+	fi
+	rm -rf "$dir"; say "removed $name"
+}
+
+# auto-pick the newest stable daily build, install it if needed, launch it.
+# Non-interactive - for scripting/cron; the default (no args) is the TUI.
+cmd_autolaunch() {
+	name=$(list_build | awk -F"$TAB" '$2=="daily" && $3=="stable"{print;exit}' | cut -f1)
+	[ -n "$name" ] || die "couldn't find a stable daily build (see: $SELF ls daily)"
+	cmd_installed | grep -qx "$name" || cmd_install "$name"
+	cmd_launch "$name"
+}
+
+# --- dialog-based TUI (no fzf) -------------------------------------------
+# Two sections, like the Blender Launcher apps:
+#   Installed  what is on disk and can be launched right now (Enter = launch / remove)
+#   New        what can still be downloaded, by category (installed builds are not offered again)
+# dialog has no live single-keystroke bindings, so this is a menu-of-menus instead of one filterable list.
+_tui_main() {
+	n=$(cmd_installed | wc -l | tr -d ' ')
+	dialog --clear --backtitle blenderlauncher --menu "Blender builds" 0 0 3 \
+		installed "Installed - $n build(s), ready to launch now" \
+		new       "New - download and install a build" \
+		quit      "" \
+		3>&1 1>&2 2>&3
+}
+
+_tui_category() {
+	dialog --clear --backtitle blenderlauncher \
+		--menu "new builds - category:" 0 0 8 \
+		All          "every source, unfiltered" \
+		Stable       "" LTS "" Daily "" Patch "" Experimental "" Bforartists "" \
+		3>&1 1>&2 2>&3
+}
+
+# launch / remove menu for one installed build; returns 0 when something was launched (leave the TUI)
+_tui_installed_action() {
+	action=$(dialog --clear --backtitle blenderlauncher --menu "$1 is installed:" 0 0 3 \
+		launch "run it" remove "delete it" back "" 3>&1 1>&2 2>&3) || { clear; return 1; }
+	clear
+	case $action in
+		launch) cmd_launch "$1"; return 0 ;;
+		remove) cmd_remove "$1" -y ;;
+	esac
+	return 1
+}
+
+_tui_installed() {
+	while :; do
+		set --
+		for name in $(cmd_installed | sort -rV); do
+			set -- "$@" "$name" "$(du -sh "$DATA/$name" 2>/dev/null | cut -f1)"
+		done
+		if [ $# -eq 0 ]; then dialog --msgbox "nothing installed yet - pick New to download a build" 6 56; return 1; fi
+		name=$(dialog --clear --backtitle blenderlauncher \
+			--menu "Installed - Enter: launch / remove, Esc: back" 0 0 20 "$@" 3>&1 1>&2 2>&3) || return 1
+		clear
+		[ -n "$name" ] || return 1
+		_tui_installed_action "$name" && return 0
+	done
+}
+
+_tui_new() {
+	while :; do
+		cat=$(_tui_category) || return 1
+		[ "$cat" = All ] && cat=
+
+		tmp=$(mktemp)
+		list_build | _rows | _catfilter "$cat" | awk -F"$TAB" '$2 !~ /\(installed\)/' > "$tmp"
+		if [ ! -s "$tmp" ]; then rm -f "$tmp"; dialog --msgbox "nothing new in category: ${cat:-All}" 6 44; continue; fi
+
+		set --
+		while IFS="$TAB" read -r name catsize _url; do set -- "$@" "$name" "$catsize"; done < "$tmp"
+		rm -f "$tmp"
+
+		name=$(dialog --clear --backtitle blenderlauncher \
+			--menu "New - ${cat:-All}  (Enter: install + launch, Esc: back)" 0 0 20 "$@" 3>&1 1>&2 2>&3) || continue
+		clear
+		[ -n "$name" ] || continue
+		cmd_install "$name" && cmd_launch "$name"
+		return 0
+	done
+}
+
+cmd_tui() {
+	command -v dialog >/dev/null || die "dialog not installed  (pacman -S dialog)"
+	while :; do
+		section=$(_tui_main) || { clear; return 0; }
+		clear
+		case $section in
+			installed) _tui_installed && return 0 ;;
+			new)       _tui_new && return 0 ;;
+			*)         return 0 ;;
+		esac
+	done
+}
+
+# =========================================================================
+# dispatch
+# =========================================================================
+cmd=${1:-tui}; [ $# -gt 0 ] && shift || true
+case $cmd in
+	tui|pick)          cmd_tui ;;
+	auto)              cmd_autolaunch ;;
+	ls|list|available) cmd_available "$@" ;;
+	installed)         cmd_installed ;;
+	install)           [ $# -ge 1 ] || die "usage: $SELF install <name> [name...]"
+	                   [ $# -eq 1 ] && cmd_install "$1" || cmd_install_many "$@" ;;
+	launch|open)       [ $# -ge 1 ] || die "usage: $SELF launch <name> [-- args]"; cmd_launch "$@" ;;
+	remove|rm)         [ $# -ge 1 ] || die "usage: $SELF remove <name> [-y]"; cmd_remove "$@" ;;
+	dir)               [ $# -ge 1 ] || die "usage: $SELF dir <name>"; echo "$DATA/$1" ;;
+	refresh)           list_build -r >/dev/null && say "refreshed ($(wc -l < "$LIST" | tr -d ' ') builds)" ;;
+	_archdir)          _archdir "$1" "$2" ;;
+	_dqworker)         _dqworker "$1" "${2:-}" ;;
+	_dqsize)           _dqsize "$1" ;;
+	-h|--help|help)    sed -n '2,36p' "$0" ;;
+	*)                 die "unknown: $cmd  (try: $SELF help)" ;;
+esac

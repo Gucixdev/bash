@@ -1,0 +1,44 @@
+.TH EZLOG 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+ezlog \- read any log with fzf: journal, units, kernel and plain log
+.SH SYNOPSIS
+.B ezlog SOURCE
+.br
+.B ezlog MODE
+.br
+.B ezlog LEVEL
+.SH DESCRIPTION
+.B ezlog
+.nf
+files, coloured by severity, live or as a snapshot. Built on
+lib/lazytui.sh; replaces the old `log`.
+
+  ezlog                    pick a source, then read it
+  ezlog SOURCE [MODE] [LEVEL]
+
+Sources are listed in one searchable list: the systemd journal (this
+boot, everything, previous boot, errors, user), the kernel, every
+service unit, and log files found under LOG_DIRS (top of the script).
+Without systemd only the files (and dmesg) are offered, so it works
+everywhere. Compressed logs (.gz) open as snapshots.
+
+In the reader, type to filter (exact match), arrows scroll, Ctrl-/ shows
+the whole line wrapped, Tab marks lines and Ctrl-Y copies them. MODE is
+static (last LINES_MAX lines) or follow (live, Ctrl-F toggles). LEVEL
+keeps only errors (Alt-E), warnings and above (Alt-W) or everything
+(Alt-A). Lines mentioning error/fail/fatal/panic/denied are red,
+warn/timeout/deprecated yellow, started/connected/success green.
+
+.fi
+.SH OPTIONS
+.TP
+.B SOURCE
+journal:boot, journal:all, journal:prev, journal:err, journal:user, kernel, unit:NAME or file:PATH
+.TP
+.B MODE
+static or follow
+.TP
+.B LEVEL
+all, warn or err
+.SH SEE ALSO
+TODO: related tools here.

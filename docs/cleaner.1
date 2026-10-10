@@ -1,0 +1,29 @@
+.TH CLEANER 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+cleaner \- wraps a real tool for every real kind of bloat rather
+.SH SYNOPSIS
+.B cleaner
+.SH DESCRIPTION
+.B cleaner
+.nf
+than reimplementing any of them, and picks its package-manager
+backend by real detection (`command -v`) instead of hardcoding one -
+pacman/apt/dnf/zypper/apk/xbps/portage all real, all checked -
+so this actually works across distros, not just this machine's own
+Arch-based one. Package cache trimming, orphaned-package listing,
+systemd journal vacuuming, container image pruning (podman/docker),
+unused Flatpak runtimes, language-toolchain caches (npm/pip/cargo),
+stale ~/.cache files, and old ~/.local/share/Trash entries (see this
+dir's own `trash` script for how things get there) - each run only
+if its own real tool is actually present.
+
+ALWAYS shows what WOULD be removed first (every category real,
+nothing fabricated) and asks to confirm once before doing anything
+for real - a cleanup script that silently deletes real user data or
+packages on the first run is the wrong kind of "real". Orphaned
+packages are listed but never auto-removed even after confirming -
+a real judgement call (gcc15, say, might be kept on purpose for
+cross-compiling) left to the user to remove by hand.
+.fi
+.SH SEE ALSO
+TODO: related tools here.

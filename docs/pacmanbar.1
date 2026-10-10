@@ -1,0 +1,20 @@
+.TH PACMANBAR 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+pacmanbar \- a podman/pacman-style transfer bar for shell scripts.
+.SH SYNOPSIS
+.B pacmanbar
+.SH DESCRIPTION
+.B pacmanbar
+.nf
+
+  pacmanbar                       run a short demo (no args)
+  pacmanbar <cur> <total> [label]        draw one frame (\\r, to stderr)
+  pacmanbar watch <file> <total> [label] poll <file>'s size until it
+                                         reaches <total>, drawing as it grows
+
+Sizes in bytes. `watch` also shows a live transfer rate and returns 0 when
+the file reaches <total>, or 1 if it stops growing for ~10 s. Width adapts
+to $COLUMNS / `tput cols`. Nothing is printed to stdout - safe to wrap.
+.fi
+.SH SEE ALSO
+TODO: related tools here.

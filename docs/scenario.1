@@ -1,0 +1,86 @@
+.TH SCENARIO 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+scenario \- real keyboard/mouse macro record+play - tries multiple real backends
+.SH SYNOPSIS
+.B scenario record [NAME] [DEVICE...]
+.br
+.B scenario stop
+.br
+.B scenario play NAME
+.br
+.B scenario list
+.br
+.B scenario delete NAME
+.br
+.B scenario rename OLD NEW
+.SH DESCRIPTION
+.B scenario
+.nf
+so this works across distros without hardcoding one specific tool:
+evemu (kernel evdev level - real, portable across BOTH X11 and
+Wayland since it never touches the display server at all, confirmed
+installed on this machine) first, falling back to xnee/cnee (X11-
+only, XTEST-based - a real, well-known tool for exactly this, but
+not packaged for this machine's own distro, so its branch below is
+real but UNVERIFIED - stated honestly, not tested against a real
+install anywhere).
+
+The real source this project used to have for this (fezscenario,
+from the user's own ~/.mydot/toolbox) is unrecoverable - every
+symlink to it is broken, no git history, no filesystem snapshot
+exists despite the btrfs @snapshots subvolume being there (checked
+by hand: mounted, empty). The only real trace left is a single
+stale PID in ~/.local/share/fezscenario/.rec_pids - which is what
+confirms the real design choice below (one recorder process PER
+device, multiple PIDs tracked at once for a keyboard+mouse pair)
+rather than being a guess.
+
+usage: scenario record [NAME] [DEVICE...]
+         starts one real recorder per DEVICE (default: every real
+         keyboard+mouse device found in /proc/bus/input/devices)
+       scenario stop
+         stops the recorder(s) started by the last `record`
+       scenario play NAME
+       scenario list
+       scenario delete NAME | rename OLD NEW
+       scenario                    (no arguments: the TUI below)
+
+The TUI (lib/lazytui.sh) lists the recordings with a live "recording"
+marker and refreshes itself; Enter plays, Ctrl-R records a new one,
+Ctrl-X stops recording, Ctrl-D deletes, Alt-N renames. Playing waits
+PLAY_DELAY seconds first (top of the script, or SCENARIO_DELAY) so you can
+put the focus where the input should go; 0 plays at once.
+
+NEEDS ROOT for the evemu backend (reading/writing real
+/dev/input/eventN nodes - confirmed by hand: evemu-record can't even
+list devices as this project's own non-root user).
+
+NOT live-tested against real hardware here, deliberately: actually
+running `scenario play` injects real synthetic keyboard/mouse events
+into whatever currently has focus - doing that from an unattended
+agent session risks hijacking the user's own live input. Only
+syntax (`sh -n`) and the device-detection parsing (checked against
+this machine's own real /proc/bus/input/devices) were verified.
+
+.fi
+.SH OPTIONS
+.TP
+.B record [NAME] [DEVICE...]
+record keyboard and mouse
+.TP
+.B stop
+stop the recording
+.TP
+.B play NAME
+replay a recording (after PLAY_DELAY seconds)
+.TP
+.B list
+list recordings
+.TP
+.B delete NAME
+remove a recording
+.TP
+.B rename OLD NEW
+rename a recording
+.SH SEE ALSO
+TODO: related tools here.

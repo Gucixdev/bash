@@ -1,0 +1,423 @@
+#!/bin/sh
+# <manwriter>
+# real keyboard/mouse macro record+play - tries multiple real backends
+# so this works across distros without hardcoding one specific tool:
+# evemu (kernel evdev level - real, portable across BOTH X11 and
+# Wayland since it never touches the display server at all, confirmed
+# installed on this machine) first, falling back to xnee/cnee (X11-
+# only, XTEST-based - a real, well-known tool for exactly this, but
+# not packaged for this machine's own distro, so its branch below is
+# real but UNVERIFIED - stated honestly, not tested against a real
+# install anywhere).
+#
+# The real source this project used to have for this (fezscenario,
+# from the user's own ~/.mydot/toolbox) is unrecoverable - every
+# symlink to it is broken, no git history, no filesystem snapshot
+# exists despite the btrfs @snapshots subvolume being there (checked
+# by hand: mounted, empty). The only real trace left is a single
+# stale PID in ~/.local/share/fezscenario/.rec_pids - which is what
+# confirms the real design choice below (one recorder process PER
+# device, multiple PIDs tracked at once for a keyboard+mouse pair)
+# rather than being a guess.
+#
+# usage: scenario record [NAME] [DEVICE...]
+#          starts one real recorder per DEVICE (default: every real
+#          keyboard+mouse device found in /proc/bus/input/devices)
+#        scenario stop
+#          stops the recorder(s) started by the last `record`
+#        scenario play NAME
+#        scenario list
+#        scenario delete NAME | rename OLD NEW
+#        scenario                    (no arguments: the TUI below)
+#
+# The TUI (lib/lazytui.sh) lists the recordings with a live "recording"
+# marker and refreshes itself; Enter plays, Ctrl-R records a new one,
+# Ctrl-X stops recording, Ctrl-D deletes, Alt-N renames. Playing waits
+# PLAY_DELAY seconds first (top of the script, or SCENARIO_DELAY) so you can
+# put the focus where the input should go; 0 plays at once.
+#
+# NEEDS ROOT for the evemu backend (reading/writing real
+# /dev/input/eventN nodes - confirmed by hand: evemu-record can't even
+# list devices as this project's own non-root user).
+#
+# NOT live-tested against real hardware here, deliberately: actually
+# running `scenario play` injects real synthetic keyboard/mouse events
+# into whatever currently has focus - doing that from an unattended
+# agent session risks hijacking the user's own live input. Only
+# syntax (`sh -n`) and the device-detection parsing (checked against
+# this machine's own real /proc/bus/input/devices) were verified.
+#
+# @flag record [NAME] [DEVICE...]:record keyboard and mouse
+# @flag stop:stop the recording
+# @flag play NAME:replay a recording (after PLAY_DELAY seconds)
+# @flag list:list recordings
+# @flag delete NAME:remove a recording
+# @flag rename OLD NEW:rename a recording
+# </manwriter>
+
+# ---- edit me ---------------------------------------------------------
+# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
+# (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
+# (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
+_lt_hint() {
+	_lt_h=$1
+	while :; do
+		case $_lt_h in
+			ctrl-?*)  printf '\033[30;44m Ctrl \033[0m'; _lt_h=${_lt_h#ctrl-} ;;
+			alt-?*)   printf '\033[30;43m Alt \033[0m'; _lt_h=${_lt_h#alt-} ;;
+			shift-?*) printf '\033[30;42m Shift \033[0m'; _lt_h=${_lt_h#shift-} ;;
+			*) break ;;
+		esac
+	done
+	case $_lt_h in
+		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
+		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
+		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
+	esac
+	printf '\033[7m %s \033[0m %s   ' "$_lt_h" "$2"
+}
+
+# _lt_trim STR -> STR without leading/trailing blanks
+_lt_trim() { printf %s "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# _lt_script FILE CMD -> FILE runs CMD "$@" (keeps quoting out of fzf binds)
+_lt_script() { printf '%s "$@"\n' "$2" >"$1"; }
+
+lt_select() {
+	_lt_mode=raw _lt_refresh=${LT_REFRESH:-0} _lt_seed= _lt_more= _lt_reload= _lt_preview= _lt_keys= \
+	_lt_key=1 _lt_nth= _lt_header= _lt_prompt='> '
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--mode)    _lt_mode=$2;    shift 2 ;;
+			--seed)    _lt_seed=$2;    shift 2 ;;
+			--more)    _lt_more=$2;    shift 2 ;;
+			--refresh) _lt_refresh=$2; shift 2 ;;
+			--reload)  _lt_reload=$2;  shift 2 ;;
+			--preview) _lt_preview=$2; shift 2 ;;
+			--keys)    _lt_keys=$2;    shift 2 ;;
+			--key)     _lt_key=$2;     shift 2 ;;
+			--nth)     _lt_nth=$2;     shift 2 ;;
+			--header)  _lt_header=$2;  shift 2 ;;
+			--prompt)  _lt_prompt=$2;  shift 2 ;;
+			*) echo "lt_select: unknown arg $1" >&2; return 2 ;;
+		esac
+	done
+	case $_lt_refresh in '' | *[!0-9]*) echo "lt_select: --refresh wants milliseconds, got '$_lt_refresh'" >&2; return 2 ;; esac
+	case $_lt_mode in raw | select) ;; *) echo "lt_select: --mode must be raw or select" >&2; return 2 ;; esac
+
+	_lt_tmp=$(mktemp -d) || return 1
+	if [ -n "$_lt_seed" ]; then
+		_lt_script "$_lt_tmp/seed.sh" "$_lt_seed"
+	else
+		cat >"$_lt_tmp/list"
+		printf 'cat "%s/list"\n' "$_lt_tmp" >"$_lt_tmp/seed.sh"
+	fi
+
+	if ! command -v fzf >/dev/null 2>&1; then
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
+
+	TAB=$(printf '\t')
+	_lt_k="{+$_lt_key}"
+	set -- --delimiter="$TAB" --ansi --prompt="$_lt_prompt" --footer-border=none --layout=reverse-list
+	[ -n "$_lt_header" ] && set -- "$@" --header="$_lt_header"
+	[ -n "$_lt_nth" ] && set -- "$@" --with-nth="$_lt_nth"
+	if [ -n "$_lt_preview" ]; then
+		_lt_script "$_lt_tmp/preview.sh" "$_lt_preview"
+		set -- "$@" --preview="sh $_lt_tmp/preview.sh {$_lt_key}" \
+			--preview-window="${LT_PREVIEW_WINDOW:-down,60%,wrap}"
+	fi
+	_lt_start=
+	if [ -n "$_lt_more" ]; then
+		cat >"$_lt_tmp/more.sh" <<EOF
+out=\$(mktemp)
+$_lt_more > "\$out" 2>/dev/null || true
+if [ -s "\$out" ]; then
+	curl -s -XPOST "127.0.0.1:\$1" --data "reload(cat \$out; rm -f \$out)" >/dev/null 2>&1 || rm -f "\$out"
+else rm -f "\$out"; fi
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/more.sh \$FZF_PORT &"
+	fi
+	if [ "$_lt_refresh" -gt 0 ] && [ -z "$_lt_reload" ] && command -v curl >/dev/null 2>&1; then
+		# background loop: run the seed, post it to fzf only when it changed;
+		# it ends by itself once fzf's port stops answering
+		_lt_secs=$(awk -v ms="$_lt_refresh" 'BEGIN { if (ms < 50) ms = 50; printf "%.3f", ms / 1000 }')
+		cat >"$_lt_tmp/refresh.sh" <<EOF
+port=\$1; last=$_lt_tmp/last; new=$_lt_tmp/new
+sh $_lt_tmp/seed.sh >"\$last" 2>/dev/null
+while sleep $_lt_secs; do
+	[ -d $_lt_tmp ] || exit 0
+	sh $_lt_tmp/seed.sh >"\$new" 2>/dev/null || continue
+	cmp -s "\$last" "\$new" && continue
+	cp "\$new" "\$last"
+	curl -s -m 2 -XPOST "127.0.0.1:\$port" --data "reload-sync(cat $_lt_tmp/last)" >/dev/null 2>&1 || exit 0
+done
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
+		set -- "$@" --track --id-nth="$_lt_key"
+	fi
+	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
+	if [ -n "$_lt_reload" ]; then
+		printf '%s\n' "$_lt_reload" | sed 's/{q}/"$1"/g' >"$_lt_tmp/reload.sh"
+		set -- "$@" --bind="change:reload(sh $_lt_tmp/reload.sh {q})"
+	fi
+
+	# mode: select = no input line, space marks, / opens search
+	_lt_bar= _lt_ubar=
+	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
+	_lt_hints=
+	case $(fzf --version 2>/dev/null) in *-c\ *) _lt_hints=1 ;; esac
+	if [ "$_lt_mode" = select ]; then
+		set -- "$@" --multi --no-input \
+			--bind='space:toggle+down # mark,tab:down,btab:up,/:show-input # search' \
+			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	else
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint type filter)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	fi
+
+	# yaml key map -> binds + key bar
+	_lt_n=0
+	if [ -n "$_lt_keys" ]; then
+		[ "$_lt_keys" = - ] && printf '%s\n' "${LT_KEYS:-}" >"$_lt_tmp/keys" || cat "$_lt_keys" >"$_lt_tmp/keys"
+		while IFS= read -r _lt_line || [ -n "$_lt_line" ]; do
+			_lt_line=$(_lt_trim "$_lt_line")
+			case $_lt_line in '' | '#'*) continue ;; esac
+			# a line of just --- starts a new line in the key bar
+			[ "$_lt_line" = --- ] && { _lt_ubar="$_lt_ubar
+"; _lt_fresh=1; continue; }
+			_lt_kn=$(_lt_trim "${_lt_line%%:*}")
+			_lt_rest=${_lt_line#*:}
+			case $_lt_rest in
+				*' # '*) _lt_label=$(_lt_trim "${_lt_rest##* # }"); _lt_act=$(_lt_trim "${_lt_rest% # *}") ;;
+				*)       _lt_label=; _lt_act=$(_lt_trim "$_lt_rest") ;;
+			esac
+			_lt_n=$((_lt_n + 1))
+			_lt_reloadact="+reload(sh $_lt_tmp/seed.sh)"
+			case $_lt_act in
+				refresh)  _lt_bind="reload(sh $_lt_tmp/seed.sh)" ;;
+				quit)     _lt_bind=abort ;;
+				'!'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#!}"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)$_lt_reloadact" ;;
+				'>'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#>}"
+				          _lt_bind="become(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+				accept | select-all | deselect-all | toggle | toggle-all | first | last | up | down | page-up | page-down | abort | clear-query | show-input | hide-input)
+				          _lt_bind=$_lt_act ;;
+				*)        _lt_script "$_lt_tmp/a$_lt_n.sh" "$_lt_act"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+			esac
+			if [ -n "$_lt_hints" ] && [ -n "$_lt_label" ]; then set -- "$@" --bind="$_lt_kn:$_lt_bind # $_lt_label"
+			else set -- "$@" --bind="$_lt_kn:$_lt_bind"; fi
+			if [ -n "$_lt_label" ]; then
+				_lt_ubar="$_lt_ubar$(_lt_hint "$_lt_kn" "$_lt_label")"
+				_lt_fresh=
+			fi
+		done <"$_lt_tmp/keys"
+	fi
+	# defaults on line one, the key map's labels on line two
+	if [ -n "$_lt_hints" ]; then set -- "$@" --hints
+	else set -- "$@" --footer="$_lt_bar${_lt_ubar:+
+$_lt_ubar}"; fi
+
+	_lt_sel=$(sh "$_lt_tmp/seed.sh" | fzf "$@"); _lt_rc=$?
+	rm -rf "$_lt_tmp"
+	[ $_lt_rc -eq 0 ] || return 1
+	[ -n "$_lt_sel" ] && printf '%s\n' "$_lt_sel" | cut -f"$_lt_key"
+	return 0
+}
+
+# numbered prompt when fzf is missing
+_lt_fallback() {
+	sh "$_lt_tmp/seed.sh" >"$_lt_tmp/fb"
+	[ -s "$_lt_tmp/fb" ] || return 1
+	awk -F'\t' '{ printf "%3d) %s\n", NR, ($1 == "" ? $0 : $0) }' "$_lt_tmp/fb" | tr '\t' ' ' >&2
+	printf 'pick number%s, q to cancel: ' "$([ "$_lt_mode" = select ] && echo 's (space separated)')" >&2
+	read -r _lt_ans || return 1
+	case $_lt_ans in '' | q) return 1 ;; esac
+	for _lt_i in $_lt_ans; do sed -n "${_lt_i}p" "$_lt_tmp/fb"; done | cut -f"$_lt_key"
+}
+
+# <<< lazytui <<<
+
+PLAY_DELAY="${SCENARIO_DELAY:-3}"        # seconds to wait before a replay starts
+REFRESH_MS="${SCENARIO_REFRESH:-1000}"   # TUI auto-refresh, milliseconds, 0 = off
+# ----------------------------------------------------------------------
+
+scenario_dir="${XDG_DATA_HOME:-$HOME/.local/share}/scenario"
+mkdir -p "$scenario_dir"
+
+backend=""
+if command -v evemu-record >/dev/null 2>&1 && command -v evemu-play >/dev/null 2>&1; then
+	backend=evemu
+elif command -v cnee >/dev/null 2>&1; then
+	backend=xnee
+fi
+
+if [ -z "$backend" ]; then
+	echo "no record/replay backend found - install one:"
+	echo "  evemu (pacman -S evemu / apt install evemu-tools / dnf install evemu)"
+	echo "  xnee  (apt install xnee / dnf install xnee)"
+	exit 1
+fi
+
+# real keyboard/mouse devices - an N: Name= line followed by an H:
+# Handlers= line containing kbd (keyboard-like) or mouse (pointer-
+# like); real /proc/bus/input/devices format, not guessed.
+detect_devices() {
+	awk '
+		/^H: Handlers=/ {
+			if ($0 ~ /kbd/ || $0 ~ /mouse/) {
+				for (i = 1; i <= NF; i++) {
+					if ($i ~ /^event[0-9]+$/) print "/dev/input/" $i
+				}
+			}
+		}
+	' /proc/bus/input/devices
+}
+
+case "$1" in
+record)
+	shift
+	if [ -n "$1" ] && [ "${1#/dev/}" = "$1" ]; then
+		name="$1"
+		shift
+	else
+		name="$(date +%Y%m%d_%H%M%S)"
+	fi
+	devices="$*"
+	[ -z "$devices" ] && devices="$(detect_devices)"
+	if [ -z "$devices" ]; then
+		echo "no keyboard/mouse devices found in /proc/bus/input/devices"
+		exit 1
+	fi
+
+	pids_file="$scenario_dir/$name.pids"
+	: > "$pids_file"
+	echo "recording (backend: $backend) to $scenario_dir/$name.* :"
+	i=0
+	for dev in $devices; do
+		i=$((i + 1))
+		out="$scenario_dir/$name.$i.evemu"
+		if [ "$backend" = "evemu" ]; then
+			sudo evemu-record "$dev" "$out" &
+		else
+			# UNVERIFIED - see top comment, no xnee install anywhere
+			# to confirm this exact real flag set against.
+			cnee --record --device "$dev" --events-to-file "$out" &
+		fi
+		echo $! >> "$pids_file"
+		echo "  $dev -> $out (pid $!)"
+	done
+	echo "$name" > "$scenario_dir/.last"
+	echo "recording - run 'scenario stop' to finish"
+	;;
+stop)
+	name="$(cat "$scenario_dir/.last" 2>/dev/null)"
+	pids_file="$scenario_dir/$name.pids"
+	if [ -z "$name" ] || [ ! -f "$pids_file" ]; then
+		echo "no active recording"
+		exit 1
+	fi
+	while read -r pid; do
+		[ -n "$pid" ] && sudo kill "$pid" 2>/dev/null
+	done < "$pids_file"
+	rm -f "$pids_file"
+	echo "stopped recording '$name'"
+	;;
+play)
+	if [ -z "$2" ]; then
+		echo "usage: scenario play NAME"
+		exit 1
+	fi
+	name="$2"
+	found=0
+	if [ "$PLAY_DELAY" -gt 0 ] 2>/dev/null; then
+		echo "replaying '$name' in $PLAY_DELAY s - focus the target window now"
+		sleep "$PLAY_DELAY"
+	fi
+	for f in "$scenario_dir/$name".*.evemu; do
+		[ -e "$f" ] || continue
+		found=1
+		echo "replaying $f ..."
+		if [ "$backend" = "evemu" ]; then
+			# evemu-play, given a FILE (not a device), creates a
+			# matching virtual uinput device itself and replays into
+			# it - confirmed from evemu's own real man page, no
+			# separate evemu-device step needed.
+			sudo evemu-play "$f" &
+		else
+			cnee --replay --events-from-file "$f" &
+		fi
+	done
+	if [ "$found" -eq 0 ]; then
+		echo "no recording named '$name'"
+		exit 1
+	fi
+	wait
+	;;
+list)
+	ls "$scenario_dir" 2>/dev/null | grep -v '\.pids$\|^\.last$' | sed 's/\.[0-9]*\.evemu$//' | sort -u
+	;;
+delete)
+	[ -n "$2" ] || { echo "usage: scenario delete NAME"; exit 1; }
+	case $2 in */* | .*) echo "bad name"; exit 1 ;; esac
+	[ -n "$(ls "$scenario_dir/$2".*.evemu 2>/dev/null)" ] || { echo "no recording named '$2'"; exit 1; }
+	rm -f "$scenario_dir/$2".*.evemu "$scenario_dir/$2.pids"
+	echo "deleted '$2'"
+	;;
+rename)
+	[ -n "$2" ] && [ -n "$3" ] || { echo "usage: scenario rename OLD NEW"; exit 1; }
+	case $2$3 in */* | .*) echo "bad name"; exit 1 ;; esac
+	[ -n "$(ls "$scenario_dir/$3".*.evemu 2>/dev/null)" ] && { echo "'$3' already exists"; exit 1; }
+	found=0
+	for f in "$scenario_dir/$2".*.evemu; do
+		[ -e "$f" ] || continue
+		found=1
+		n=${f#"$scenario_dir/$2".}
+		mv -- "$f" "$scenario_dir/$3.$n"
+	done
+	[ "$found" -eq 1 ] || { echo "no recording named '$2'"; exit 1; }
+	echo "renamed '$2' -> '$3'"
+	;;
+_rows)
+	# NAME<TAB>marker name, devices, size, date - "rec" while a recorder is alive
+	for n in $("$0" list); do
+		devs=$(ls "$scenario_dir/$n".*.evemu 2>/dev/null | wc -l)
+		size=$(cat "$scenario_dir/$n".*.evemu 2>/dev/null | wc -c)
+		when=$(date -r "$(ls -t "$scenario_dir/$n".*.evemu | head -1)" '+%Y-%m-%d %H:%M' 2>/dev/null)
+		rec="   "
+		if [ -f "$scenario_dir/$n.pids" ]; then
+			while read -r pid; do [ -n "$pid" ] && [ -d "/proc/$pid" ] && rec="$(printf '\033[31m●\033[0m  ')"; done < "$scenario_dir/$n.pids"
+		fi
+		printf '%s\t%s %-30s %2s dev  %8s B  %s\n' "$n" "$rec" "$n" "$devs" "$size" "$when"
+	done
+	;;
+_preview)
+	for f in "$scenario_dir/$2".*.evemu; do
+		[ -e "$f" ] && printf '%s  %s events\n' "$(basename "$f")" "$(grep -c '^E:' "$f")"
+	done
+	;;
+_new)
+	printf 'name for the new recording (empty = timestamp): ' >&2
+	read -r nm
+	"$0" record $nm
+	;;
+""|tui)
+	SELF=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
+	LT_KEYS="enter:  !$SELF play        # Play
+ctrl-r: !$SELF _new         # Record
+ctrl-x: !$SELF stop         # Stop
+ctrl-d: !$SELF delete       # Delete
+alt-n:  !sh -c 'printf \"new name: \" >&2; read -r n </dev/tty; exec \"\$0\" rename \"\$1\" \"\$n\"' $SELF   # Rename"
+	export LT_KEYS
+	lt_select --mode select --refresh "$REFRESH_MS" --header "scenarios ($backend)" --prompt 'search> ' --nth 2 \
+		--seed "$SELF _rows" --preview "$SELF _preview" --keys - >/dev/null || true
+	;;
+*)
+	echo "usage: scenario record [NAME] [DEVICE...] | stop | play NAME | list | delete NAME | rename OLD NEW"
+	exit 1
+	;;
+esac

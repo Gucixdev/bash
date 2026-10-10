@@ -1,0 +1,15 @@
+.TH LOCK 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+lock \- real screen lock - invokes this project's own already-vendored
+.SH SYNOPSIS
+.B lock
+.SH DESCRIPTION
+.B lock
+.nf
+suckless slock (coreutils/slock/, real, already built - checked by
+hand) instead of reimplementing a screen locker. Falls back to a
+plain `slock` on PATH if the vendored build isn't reachable (e.g.
+this script copied somewhere the repo layout doesn't match).
+.fi
+.SH SEE ALSO
+TODO: related tools here.

@@ -1,0 +1,17 @@
+.TH TRASH 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+trash \- real trash-can, implementing the actual freedesktop.org Trash spec
+.SH SYNOPSIS
+.B trash
+.SH DESCRIPTION
+.B trash
+.nf
+directly (files/ + a matching .trashinfo per file) rather than
+depending on trash-cli - not installed on this machine (checked by
+hand) - so any real spec-compliant GUI file manager sees and can
+restore what this deletes, not just this script itself.
+
+usage: trash FILE...
+.fi
+.SH SEE ALSO
+TODO: related tools here.

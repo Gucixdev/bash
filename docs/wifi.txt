@@ -1,0 +1,3 @@
+wifi bash only choose wifi and password 
+fallback 1 network manager 2 iwd 3 rest 
+

@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+# <manwriter>
+# bdfeditor - terminal editor for BDF bitmap fonts, also handy for small sprites.
+#
+#   bdfeditor FILE.bdf              edit (creates the file if it does not exist, asking for the size)
+#   bdfeditor info FILE.bdf         font header and glyph count
+#   bdfeditor show FILE.bdf CHAR    print one glyph as text: CHAR is a character, 0x41, U+0041 or a decimal code
+#   bdfeditor text FILE.bdf "TEXT"  render TEXT with the font as text
+#
+# One file, Python 3 standard library only (curses), so it works wherever python3 does. Every glyph is
+# edited on a canvas as big as the font bounding box; on save each glyph is written with a tight BBX, and
+# the header, properties and every glyph you did not touch are kept as they were.
+#
+# Keys (? shows them in the editor)
+#   arrows / hjkl   move the cursor          space / Enter  toggle the pixel
+#   p               pen: off -> paint -> erase (moving draws)
+#   H J K L         shift the whole glyph    c clear   i invert   f flip left-right   F flip up-down   r rotate 90
+#   PgDn/PgUp n/N   next / previous glyph    g go to a character or code (asks to create it when missing)
+#   a  add a glyph  D delete the glyph       y copy       P paste          + / -   advance width (DWIDTH)
+#   u undo          U redo                   s save       S save as        q quit
+#   t  preview text                          e export the glyph as PBM   I import a PBM into the glyph
+#
+# The file is plain text, so it diffs and versions well. Sprites: start a new file (bdfeditor new.bdf asks
+# for the size), draw glyphs as frames, and use PBM export/import to move pixels in and out.
+# </manwriter>
+import os
+import sys
+
+BLOCK = "█" if "utf" in (getattr(sys.stdout, "encoding", "") or "").lower() else "#"
+
+# ---------------------------------------------------------------- BDF model
+
+
+class Glyph:
+    def __init__(self, name, enc, dwx, pixels, extra=None, swidth=None, enc2=None):
+        self.name = name
+        self.enc = enc             # encoding, -1 = unencoded
+        self.enc2 = enc2           # optional second number of "ENCODING -1 n"
+        self.dwx = dwx             # advance width
+        self.pixels = set(pixels)  # {(x, y)}: x right, y up, origin at the baseline/left
+        self.extra = extra or []   # unknown lines of the glyph, kept verbatim
+        self.swidth = swidth       # raw SWIDTH line or None (then it is computed on save)
+
+    def copy(self):
+        return Glyph(self.name, self.enc, self.dwx, set(self.pixels), list(self.extra), self.swidth, self.enc2)
+
+
+class Font:
+    def __init__(self):
+        self.header = []          # lines before the first STARTCHAR (properties included)
+        self.glyphs = []          # in file order
+        self.fbb = [8, 8, 0, 0]   # FONTBOUNDINGBOX w h xoff yoff
+        self.path = None
+
+    def by_enc(self, enc):
+        for g in self.glyphs:
+            if g.enc == enc:
+                return g
+        return None
+
+    def canvas(self):
+        """x0, y0, w, h of the editing canvas: the font box, grown to hold every glyph."""
+        x0, y0 = self.fbb[2], self.fbb[3]
+        x1, y1 = x0 + self.fbb[0] - 1, y0 + self.fbb[1] - 1
+        for g in self.glyphs:
+            for (x, y) in g.pixels:
+                x0, x1, y0, y1 = min(x0, x), max(x1, x), min(y0, y), max(y1, y)
+        return x0, y0, x1 - x0 + 1, y1 - y0 + 1
+
+
+def parse_bdf(text):
+    font = Font()
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    i, n = 0, len(lines)
+    while i < n and not lines[i].startswith("STARTCHAR"):
+        ln = lines[i]
+        if ln.startswith("FONTBOUNDINGBOX"):
+            p = ln.split()
+            font.fbb = [int(p[1]), int(p[2]), int(p[3]), int(p[4])]
+        font.header.append(ln)
+        i += 1
+    while i < n:
+        if not lines[i].startswith("STARTCHAR"):
+            i += 1
+            continue
+        parts = lines[i].split(None, 1)
+        name = parts[1] if len(parts) > 1 else "glyph"
+        enc, enc2, dwx, swidth, bbx, extra, rows = -1, None, font.fbb[0], None, (0, 0, 0, 0), [], []
+        i += 1
+        while i < n and not lines[i].startswith("ENDCHAR"):
+            ln = lines[i]
+            key = ln.split(None, 1)[0] if ln.strip() else ""
+            if key == "ENCODING":
+                p = ln.split()
+                enc = int(p[1])
+                enc2 = int(p[2]) if len(p) > 2 else None
+            elif key == "DWIDTH":
+                dwx = int(ln.split()[1])
+            elif key == "SWIDTH":
+                swidth = ln
+            elif key == "BBX":
+                p = ln.split()
+                bbx = (int(p[1]), int(p[2]), int(p[3]), int(p[4]))
+            elif key == "BITMAP":
+                i += 1
+                while i < n and not lines[i].startswith("ENDCHAR"):
+                    if lines[i].strip():
+                        rows.append(lines[i].strip())
+                    i += 1
+                continue
+            elif ln.strip():
+                extra.append(ln)
+            i += 1
+        w, h, xo, yo = bbx
+        pixels = set()
+        for r, hexrow in enumerate(rows[:h]):
+            bits = bin(int(hexrow, 16))[2:].zfill(len(hexrow) * 4)
+            for c in range(w):
+                if c < len(bits) and bits[c] == "1":
+                    pixels.add((xo + c, yo + h - 1 - r))
+        font.glyphs.append(Glyph(name, enc, dwx, pixels, extra, swidth, enc2))
+        i += 1
+    return font
+
+
+def serialize_bdf(font):
+    out = []
+    has_chars = False
+    for ln in font.header:
+        if ln.startswith("CHARS"):
+            out.append("CHARS %d" % len(font.glyphs))
+            has_chars = True
+        elif ln.startswith("FONTBOUNDINGBOX"):
+            out.append("FONTBOUNDINGBOX %d %d %d %d" % tuple(font.fbb))
+        elif ln.strip() or out:
+            out.append(ln)
+    if not has_chars:
+        out.append("CHARS %d" % len(font.glyphs))
+    for g in font.glyphs:
+        out.append("STARTCHAR %s" % g.name)
+        out.append("ENCODING %d%s" % (g.enc, " %d" % g.enc2 if g.enc2 is not None else ""))
+        out.append(g.swidth if g.swidth else "SWIDTH %d 0" % (g.dwx * 1000 // max(1, font.fbb[1])))
+        out.append("DWIDTH %d 0" % g.dwx)
+        out.extend(g.extra)
+        if g.pixels:
+            xs = [p[0] for p in g.pixels]
+            ys = [p[1] for p in g.pixels]
+            x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+            w, h = x1 - x0 + 1, y1 - y0 + 1
+            out.append("BBX %d %d %d %d" % (w, h, x0, y0))
+            out.append("BITMAP")
+            nbytes = (w + 7) // 8
+            for y in range(y1, y0 - 1, -1):
+                v = 0
+                for c in range(nbytes * 8):
+                    v = (v << 1) | (1 if c < w and (x0 + c, y) in g.pixels else 0)
+                out.append("%0*X" % (nbytes * 2, v))
+        else:
+            out.append("BBX 0 0 0 0")
+            out.append("BITMAP")
+        out.append("ENDCHAR")
+    out.append("ENDFONT")
+    return "\n".join(out) + "\n"
+
+
+def new_font(w, h):
+    font = Font()
+    asc = max(1, h - max(1, h // 4))
+    font.fbb = [w, h, 0, -(h - asc)]
+    font.header = ["STARTFONT 2.1", "FONT -bdfeditor-new-medium-r-normal--%d-%d0-75-75-c-%d0-iso10646-1" % (h, h, w),
+                   "SIZE %d 75 75" % h, "FONTBOUNDINGBOX %d %d 0 %d" % (w, h, -(h - asc)),
+                   "STARTPROPERTIES 2", "FONT_ASCENT %d" % asc, "FONT_DESCENT %d" % (h - asc), "ENDPROPERTIES", "CHARS 0"]
+    return font
+
+
+def load(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        font = parse_bdf(f.read())
+    font.path = path
+    return font
+
+
+def save(font, path=None):
+    path = path or font.path
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(serialize_bdf(font))
+    os.replace(tmp, path)
+    font.path = path
+
+
+def glyph_rows(font, g):
+    """The glyph on the font canvas as strings, top row first: '#' set, '.' clear."""
+    x0, y0, w, h = font.canvas()
+    return ["".join("#" if (x0 + c, y0 + h - 1 - r) in g.pixels else "." for c in range(w)) for r in range(h)]
+
+
+def parse_char(s):
+    """A character, 0x41, U+0041 or a decimal code -> encoding, or None."""
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        if s.lower().startswith("u+"):
+            return int(s[2:], 16)
+        if s.lower().startswith("0x"):
+            return int(s, 16)
+        if s.isdigit() and len(s) > 1:
+            return int(s)
+    except ValueError:
+        return None
+    return ord(s[0])
+
+
+def render_text(font, text):
+    """TEXT drawn with the font: list of strings, one per pixel row ('#' set, ' ' clear)."""
+    x0, y0, w, h = font.canvas()
+    rows = [""] * h
+    for ch in text:
+        g = font.by_enc(ord(ch)) or font.by_enc(0x3F) or font.by_enc(0x20)
+        adv = g.dwx if g else font.fbb[0]
+        for r in range(h):
+            y = y0 + h - 1 - r
+            rows[r] += "".join("#" if g and (x, y) in g.pixels else " " for x in range(0, max(adv, 1)))
+    return rows
+
+
+# ---------------------------------------------------------------- non-interactive commands
+
+
+def cmd_info(path):
+    f = load(path)
+    print("file      %s" % path)
+    for ln in f.header:
+        if ln.startswith(("FONT ", "SIZE", "FONTBOUNDINGBOX", "FONT_ASCENT", "FONT_DESCENT")):
+            print("  " + ln)
+    print("glyphs    %d" % len(f.glyphs))
+    encs = sorted(g.enc for g in f.glyphs if g.enc >= 0)
+    if encs:
+        print("encodings U+%04X .. U+%04X" % (encs[0], encs[-1]))
+    print("canvas    %dx%d" % f.canvas()[2:])
+
+
+def cmd_show(path, ch):
+    f = load(path)
+    enc = parse_char(ch)
+    g = f.by_enc(enc) if enc is not None else None
+    if g is None:
+        print("bdfeditor: no glyph for %s" % ch, file=sys.stderr)
+        return 1
+    print("U+%04X  %s  advance %d" % (g.enc, g.name, g.dwx))
+    print("\n".join(glyph_rows(f, g)))
+    return 0
+
+
+def cmd_text(path, text):
+    f = load(path)
+    print("\n".join(r.rstrip() for r in render_text(f, text)))
+
+
+# ---------------------------------------------------------------- pbm (sprites in and out)
+
+
+def to_pbm(font, g):
+    rows = glyph_rows(font, g)
+    return "P1\n%d %d\n%s\n" % (len(rows[0]), len(rows), "\n".join(" ".join("1" if c == "#" else "0" for c in r) for r in rows))
+
+
+def from_pbm(text):
+    tok = [t for ln in text.splitlines() if not ln.startswith("#") for t in ln.split()]
+    if not tok or tok[0] != "P1":
+        raise ValueError("only ASCII PBM (P1) is supported")
+    w, h = int(tok[1]), int(tok[2])
+    return w, h, "".join(tok[3:])
+
+
+# ---------------------------------------------------------------- the editor (curses)
+
+
+HELP = """bdfeditor keys
+ move       arrows / h j k l          toggle   space, Enter
+ pen        p   off -> paint -> erase (moving draws)
+ shift      H J K L    move the whole glyph by one pixel
+ transform  c clear   i invert   f flip left-right   F flip up-down   r rotate 90 (square canvas)
+ glyphs     PgDn/n next   PgUp/N previous   g go to char/code   a add   D delete
+ copy       y copy the glyph   P paste over this one   + / -  advance width
+ history    u undo   U redo
+ file       s save   S save as   q quit
+ pixels     e export this glyph as PBM   I import a PBM into this glyph
+ preview    t change the preview text
+press a key to close"""
+
+
+class Editor:
+    UNDO_LIMIT = 300
+
+    def __init__(self, font, path):
+        self.font = font
+        self.path = path
+        self.idx = 0
+        self.cx = self.cy = 0          # cursor on the canvas (column, row from the top)
+        self.pen = 0                   # 0 off, 1 paint, 2 erase
+        self.stroke = False            # this pen stroke already has an undo step
+        self.undo, self.redo = [], []
+        self.dirty = False
+        self.clip = None
+        self.msg = "? for keys" if font.glyphs else "empty font: press a to add a glyph"
+        self.preview = "Hamburgefonstiv 0123 the quick brown fox"
+        self.vx = self.vy = 0
+
+    # ---- helpers
+    @property
+    def g(self):
+        return self.font.glyphs[self.idx] if self.font.glyphs else None
+
+    def xy(self):
+        x0, y0, w, h = self.font.canvas()
+        return x0 + self.cx, y0 + h - 1 - self.cy
+
+    def push(self):
+        g = self.g
+        if g is not None:
+            self.undo.append((g.enc, g.copy()))
+            del self.undo[:-self.UNDO_LIMIT]
+            self.redo = []
+        self.dirty = True
+
+    def apply_pixels(self, pixels):
+        self.push()
+        self.g.pixels = set(pixels)
+
+    def clamp(self):
+        x0, y0, w, h = self.font.canvas()
+        self.cx = max(0, min(w - 1, self.cx))
+        self.cy = max(0, min(h - 1, self.cy))
+
+    def insert_sorted(self, g):
+        gl = self.font.glyphs
+        pos = len(gl)
+        for k, o in enumerate(gl):
+            if o.enc > g.enc >= 0:
+                pos = k
+                break
+        gl.insert(pos, g)
+        return pos
+
+    # ---- actions on the glyph
+    def toggle(self):
+        if self.g is None:
+            return
+        p = self.xy()
+        self.push()
+        if p in self.g.pixels:
+            self.g.pixels.remove(p)
+        else:
+            self.g.pixels.add(p)
+
+    def paint(self):
+        if self.g is None or not self.pen:
+            return
+        p = self.xy()
+        if (p in self.g.pixels) == (self.pen == 1):
+            return
+        if not self.stroke:      # one undo step per stroke, not per pixel
+            self.push()
+            self.stroke = True
+        if self.pen == 1:
+            self.g.pixels.add(p)
+        else:
+            self.g.pixels.discard(p)
+
+    def move(self, dx, dy):
+        self.cx += dx
+        self.cy += dy
+        self.clamp()
+        self.paint()
+
+    def shift(self, dx, dy):
+        if self.g is not None:
+            self.apply_pixels({(x + dx, y - dy) for (x, y) in self.g.pixels})
+
+    def transform(self, kind):
+        g = self.g
+        if g is None:
+            return
+        x0, y0, w, h = self.font.canvas()
+        px = {(x - x0, y - y0) for (x, y) in g.pixels}
+        if kind == "c":
+            new = set()
+        elif kind == "i":
+            new = {(c, r) for c in range(w) for r in range(h)} - px
+        elif kind == "f":
+            new = {(w - 1 - x, y) for (x, y) in px}
+        elif kind == "F":
+            new = {(x, h - 1 - y) for (x, y) in px}
+        elif kind == "r":
+            if w != h:
+                self.msg = "rotate needs a square canvas (%dx%d)" % (w, h)
+                return
+            new = {(y, w - 1 - x) for (x, y) in px}
+        else:
+            return
+        self.apply_pixels({(x + x0, y + y0) for (x, y) in new})
+
+    def goto_enc(self, enc):
+        for k, g in enumerate(self.font.glyphs):
+            if g.enc == enc:
+                self.idx = k
+                return True
+        return False
+
+    def add_glyph(self, enc):
+        if self.goto_enc(enc):
+            return
+        name = "uni%04X" % enc
+        g = Glyph(name, enc, self.font.fbb[0], set())
+        self.undo.append((None, g.copy()))
+        self.idx = self.insert_sorted(g)
+        self.dirty = True
+        self.msg = "added U+%04X" % enc
+
+    def delete_glyph(self):
+        if self.g is None:
+            return
+        del self.font.glyphs[self.idx]
+        self.idx = max(0, min(self.idx, len(self.font.glyphs) - 1))
+        self.dirty = True
+        self.undo, self.redo = [], []
+        self.msg = "glyph deleted (this cannot be undone)"
+
+    def do_undo(self):
+        if not self.undo:
+            self.msg = "nothing to undo"
+            return
+        enc, snap = self.undo.pop()
+        if enc is None:      # an added glyph: take it out again
+            for k, g in enumerate(self.font.glyphs):
+                if g.enc == snap.enc:
+                    del self.font.glyphs[k]
+                    self.idx = max(0, min(k, len(self.font.glyphs) - 1))
+                    break
+            self.msg = "undone: add glyph"
+            return
+        g = self.font.by_enc(enc)
+        if g is None:
+            return
+        self.redo.append((enc, g.copy()))
+        g.pixels, g.dwx = snap.pixels, snap.dwx
+        self.idx = self.font.glyphs.index(g)
+        self.msg = "undone"
+
+    def do_redo(self):
+        if not self.redo:
+            self.msg = "nothing to redo"
+            return
+        enc, snap = self.redo.pop()
+        g = self.font.by_enc(enc)
+        if g is None:
+            return
+        self.undo.append((enc, g.copy()))
+        g.pixels, g.dwx = snap.pixels, snap.dwx
+        self.idx = self.font.glyphs.index(g)
+        self.msg = "redone"
+
+    def save(self, path):
+        f = self.font
+        x0, y0, w, h = f.canvas()
+        f.fbb = [w, h, x0, y0]     # the canvas only ever grows past the header box
+        try:
+            save(f, path)
+            self.path = path
+            self.dirty = False
+            self.msg = "saved %s (%d glyphs)" % (path, len(f.glyphs))
+        except OSError as e:
+            self.msg = "save failed: %s" % e
+
+    # ---- ui
+    def put(self, y, x, text, attr=0):
+        try:
+            self.scr.addstr(y, x, text, attr)
+        except self.C.error:      # the bottom-right cell and clipped text are not errors for us
+            pass
+
+    def run(self, stdscr):
+        import curses
+        self.C = curses
+        self.scr = stdscr
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        while True:
+            self.draw()
+            if self.handle(stdscr.getch()):
+                return
+
+    def prompt(self, label, default=""):
+        c = self.C
+        h, w = self.scr.getmaxyx()
+        buf = list(default)
+        while True:
+            self.scr.move(h - 1, 0)
+            self.scr.clrtoeol()
+            self.put(h - 1, 0, (label + ": " + "".join(buf))[:w - 1], c.A_BOLD)
+            k = self.scr.getch()
+            if k in (10, 13):
+                return "".join(buf)
+            if k == 27:
+                return None
+            if k in (127, 8, c.KEY_BACKSPACE):
+                if buf:
+                    buf.pop()
+            elif 32 <= k < 127:
+                buf.append(chr(k))
+
+    def confirm(self, text):
+        a = self.prompt(text + " [y/N]")
+        return a is not None and a.strip().lower() in ("y", "yes", "t", "tak")
+
+    def draw(self):
+        c, s = self.C, self.scr
+        s.erase()
+        H, W = s.getmaxyx()
+        f, g = self.font, self.g
+        x0, y0, cw, ch = f.canvas()
+        self.put(0, 0, (" %s%s   canvas %dx%d   %d glyphs" % (os.path.basename(self.path), " *" if self.dirty else "", cw, ch, len(f.glyphs))).ljust(W)[:W - 1], c.A_REVERSE)
+        lw = 22                                           # glyph list
+        rows = max(1, H - 3)
+        top = max(0, min(self.idx - rows // 2, len(f.glyphs) - rows))
+        for r, k in enumerate(range(top, min(len(f.glyphs), top + rows))):
+            gg = f.glyphs[k]
+            shown = chr(gg.enc) if 32 < gg.enc < 0x2FFF and chr(gg.enc).isprintable() else ""
+            label = "%-7s %s" % ("U+%04X" % gg.enc if gg.enc >= 0 else "-1", shown)
+            self.put(1 + r, 0, ("> " if k == self.idx else "  ") + label.ljust(lw - 2)[:lw - 2], c.A_REVERSE if k == self.idx else 0)
+        if g is None:
+            self.put(2, lw + 2, "no glyphs - press a to add one")
+        else:
+            gx, gy = lw + 2, 2                            # pixel grid: two columns per pixel, viewport follows the cursor
+            vis_w, vis_h = max(1, (W - gx - 1) // 2), max(1, H - gy - 3)
+            if self.cx < self.vx:
+                self.vx = self.cx
+            if self.cx >= self.vx + vis_w:
+                self.vx = self.cx - vis_w + 1
+            if self.cy < self.vy:
+                self.vy = self.cy
+            if self.cy >= self.vy + vis_h:
+                self.vy = self.cy - vis_h + 1
+            for r in range(min(vis_h, ch - self.vy)):
+                for col in range(min(vis_w, cw - self.vx)):
+                    cc, rr = self.vx + col, self.vy + r
+                    x, y = x0 + cc, y0 + ch - 1 - rr
+                    on = (x, y) in g.pixels
+                    if cc == self.cx and rr == self.cy:
+                        self.put(gy + r, gx + col * 2, "[]", c.A_REVERSE if on else c.A_BOLD)
+                    elif on:
+                        self.put(gy + r, gx + col * 2, BLOCK * 2 if BLOCK != "#" else "  ", 0 if BLOCK != "#" else c.A_REVERSE)
+                    elif y == 0:
+                        self.put(gy + r, gx + col * 2, "--", c.A_DIM)     # the baseline
+                    elif x == 0:
+                        self.put(gy + r, gx + col * 2, "| ", c.A_DIM)     # the origin
+                    else:
+                        self.put(gy + r, gx + col * 2, ". ", c.A_DIM)
+            px = gx + min(cw, vis_w) * 2 + 3              # sample text with the whole font, right of the grid
+            if px + 12 < W:
+                self.put(gy - 1, px, "preview (t)", c.A_DIM)
+                for r, line in enumerate(render_text(f, self.preview)[:H - gy - 3]):
+                    self.put(gy + r, px, line.replace("#", BLOCK)[:W - px - 1])
+        px_, py_ = self.xy() if g else (0, 0)
+        info = "U+%04X  cursor %d,%d  advance %d  pen:%s" % (g.enc if g else 0, px_, py_, g.dwx if g else 0, ("off", "PAINT", "ERASE")[self.pen])
+        self.put(H - 2, 0, info[:W - 1], c.A_BOLD)
+        self.put(H - 1, 0, self.msg[:W - 1])
+        s.refresh()
+
+    def handle(self, k):
+        c = self.C
+        self.msg = ""
+        if k not in (c.KEY_LEFT, c.KEY_RIGHT, c.KEY_UP, c.KEY_DOWN, ord("h"), ord("j"), ord("k"), ord("l")):
+            self.stroke = False
+        if k == ord("q"):
+            if not self.dirty or self.confirm("unsaved changes - quit anyway"):
+                return True
+        elif k in (c.KEY_LEFT, ord("h")):
+            self.move(-1, 0)
+        elif k in (c.KEY_RIGHT, ord("l")):
+            self.move(1, 0)
+        elif k in (c.KEY_UP, ord("k")):
+            self.move(0, -1)
+        elif k in (c.KEY_DOWN, ord("j")):
+            self.move(0, 1)
+        elif k in (ord(" "), 10, 13):
+            self.toggle()
+        elif k == ord("p"):
+            self.pen = (self.pen + 1) % 3
+            self.stroke = False
+            self.paint()
+        elif k == ord("H"):
+            self.shift(-1, 0)
+        elif k == ord("L"):
+            self.shift(1, 0)
+        elif k == ord("K"):
+            self.shift(0, -1)
+        elif k == ord("J"):
+            self.shift(0, 1)
+        elif k in (ord("c"), ord("i"), ord("f"), ord("F"), ord("r")):
+            self.transform(chr(k))
+        elif k in (c.KEY_NPAGE, ord("n")):
+            self.idx = min(len(self.font.glyphs) - 1, self.idx + 1)
+        elif k in (c.KEY_PPAGE, ord("N")):
+            self.idx = max(0, self.idx - 1)
+        elif k == ord("g"):
+            enc = parse_char(self.prompt("go to (char, 0x41, U+0041, decimal)") or "")
+            if enc is not None and not self.goto_enc(enc) and self.confirm("no glyph U+%04X - create it" % enc):
+                self.add_glyph(enc)
+        elif k == ord("a"):
+            enc = parse_char(self.prompt("new glyph (char, 0x41, U+0041, decimal)") or "")
+            if enc is not None:
+                self.add_glyph(enc)
+        elif k == ord("D"):
+            if self.g is not None and self.confirm("delete glyph U+%04X" % self.g.enc):
+                self.delete_glyph()
+        elif k == ord("y") and self.g is not None:
+            self.clip = set(self.g.pixels)
+            self.msg = "glyph copied"
+        elif k == ord("P"):
+            if self.clip is None:
+                self.msg = "nothing copied"
+            elif self.g is not None:
+                self.apply_pixels(self.clip)
+        elif k in (ord("+"), ord("=")) and self.g is not None:
+            self.push()
+            self.g.dwx += 1
+            self.g.swidth = None
+        elif k in (ord("-"), ord("_")) and self.g is not None:
+            self.push()
+            self.g.dwx = max(0, self.g.dwx - 1)
+            self.g.swidth = None
+        elif k == ord("u"):
+            self.do_undo()
+        elif k == ord("U"):
+            self.do_redo()
+        elif k == ord("s"):
+            self.save(self.path)
+        elif k == ord("S"):
+            p = self.prompt("save as", self.path)
+            if p:
+                self.save(p)
+        elif k == ord("t"):
+            v = self.prompt("preview text", self.preview)
+            if v is not None:
+                self.preview = v
+        elif k == ord("e") and self.g is not None:
+            p = self.prompt("export PBM to", "glyph_U%04X.pbm" % self.g.enc)
+            if p:
+                try:
+                    with open(p, "w") as fh:
+                        fh.write(to_pbm(self.font, self.g))
+                    self.msg = "wrote %s" % p
+                except OSError as e:
+                    self.msg = "export failed: %s" % e
+        elif k == ord("I") and self.g is not None:
+            p = self.prompt("import PBM from")
+            if p:
+                try:
+                    with open(p) as fh:
+                        w, h, bits = from_pbm(fh.read())
+                    x0, y0, cw, ch = self.font.canvas()
+                    px = {(x0 + col, y0 + ch - 1 - r) for r in range(min(h, ch)) for col in range(min(w, cw)) if bits[r * w + col] == "1"}
+                    self.apply_pixels(px)
+                    self.msg = "imported %dx%d%s" % (w, h, " (cropped to the canvas)" if w > cw or h > ch else "")
+                except (OSError, ValueError, IndexError) as e:
+                    self.msg = "import failed: %s" % e
+        elif k == ord("?"):
+            self.scr.erase()
+            for r, line in enumerate(HELP.split("\n")):
+                self.put(r, 1, line)
+            self.scr.refresh()
+            self.scr.getch()
+        self.clamp()
+        return False
+
+
+def edit(path):
+    if os.path.exists(path):
+        font = load(path)
+    else:
+        try:
+            size = input("new font %s - glyph size WxH [8x16]: " % path).strip() or "8x16"
+            w, h = (int(v) for v in size.lower().split("x"))
+            if w < 1 or h < 1:
+                raise ValueError
+        except (ValueError, EOFError):
+            print("bdfeditor: the size must look like 8x16", file=sys.stderr)
+            return 2
+        font = new_font(w, h)
+        font.path = path
+    try:
+        import curses
+        import locale
+        locale.setlocale(locale.LC_ALL, "")
+    except ImportError:
+        print("bdfeditor: python's curses module is missing (Windows: pip install windows-curses). "
+              "Meanwhile `bdfeditor info|show|text` work without it.", file=sys.stderr)
+        return 1
+    ed = Editor(font, path)
+    curses.wrapper(ed.run)
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        with open(__file__, encoding="utf-8") as fh:
+            for ln in fh.read().split("\n")[2:]:
+                if ln.startswith("# </manwriter>"):
+                    break
+                print(ln[2:] if ln.startswith("# ") else ln[1:])
+        return 0
+    cmd = argv[1]
+    try:
+        if cmd == "info" and len(argv) == 3:
+            cmd_info(argv[2])
+        elif cmd == "show" and len(argv) == 4:
+            return cmd_show(argv[2], argv[3])
+        elif cmd == "text" and len(argv) == 4:
+            cmd_text(argv[2], argv[3])
+        elif len(argv) == 2:
+            return edit(argv[1])
+        else:
+            print("usage: bdfeditor FILE.bdf | info FILE | show FILE CHAR | text FILE TEXT", file=sys.stderr)
+            return 2
+    except OSError as e:
+        print("bdfeditor: %s" % e, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

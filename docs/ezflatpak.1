@@ -1,0 +1,147 @@
+.TH EZFLATPAK 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+ezflatpak \- terminal manager for Flatpak apps and their permissions, in
+.SH SYNOPSIS
+.B ezflatpak apps
+.br
+.B ezflatpak perms APP
+.br
+.B ezflatpak global
+.br
+.B ezflatpak audit [--plain]
+.br
+.B ezflatpak who KEY [--plain]
+.br
+.B ezflatpak allow|deny|default APP KEY...
+.br
+.B ezflatpak show APP [modified]
+.br
+.B ezflatpak export [FILE] | import FILE
+.br
+.B ezflatpak ENTER
+.br
+.B ezflatpak CTRL-G
+.br
+.B ezflatpak CTRL-X
+.br
+.B ezflatpak CTRL-U
+.br
+.B ezflatpak CTRL-N
+.br
+.B ezflatpak CTRL-Z
+.br
+.B ezflatpak ALT-Z
+.br
+.B ezflatpak ALT-M
+.br
+.B ezflatpak ALT-G
+.br
+.B ezflatpak ALT-A
+.br
+.B ezflatpak ALT-T
+.br
+.B ezflatpak ALT-P
+.br
+.B ezflatpak ALT-B
+.SH DESCRIPTION
+.B ezflatpak
+.nf
+one tool, built on lib/lazytui.sh. It wraps the real flatpak, which it
+finds in PATH skipping itself.
+
+  ezflatpak [apps | perms APP | global | APP-ID]
+
+Apps (the default view) lists what is installed. Arrows or Tab move,
+space marks rows like nnn, / searches, and update / uninstall act on all
+marked rows. Enter opens the permissions of the current app. The first row,
+"All applications", is the global layer (like Flatseal): Enter opens the global
+overrides; Uninstall / Update / Run do nothing useful on it.
+
+Permissions is Flatseal in the terminal. Every permission the app really
+has is listed with its effective state, layered the way flatpak layers
+them: the app's manifest, then your global overrides, then your overrides
+for that app:
+
+  on   allowed        off   denied
+  *    set by an override of this app      g   set by a global override
+
+Rows cover sockets, devices, shares, features, filesystems, persistent
+dirs, environment variables and the D-Bus names, plus the usual
+suspects the app doesn't mention. Broad ones that are on show in red.
+Space marks rows; Enter toggles every marked row (or the current one).
+Allow, deny and "default" (drop your override) all work on the layer you
+are in, so denying something globally and re-allowing it for one app both
+work - the two things Flatseal's users asked for most.
+
+Global is the same list for the "all applications" layer, i.e. plain
+`flatpak override --user`. Everything is a per-user override, exactly
+what Flatseal writes, and no manifest is ever touched.
+
+Beyond what Flatseal does:
+  Portals    notifications, background, microphone, speakers, camera and location are rows too
+             (the xdg-desktop-portal permission store); they can be set any time, not only once the
+             portal has stored something for the app.
+  Audit      ALT-A: every app with a risk score (whole filesystem, session/system bus, all devices,
+             sandbox escape via org.freedesktop.Flatpak, ...), riskiest first. CTRL-W: which apps have
+             a given permission. Also `ezflatpak audit --plain` and `ezflatpak who KEY --plain`.
+  Try once   ALT-T: run the app with the marked rows flipped, without saving anything.
+  Bulk       ALT-P (apps list): allow / deny / drop one permission for all marked apps.
+  Version    permissions the installed flatpak is too old to know are not listed.
+  Scripts    allow / deny / default / show / export / import work without any UI.
+
+The lists refresh by themselves every REFRESH_MS milliseconds (top of
+the script, or FLATPAK_REFRESH; 0 turns it off).
+
+            ~/.local/state/flatpak-tui/backups
+.fi
+.SH OPTIONS
+.TP
+.B apps
+installed apps (default)
+.TP
+.B perms APP
+permissions of an app (APP-ID alone works too)
+.TP
+.B global
+permissions of all apps at once
+.TP
+.B ENTER
+apps: open permissions, permissions: toggle marked rows
+.TP
+.B CTRL-G
+allow the marked rows
+.TP
+.B CTRL-X
+deny the marked rows
+.TP
+.B CTRL-U
+drop your override of the marked rows
+.TP
+.B CTRL-N
+add a permission that isn't listed
+.TP
+.B CTRL-Z
+reset every override of this layer (asks first)
+.TP
+.B ALT-Z
+undo the last change to this layer; up to 20 versions are kept in
+.TP
+.B ALT-M
+show only what is overridden
+.TP
+.B ALT-G
+switch to the global layer
+.TP
+.B ALT-A
+audit: risk score of every app; CTRL-W there: who has a permission
+.TP
+.B ALT-T
+run the app once with the marked rows flipped (not saved)
+.TP
+.B ALT-P
+apps: change one permission for all marked apps
+.TP
+.B ALT-B
+back to the app list
+.SH SEE ALSO
+TODO: related tools here.

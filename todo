@@ -1,0 +1,52 @@
+#!/bin/sh
+# <manwriter>
+# real, minimal todo capture - real todo.txt convention (one task per
+# line, priority + real creation date), not a custom format.
+# `todolist` (same directory) is the matching viewer.
+#
+# usage: todo "task description"     add a task
+#        todo done N                  mark task N (as numbered by
+#                                      todolist) done - moved to
+#                                      done.txt, not deleted
+# </manwriter>
+
+#todo ls add done tui 
+#example 
+#tags priorities
+#todo add new "description"
+
+
+todo_dir="${XDG_DATA_HOME:-$HOME/.local/share}/todo"
+mkdir -p "$todo_dir"
+todo_file="$todo_dir/todo.txt"
+done_file="$todo_dir/done.txt"
+touch "$todo_file" "$done_file"
+
+if [ "$1" = "done" ] && [ -n "$2" ]; then
+	line="$(sed -n "${2}p" "$todo_file")"
+	if [ -z "$line" ]; then
+		echo "no task #$2"
+		exit 1
+	fi
+	echo "x $(date +%Y-%m-%d) $line" >> "$done_file"
+	sed -i "${2}d" "$todo_file"
+	echo "done: $line"
+elif [ -n "$1" ]; then
+	echo "(B) $(date +%Y-%m-%d) $*" >> "$todo_file"
+	echo "added"
+else
+	echo 'usage: todo "task description"  |  todo done N'
+	exit 1
+fi
+
+
+
+
+
+
+
+
+
+
+
+

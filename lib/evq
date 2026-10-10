@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# <manwriter>
+# evq - a tiny file-backed event queue for shell scripts.
+#
+# Named queues live as one file per event under
+# ${XDG_RUNTIME_DIR:-/tmp}/evq-$UID/NAME/ (default queue: "default").
+# Push writes atomically (tmp + rename); pop claims the oldest event with
+# an atomic rename, so any number of producers and consumers can share a
+# queue without locks and no event is delivered twice. Events are FIFO
+# by nanosecond timestamp. An event is one line of text
+# or, with stdin, whatever stdin holds.
+#
+# @flag push [-q NAME] [EVENT...]:append EVENT (or stdin) to the queue
+# @flag pop [-q NAME] [-w [SECS]]:print and remove the oldest event; -w blocks until one arrives (or SECS pass, exit 1)
+# @flag peek [-q NAME]:print the oldest event without removing it
+# @flag list [-q NAME]:print all pending events, oldest first
+# @flag count [-q NAME]:print the number of pending events
+# @flag listen [-q NAME] CMD...:run CMD with each event as its last argument, forever
+# @flag clear [-q NAME]:drop every pending event
+# </manwriter>
+set -euo pipefail
+
+root="${XDG_RUNTIME_DIR:-/tmp}/evq-$UID"
+q=default
+
+usage() {
+    echo "usage: evq push|pop|peek|list|count|listen|clear [-q NAME] [...]" >&2
+    exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+cmd="$1"; shift
+if [[ ${1:-} == -q ]]; then
+    [[ $# -ge 2 && $2 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "evq: bad queue name" >&2; exit 2; }
+    q="$2"; shift 2
+fi
+dir="$root/$q"
+mkdir -p -m 700 "$root" "$dir"
+
+oldest() {
+    local f
+    for f in "$dir"/*.ev; do
+        [[ -e $f ]] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+pop_one() {
+    local f c
+    while f="$(oldest)"; do
+        c="$f.claim.$$"
+        if mv -n -- "$f" "$c" 2>/dev/null && [[ ! -e $f ]]; then
+            cat -- "$c"; rm -f -- "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+case "$cmd" in
+push)
+    if [[ $# -gt 0 ]]; then body="$*"; else body="$(cat)"; fi
+    name="$(date +%s%N)-$$-$RANDOM"
+    tmp="$dir/.tmp.$name"
+    printf '%s\n' "$body" >"$tmp"
+    mv -- "$tmp" "$dir/$name.ev"
+    ;;
+pop)
+    wait=0; secs=""
+    if [[ ${1:-} == -w ]]; then
+        wait=1; shift
+        [[ ${1:-} =~ ^[0-9]+$ ]] && { secs="$1"; shift; }
+    fi
+    end=$(( $(date +%s) + ${secs:-0} ))
+    while ! pop_one; do
+        [[ $wait -eq 1 ]] || exit 1
+        [[ -n $secs && $(date +%s) -ge $end ]] && exit 1
+        sleep 0.2
+    done
+    ;;
+peek)
+    f="$(oldest)" || exit 1
+    cat -- "$f"
+    ;;
+list)
+    for f in "$dir"/*.ev; do [[ -e $f ]] && cat -- "$f"; done
+    exit 0
+    ;;
+count)
+    n=0
+    for f in "$dir"/*.ev; do [[ -e $f ]] && n=$((n+1)); done
+    echo "$n"
+    ;;
+listen)
+    [[ $# -ge 1 ]] || usage
+    while :; do
+        ev="$(pop_one)" || { sleep 0.2; continue; }
+        "$@" "$ev" || echo "evq: handler failed ($?) for: $ev" >&2
+    done
+    ;;
+clear)
+    rm -f -- "$dir"/*.ev "$dir"/*.claim.* 2>/dev/null || true
+    ;;
+*)
+    usage
+    ;;
+esac

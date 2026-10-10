@@ -1,0 +1,835 @@
+#!/bin/sh
+# <manwriter>
+# ezcon - terminal manager for containers, images, volumes and
+# networks, built on lib/lazytui.sh. One tool for both Docker and Podman
+# (pods too); it wraps the real binary, found in PATH skipping this script,
+# so it never calls itself.
+#
+#   ezcon [-e docker|podman|both|qemu] [containers|images|volumes|networks|pods|vms]
+#
+# Docker and Podman show up TOGETHER when both are installed: one list,
+# each row tagged with its engine, and every action goes to the row's own
+# engine (marked rows may even mix both). Tab cycles both -> docker ->
+# podman. -e (or EZCON_ENGINES) sets where it starts, e.g. `ezcon -e podman`.
+# Creating something (run, pull, create) asks which engine when both are in
+# use; prune and system prune run on every engine in use. Arrows or Tab move, space marks rows like nnn, / searches,
+# and every action runs on all marked rows (or the current one). The list
+# refreshes by itself every REFRESH_MS milliseconds (top of the script, or
+# LAZYCTL_REFRESH; 0 turns it off). Alt-1..5 switch views. The key bar
+# shows every key of the current view.
+#
+# Containers: logs (Enter), follow logs, shell, start, stop, restart,
+#   kill, pause, unpause, remove, inspect, stats, run a new one, prune.
+# Images: run, pull again (update), remove, history, inspect, search the
+#   registry and pull, prune dangling.
+# Volumes and networks: create, remove, inspect, prune.
+# Pods (podman): start, stop, restart, remove, create, inspect.
+# VMs (qemu, Alt-6 or `ezcon -e qemu`): every disk image in VM_IMAGES is a
+#   VM, with a NAME.conf in VM_CONF for its settings (RAM, CPUs, ISO, UEFI,
+#   display, ssh port, ...) - existing images work with the defaults. Start
+#   (headless or a window), ACPI shutdown, kill, reset, pause, ssh into the
+#   guest through a forwarded port, serial console, new VM wizard, attach an
+#   installer ISO, edit the config, disk snapshots (create, revert, drop),
+#   delete. Needs qemu and qemu-img; socat for shutdown, reset, pause and
+#   the serial console.
+#
+# Destructive actions (kill, remove, prune) ask first. When an action
+# fails its output is kept on screen until you press Enter.
+#
+# @flag -e ENGINE:docker or podman (default: docker if installed, else podman)
+# @flag VIEW:start in this view (default containers)
+# @flag ENTER:container logs / image run / inspect
+# @flag ALT-1..5:switch view
+# </manwriter>
+
+# ---- edit me ---------------------------------------------------------
+REFRESH_MS="${LAZYCTL_REFRESH:-2000}"     # auto-refresh, milliseconds, 0 = off
+LOG_TAIL="${LAZYCTL_LOG_TAIL:-500}"       # log lines loaded before following
+SHELL_CMD='command -v bash >/dev/null && exec bash || exec sh'   # for "shell"
+# ----------------------------------------------------------------------
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SELF=$HERE/$(basename -- "$0")
+# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
+# (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
+# (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
+_lt_hint() {
+	_lt_h=$1
+	while :; do
+		case $_lt_h in
+			ctrl-?*)  printf '\033[30;44m Ctrl \033[0m'; _lt_h=${_lt_h#ctrl-} ;;
+			alt-?*)   printf '\033[30;43m Alt \033[0m'; _lt_h=${_lt_h#alt-} ;;
+			shift-?*) printf '\033[30;42m Shift \033[0m'; _lt_h=${_lt_h#shift-} ;;
+			*) break ;;
+		esac
+	done
+	case $_lt_h in
+		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
+		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
+		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
+	esac
+	printf '\033[7m %s \033[0m %s   ' "$_lt_h" "$2"
+}
+
+# _lt_trim STR -> STR without leading/trailing blanks
+_lt_trim() { printf %s "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# _lt_script FILE CMD -> FILE runs CMD "$@" (keeps quoting out of fzf binds)
+_lt_script() { printf '%s "$@"\n' "$2" >"$1"; }
+
+lt_confirm() {   # lt_confirm "question" -> 0 on y
+	printf '%s [y/N] ' "$1" >&2
+	read -r _lt_a || return 1
+	case $_lt_a in y | Y | yes | YES | t | T | tak) return 0 ;; *) return 1 ;; esac
+}
+
+lt_input() {   # lt_input "prompt" [default] -> stdout
+	printf '%s%s: ' "$1" "${2:+ [$2]}" >&2
+	read -r _lt_a || return 1
+	printf '%s\n' "${_lt_a:-${2:-}}"
+}
+
+lt_select() {
+	_lt_mode=raw _lt_refresh=${LT_REFRESH:-0} _lt_seed= _lt_more= _lt_reload= _lt_preview= _lt_keys= \
+	_lt_key=1 _lt_nth= _lt_header= _lt_prompt='> '
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--mode)    _lt_mode=$2;    shift 2 ;;
+			--seed)    _lt_seed=$2;    shift 2 ;;
+			--more)    _lt_more=$2;    shift 2 ;;
+			--refresh) _lt_refresh=$2; shift 2 ;;
+			--reload)  _lt_reload=$2;  shift 2 ;;
+			--preview) _lt_preview=$2; shift 2 ;;
+			--keys)    _lt_keys=$2;    shift 2 ;;
+			--key)     _lt_key=$2;     shift 2 ;;
+			--nth)     _lt_nth=$2;     shift 2 ;;
+			--header)  _lt_header=$2;  shift 2 ;;
+			--prompt)  _lt_prompt=$2;  shift 2 ;;
+			*) echo "lt_select: unknown arg $1" >&2; return 2 ;;
+		esac
+	done
+	case $_lt_refresh in '' | *[!0-9]*) echo "lt_select: --refresh wants milliseconds, got '$_lt_refresh'" >&2; return 2 ;; esac
+	case $_lt_mode in raw | select) ;; *) echo "lt_select: --mode must be raw or select" >&2; return 2 ;; esac
+
+	_lt_tmp=$(mktemp -d) || return 1
+	if [ -n "$_lt_seed" ]; then
+		_lt_script "$_lt_tmp/seed.sh" "$_lt_seed"
+	else
+		cat >"$_lt_tmp/list"
+		printf 'cat "%s/list"\n' "$_lt_tmp" >"$_lt_tmp/seed.sh"
+	fi
+
+	if ! command -v fzf >/dev/null 2>&1; then
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
+
+	TAB=$(printf '\t')
+	_lt_k="{+$_lt_key}"
+	set -- --delimiter="$TAB" --ansi --prompt="$_lt_prompt" --footer-border=none --layout=reverse-list
+	[ -n "$_lt_header" ] && set -- "$@" --header="$_lt_header"
+	[ -n "$_lt_nth" ] && set -- "$@" --with-nth="$_lt_nth"
+	if [ -n "$_lt_preview" ]; then
+		_lt_script "$_lt_tmp/preview.sh" "$_lt_preview"
+		set -- "$@" --preview="sh $_lt_tmp/preview.sh {$_lt_key}" \
+			--preview-window="${LT_PREVIEW_WINDOW:-down,60%,wrap}"
+	fi
+	_lt_start=
+	if [ -n "$_lt_more" ]; then
+		cat >"$_lt_tmp/more.sh" <<EOF
+out=\$(mktemp)
+$_lt_more > "\$out" 2>/dev/null || true
+if [ -s "\$out" ]; then
+	curl -s -XPOST "127.0.0.1:\$1" --data "reload(cat \$out; rm -f \$out)" >/dev/null 2>&1 || rm -f "\$out"
+else rm -f "\$out"; fi
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/more.sh \$FZF_PORT &"
+	fi
+	if [ "$_lt_refresh" -gt 0 ] && [ -z "$_lt_reload" ] && command -v curl >/dev/null 2>&1; then
+		# background loop: run the seed, post it to fzf only when it changed;
+		# it ends by itself once fzf's port stops answering
+		_lt_secs=$(awk -v ms="$_lt_refresh" 'BEGIN { if (ms < 50) ms = 50; printf "%.3f", ms / 1000 }')
+		cat >"$_lt_tmp/refresh.sh" <<EOF
+port=\$1; last=$_lt_tmp/last; new=$_lt_tmp/new
+sh $_lt_tmp/seed.sh >"\$last" 2>/dev/null
+while sleep $_lt_secs; do
+	[ -d $_lt_tmp ] || exit 0
+	sh $_lt_tmp/seed.sh >"\$new" 2>/dev/null || continue
+	cmp -s "\$last" "\$new" && continue
+	cp "\$new" "\$last"
+	curl -s -m 2 -XPOST "127.0.0.1:\$port" --data "reload-sync(cat $_lt_tmp/last)" >/dev/null 2>&1 || exit 0
+done
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
+		set -- "$@" --track --id-nth="$_lt_key"
+	fi
+	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
+	if [ -n "$_lt_reload" ]; then
+		printf '%s\n' "$_lt_reload" | sed 's/{q}/"$1"/g' >"$_lt_tmp/reload.sh"
+		set -- "$@" --bind="change:reload(sh $_lt_tmp/reload.sh {q})"
+	fi
+
+	# mode: select = no input line, space marks, / opens search
+	_lt_bar= _lt_ubar=
+	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
+	_lt_hints=
+	case $(fzf --version 2>/dev/null) in *-c\ *) _lt_hints=1 ;; esac
+	if [ "$_lt_mode" = select ]; then
+		set -- "$@" --multi --no-input \
+			--bind='space:toggle+down # mark,tab:down,btab:up,/:show-input # search' \
+			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	else
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint type filter)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	fi
+
+	# yaml key map -> binds + key bar
+	_lt_n=0
+	if [ -n "$_lt_keys" ]; then
+		[ "$_lt_keys" = - ] && printf '%s\n' "${LT_KEYS:-}" >"$_lt_tmp/keys" || cat "$_lt_keys" >"$_lt_tmp/keys"
+		while IFS= read -r _lt_line || [ -n "$_lt_line" ]; do
+			_lt_line=$(_lt_trim "$_lt_line")
+			case $_lt_line in '' | '#'*) continue ;; esac
+			# a line of just --- starts a new line in the key bar
+			[ "$_lt_line" = --- ] && { _lt_ubar="$_lt_ubar
+"; _lt_fresh=1; continue; }
+			_lt_kn=$(_lt_trim "${_lt_line%%:*}")
+			_lt_rest=${_lt_line#*:}
+			case $_lt_rest in
+				*' # '*) _lt_label=$(_lt_trim "${_lt_rest##* # }"); _lt_act=$(_lt_trim "${_lt_rest% # *}") ;;
+				*)       _lt_label=; _lt_act=$(_lt_trim "$_lt_rest") ;;
+			esac
+			_lt_n=$((_lt_n + 1))
+			_lt_reloadact="+reload(sh $_lt_tmp/seed.sh)"
+			case $_lt_act in
+				refresh)  _lt_bind="reload(sh $_lt_tmp/seed.sh)" ;;
+				quit)     _lt_bind=abort ;;
+				'!'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#!}"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)$_lt_reloadact" ;;
+				'>'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#>}"
+				          _lt_bind="become(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+				accept | select-all | deselect-all | toggle | toggle-all | first | last | up | down | page-up | page-down | abort | clear-query | show-input | hide-input)
+				          _lt_bind=$_lt_act ;;
+				*)        _lt_script "$_lt_tmp/a$_lt_n.sh" "$_lt_act"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+			esac
+			if [ -n "$_lt_hints" ] && [ -n "$_lt_label" ]; then set -- "$@" --bind="$_lt_kn:$_lt_bind # $_lt_label"
+			else set -- "$@" --bind="$_lt_kn:$_lt_bind"; fi
+			if [ -n "$_lt_label" ]; then
+				_lt_ubar="$_lt_ubar$(_lt_hint "$_lt_kn" "$_lt_label")"
+				_lt_fresh=
+			fi
+		done <"$_lt_tmp/keys"
+	fi
+	# defaults on line one, the key map's labels on line two
+	if [ -n "$_lt_hints" ]; then set -- "$@" --hints
+	else set -- "$@" --footer="$_lt_bar${_lt_ubar:+
+$_lt_ubar}"; fi
+
+	_lt_sel=$(sh "$_lt_tmp/seed.sh" | fzf "$@"); _lt_rc=$?
+	rm -rf "$_lt_tmp"
+	[ $_lt_rc -eq 0 ] || return 1
+	[ -n "$_lt_sel" ] && printf '%s\n' "$_lt_sel" | cut -f"$_lt_key"
+	return 0
+}
+
+# numbered prompt when fzf is missing
+_lt_fallback() {
+	sh "$_lt_tmp/seed.sh" >"$_lt_tmp/fb"
+	[ -s "$_lt_tmp/fb" ] || return 1
+	awk -F'\t' '{ printf "%3d) %s\n", NR, ($1 == "" ? $0 : $0) }' "$_lt_tmp/fb" | tr '\t' ' ' >&2
+	printf 'pick number%s, q to cancel: ' "$([ "$_lt_mode" = select ] && echo 's (space separated)')" >&2
+	read -r _lt_ans || return 1
+	case $_lt_ans in '' | q) return 1 ;; esac
+	for _lt_i in $_lt_ans; do sed -n "${_lt_i}p" "$_lt_tmp/fb"; done | cut -f"$_lt_key"
+}
+
+# lt_wizard: steps on stdin, one per line:
+#   var|prompt              free text
+#   var|prompt|a,b,c        pick one (fzf)
+#   var|prompt|a,b,c|def    same, with default
+# prints eval-able VAR='value' lines; Esc goes back a step, Esc on the
+# first step cancels (return 1). Usage: eval "$(lt_wizard <<EOF ... EOF)"
+lt_wizard() {
+	_lt_wd=$(mktemp -d) || return 1
+	cat >"$_lt_wd/steps"
+	_lt_total=$(wc -l <"$_lt_wd/steps")
+	_lt_i=1
+	while [ "$_lt_i" -le "$_lt_total" ]; do
+		IFS='|' read -r _lt_var _lt_q _lt_ch _lt_def <<EOF
+$(sed -n "${_lt_i}p" "$_lt_wd/steps")
+EOF
+		_lt_prev=
+		[ -f "$_lt_wd/v.$_lt_i" ] && _lt_prev=$(cat "$_lt_wd/v.$_lt_i")
+		_lt_hdr="[$_lt_i/$_lt_total] $_lt_q"
+		if [ -n "$_lt_ch" ]; then
+			_lt_pick=${_lt_prev:-$_lt_def}
+			_lt_ans=$( { [ -n "$_lt_pick" ] && printf '%s\n' "$_lt_pick"; printf '%s\n' "$_lt_ch" | tr ',' '\n' | grep -vxF -- "$_lt_pick"; } | fzf --layout=reverse-list --header="$_lt_hdr" --footer='↑↓ move · enter accept · esc back' --no-multi) || _lt_ans=__back__
+		else
+			_lt_ans=$(printf '' | fzf --print-query --no-info --bind=enter:accept-or-print-query --header="$_lt_hdr" --footer='type · enter accept · esc back' --query="${_lt_prev:-$_lt_def}" | head -1) || _lt_ans=__back__
+		fi
+		if [ "$_lt_ans" = __back__ ]; then
+			[ "$_lt_i" -eq 1 ] && { rm -rf "$_lt_wd"; return 1; }
+			_lt_i=$((_lt_i - 1)); continue
+		fi
+		printf '%s' "$_lt_ans" >"$_lt_wd/v.$_lt_i"
+		_lt_i=$((_lt_i + 1))
+	done
+	_lt_i=1
+	while [ "$_lt_i" -le "$_lt_total" ]; do
+		_lt_var=$(sed -n "${_lt_i}p" "$_lt_wd/steps" | cut -d'|' -f1)
+		printf "%s='%s'\n" "$_lt_var" "$(sed "s/'/'\\\\''/g" "$_lt_wd/v.$_lt_i")"
+		_lt_i=$((_lt_i + 1))
+	done
+	rm -rf "$_lt_wd"
+}
+
+# lt_realbin NAME -> path of the real NAME in PATH, skipping this script
+# itself. For tools that wrap a program of the same name (a script called
+# docker or flatpak) so they never call themselves.
+lt_realbin() {
+	_lt_old=$IFS; IFS=:
+	for _lt_d in $PATH; do
+		IFS=$_lt_old
+		_lt_c=$_lt_d/$1
+		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && ! [ "$_lt_c" -ef "$0" ]; then printf '%s\n' "$_lt_c"; return 0; fi
+		IFS=:
+	done
+	IFS=$_lt_old
+	return 1
+}
+
+# <<< lazytui <<<
+
+# ---- engines -----------------------------------------------------------
+# ENGINES is the list in use: docker, podman or both at once. Rows are keyed
+# ENGINE:ID so every action goes to the engine the row came from. Tab
+# cycles both -> docker -> podman; -e / EZCON_ENGINES set the start value.
+AVAIL=
+for _e in docker podman; do lt_realbin "$_e" >/dev/null 2>&1 && AVAIL="$AVAIL $_e"; done
+AVAIL=${AVAIL# }
+DEFAULT_VIEW=containers
+ENGINES=${EZCON_ENGINES:-${LAZYCTL_ENGINE:-}}
+if [ "${1:-}" = -e ]; then ENGINES=${2:?-e needs docker, podman, both or qemu}; shift 2; fi
+case $ENGINES in
+	qemu) ENGINES=; DEFAULT_VIEW=vms ;;
+	both | all | '') ENGINES=$AVAIL ;;
+esac
+for _e in $ENGINES; do
+	case $_e in docker | podman) ;; *) echo "ezcon: engine must be docker, podman, both or qemu" >&2; exit 2 ;; esac
+done
+export EZCON_ENGINES="$ENGINES"
+MULTI=0; case $ENGINES in *" "*) MULTI=1 ;; esac
+
+# ce ENGINE ARGS...: run the real engine binary (never this script)
+ce() { _ce=$1; shift; "$(lt_realbin "$_ce")" "$@"; }
+# key helpers: KEY is ENGINE:ID
+k_e() { printf '%s' "${1%%:*}"; }
+k_id() { printf '%s' "${1#*:}"; }
+
+pause() { printf '\npress Enter ' >&2; read -r _ </dev/tty; }
+pager() { ${PAGER:-less -R}; }
+pretty() { if command -v jq >/dev/null 2>&1; then jq -C . 2>/dev/null || cat; else cat; fi; }
+run() { "$@" || { echo "ezcon: '$*' failed" >&2; pause; return 1; }; }
+
+# ---- list rows: KEY<TAB>display --------------------------------------
+_rows() {
+	if [ "$1" = vms ]; then vm_rows; return; fi
+	for e in $ENGINES; do
+		tag=; if [ "$MULTI" = 1 ]; then case $e in docker) tag=$(printf '\033[34mdocker\033[0m ') ;; podman) tag=$(printf '\033[35mpodman\033[0m ') ;; esac; fi
+		case $1 in
+		containers)
+			ce "$e" ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}' 2>/dev/null | awk -F'|' -v e="$e" -v tag="$tag" '{
+				c = "\033[31m"
+				if ($4 ~ /^Up/) c = "\033[32m"
+				if ($4 ~ /Paused/) c = "\033[33m"
+				if ($4 ~ /^Created/ || $4 ~ /^Exited \(0\)/) c = "\033[90m"
+				printf "%s:%s\t%s%-24.24s %-32.32s %s%-26.26s\033[0m %s\n", e, $1, tag, $2, $3, c, $4, $5 }' ;;
+		images)
+			ce "$e" images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.Size}}|{{.CreatedSince}}' 2>/dev/null | awk -F'|' -v e="$e" -v tag="$tag" '{
+				key = ($2 == "<none>" || $3 == "<none>") ? $1 : $2 ":" $3
+				printf "%s:%s\t%s%-56.56s %-10s %s\n", e, key, tag, ($2 == "<none>" ? "<dangling> " $1 : $2 ":" $3), $4, $5 }' ;;
+		volumes)
+			ce "$e" volume ls --format '{{.Name}}|{{.Driver}}' 2>/dev/null | awk -F'|' -v e="$e" -v tag="$tag" '{ printf "%s:%s\t%s%-60.60s %s\n", e, $1, tag, $1, $2 }' ;;
+		networks)
+			ce "$e" network ls --format '{{.Name}}|{{.Driver}}|{{.ID}}' 2>/dev/null | awk -F'|' -v e="$e" -v tag="$tag" '{ printf "%s:%s\t%s%-30s %-10s %s\n", e, $1, tag, $1, $2, $3 }' ;;
+		pods)
+			[ "$e" = podman ] || continue
+			ce podman pod ps --format '{{.Name}}|{{.Status}}|{{.NumberOfContainers}}|{{.ID}}' 2>/dev/null | awk -F'|' -v e="$e" -v tag="$tag" '{
+				c = ($2 ~ /Running/) ? "\033[32m" : "\033[90m"
+				printf "%s:%s\t%s%-30s %s%-12s\033[0m %s containers\n", e, $1, tag, $1, c, $2, $3 }' ;;
+		esac
+	done
+}
+
+noun_of() {
+	case $1 in containers) echo container ;; images) echo image ;; volumes) echo volume ;; networks) echo network ;; pods) echo pod ;; vms) echo vm ;; esac
+}
+
+# ---- actions ---------------------------------------------------------
+# _do VERB NOUN KEY...   each key goes to its own engine
+_do() {
+	verb=$1 noun=$2; shift 2
+	[ $# -gt 0 ] || exit 0
+	case $verb in
+		rm | kill) lt_confirm "$verb $noun $*?" || exit 0 ;;
+	esac
+	for k in "$@"; do
+		e=$(k_e "$k"); id=$(k_id "$k")
+		case "$noun:$verb" in
+			container:rm | pod:rm) run ce "$e" "$noun" rm -f "$id" ;;
+			image:pull) case $id in *:*) run ce "$e" pull "$id" ;; *) echo "skipping $id (untagged)" >&2 ;; esac ;;
+			*) run ce "$e" "$noun" "$verb" "$id" ;;
+		esac
+	done
+	exit 0
+}
+
+_prune() {
+	noun=$1
+	lt_confirm "remove all unused ${noun}s ($ENGINES)?" || exit 0
+	for e in $ENGINES; do run ce "$e" "$noun" prune -f; done
+	exit 0
+}
+
+_sysprune() {
+	lt_confirm "system prune ($ENGINES): stopped containers, unused networks, dangling images" || exit 0
+	for e in $ENGINES; do run ce "$e" system prune -f; done
+	exit 0
+}
+
+_logs() {   # KEY [follow]
+	e=$(k_e "$1"); id=$(k_id "$1")
+	if [ "${2:-}" = follow ]; then ce "$e" logs -f --tail "$LOG_TAIL" "$id" 2>&1 | less -R +F
+	else ce "$e" logs --tail "$LOG_TAIL" "$id" 2>&1 | less -R +G; fi
+	exit 0
+}
+
+_exec() {
+	e=$(k_e "$1"); id=$(k_id "$1")
+	[ "$(ce "$e" inspect -f '{{.State.Running}}' "$id" 2>/dev/null)" = true ] || { echo "$id is not running (start it with ^U)" >&2; pause; exit 0; }
+	ce "$e" exec -it "$id" sh -c "$SHELL_CMD"
+	exit 0
+}
+
+_inspect() {   # NOUN KEY
+	ce "$(k_e "$2")" "$1" inspect "$(k_id "$2")" 2>&1 | pretty | pager
+	exit 0
+}
+
+_history() { ce "$(k_e "$1")" image history "$(k_id "$1")" 2>&1 | pager; exit 0; }
+_stats() { for k in "$@"; do ce "$(k_e "$k")" stats --no-stream "$(k_id "$k")" 2>&1; done | pager; exit 0; }
+_runimg() { ce "$(k_e "$1")" run -it --rm "$(k_id "$1")" sh -c "$SHELL_CMD"; exit 0; }
+
+# pick_engine -> the engine a new object is created on
+pick_engine() {
+	if [ "$MULTI" = 1 ]; then
+		printf '%s\n' $ENGINES | lt_select --header 'create on which engine?' --prompt 'engine> ' || return 1
+	else printf '%s\n' "$ENGINES"; fi
+}
+
+_new() {   # NOUN: create/run/pull, asking for what it needs
+	e=$(pick_engine) || exit 0
+	case $1 in
+		container)
+			img=$(lt_input "image to run (e.g. debian:12-slim)") || exit 0; [ -n "$img" ] || exit 0
+			args=$(lt_input "run options (e.g. --name web -p 8080:80 -v data:/data)") || exit 0
+			# shellcheck disable=SC2086
+			run ce "$e" run -d $args "$img" ;;
+		image)
+			term=$(lt_input "pull image, or search the registry for") || exit 0; [ -n "$term" ] || exit 0
+			case $term in
+				*/* | *:*) img=$term ;;
+				*) img=$(ce "$e" search --limit 30 --format '{{.Name}}|{{.Description}}' "$term" 2>/dev/null \
+					| awk -F'|' '{ printf "%s\t%-50.50s %.70s\n", $1, $1, $2 }' \
+					| lt_select --nth 2 --header "registry results for $term" --prompt 'pick> ') || exit 0 ;;
+			esac
+			[ -n "$img" ] && run ce "$e" pull "$img" ;;
+		volume|network|pod)
+			name=$(lt_input "new $1 name") || exit 0; [ -n "$name" ] || exit 0
+			if [ "$1" = pod ]; then run ce "$e" pod create --name "$name"; else run ce "$e" "$1" create "$name"; fi ;;
+	esac
+	exit 0
+}
+
+_preview() {   # NOUN KEY
+	case $1 in
+		vm)        _vmpreview "$2" ;;
+		container) ce "$(k_e "$2")" logs --tail 40 "$(k_id "$2")" 2>&1 ;;
+		image)     ce "$(k_e "$2")" image history "$(k_id "$2")" 2>&1 ;;
+		*)         ce "$(k_e "$2")" "$1" inspect "$(k_id "$2")" 2>&1 | pretty ;;
+	esac
+}
+
+# ---- virtual machines (qemu) ------------------------------------------
+# A VM is a disk image found in VM_IMAGES (name = file name without the
+# extension) and/or a NAME.conf in VM_CONF with the settings; a VM with no
+# config just uses the defaults, so existing images work at once.
+VM_IMAGES="${EZCON_IMAGES:-/data/vms $HOME/vms $HOME/.local/share/ezcon/vms}"   # where images live
+VM_CONF="${EZCON_VM_CONF:-$HOME/.config/ezcon/vms}"                            # NAME.conf per VM
+ISO_DIRS="${EZCON_ISOS:-$HOME/Downloads /data/isos /data/vms}"                 # searched for installers
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/ezcon-$(id -u)"                               # pid, monitor, serial sockets
+
+vm_names() {
+	{
+		for d in $VM_IMAGES; do
+			for f in "$d"/*.qcow2 "$d"/*.img "$d"/*.raw; do [ -f "$f" ] && basename -- "$f" | sed 's/\.[^.]*$//'; done
+		done
+		for f in "$VM_CONF"/*.conf; do [ -f "$f" ] && basename -- "$f" .conf; done
+	} | sort -u
+}
+
+# vm_load NAME: defaults, then NAME.conf, then a found image
+vm_load() {
+	RAM=4096 CPUS=4 DISK= ISO= SSH_PORT= SSH_USER=${USER:-root} DISPLAY_MODE= UEFI=0 DISK_IF=virtio NIC=virtio-net-pci EXTRA= ARCH=$(uname -m)
+	[ -f "$VM_CONF/$1.conf" ] && . "$VM_CONF/$1.conf"
+	if [ -z "$DISK" ]; then
+		for d in $VM_IMAGES; do for e in qcow2 img raw; do [ -f "$d/$1.$e" ] && { DISK=$d/$1.$e; break 2; }; done; done
+	fi
+	[ -n "$SSH_PORT" ] || SSH_PORT=$((2200 + $(printf %s "$1" | cksum | cut -d' ' -f1) % 800))
+	if [ -z "$DISPLAY_MODE" ]; then if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then DISPLAY_MODE=gtk; else DISPLAY_MODE=none; fi; fi
+}
+
+vm_pid() {   # NAME (after vm_load): pid of the running qemu, or nothing
+	f=$RUN_DIR/$1.pid
+	if [ -f "$f" ] && [ -d "/proc/$(cat "$f" 2>/dev/null)" ]; then cat "$f"; return 0; fi
+	[ -n "$DISK" ] && pgrep -f "qemu-system.*[=,]$DISK" | head -1
+}
+
+VMERR=0
+vm_err() { echo "ezcon: $*" >&2; VMERR=1; }
+
+vm_qmp() {   # NAME COMMAND -> send one QMP command (needs a VM started by ezcon)
+	sock=$RUN_DIR/$1.qmp
+	[ -S "$sock" ] && command -v socat >/dev/null 2>&1 || return 1
+	{ printf '{"execute":"qmp_capabilities"}\n{"execute":"%s"}\n' "$2"; sleep 0.3; } | socat - "UNIX-CONNECT:$sock" >/dev/null 2>&1
+}
+
+vm_rows() {
+	for n in $(vm_names); do
+		vm_load "$n"
+		if [ -z "$DISK" ] || [ ! -e "$DISK" ]; then
+			printf '%s\t\033[31m! no disk\033[0m %-22.22s\n' "$n" "$n"; continue
+		fi
+		if [ -n "$(vm_pid "$n")" ]; then st=$(printf '\033[32m● running\033[0m'); else st=$(printf '\033[90m○ stopped\033[0m'); fi
+		info=$(qemu-img info -U "$DISK" 2>/dev/null)
+		virt=$(printf '%s\n' "$info" | sed -n 's/^virtual size: \([^(]*\).*/\1/p' | tr -d ' ')
+		snaps=$(printf '%s\n' "$info" | grep -c '^[0-9][0-9]* ')
+		iso=; [ -n "$ISO" ] && iso=" iso"
+		printf '%s\t%s %-22.22s %5sM %2s cpu %8s  ssh:%s%s%s\n' "$n" "$st" "$n" "$RAM" "$CPUS" "$virt" "$SSH_PORT" "$iso" "$([ "$snaps" -gt 0 ] && echo " snaps:$snaps")"
+	done
+}
+
+vm_start() {
+	n=$1; vm_load "$n"
+	[ -n "$DISK" ] && [ -e "$DISK" ] || { vm_err "$n: no disk image"; return; }
+	[ -n "$(vm_pid "$n")" ] && { echo "$n is already running"; return; }
+	bin=qemu-system-$ARCH
+	command -v "$bin" >/dev/null 2>&1 || { vm_err "$bin not found"; return; }
+	mkdir -p "$RUN_DIR"; rm -f "$RUN_DIR/$n.qmp" "$RUN_DIR/$n.serial"
+	fmt=$(qemu-img info -U "$DISK" 2>/dev/null | sed -n 's/^file format: //p')
+	set -- -name "$n" -m "$RAM" -smp "$CPUS" -pidfile "$RUN_DIR/$n.pid" \
+		-qmp "unix:$RUN_DIR/$n.qmp,server,nowait" -serial "unix:$RUN_DIR/$n.serial,server,nowait" \
+		-drive "file=$DISK,format=${fmt:-raw},if=$DISK_IF,discard=unmap"
+	case $ARCH in x86_64 | i386) set -- "$@" -machine q35 ;; esac
+	if [ -w /dev/kvm ]; then set -- "$@" -enable-kvm -cpu host; else set -- "$@" -cpu max; fi
+	[ -n "$ISO" ] && set -- "$@" -drive "file=$ISO,media=cdrom,readonly=on" -boot order=dc
+	set -- "$@" -nic "user,model=$NIC,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22"
+	case $DISPLAY_MODE in
+		none) set -- "$@" -display none ;;
+		vnc)  set -- "$@" -display none -vnc "127.0.0.1:$((SSH_PORT - 2200))" -vga std ;;
+		*)    set -- "$@" -display "$DISPLAY_MODE" -vga std -device qemu-xhci -device usb-tablet ;;
+	esac
+	if [ "$UEFI" = 1 ]; then
+		code= tmpl=
+		for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2-ovmf/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/qemu/OVMF_CODE.fd; do [ -f "$c" ] && { code=$c; break; }; done
+		for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2-ovmf/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/qemu/OVMF_VARS.fd; do [ -f "$c" ] && { tmpl=$c; break; }; done
+		[ -n "$code" ] && [ -n "$tmpl" ] || { vm_err "$n: UEFI firmware (OVMF) not found"; return; }
+		mkdir -p "$VM_CONF"; [ -f "$VM_CONF/$n.vars.fd" ] || cp "$tmpl" "$VM_CONF/$n.vars.fd"
+		set -- "$@" -drive "if=pflash,format=raw,readonly=on,file=$code" -drive "if=pflash,format=raw,file=$VM_CONF/$n.vars.fd"
+	fi
+	# shellcheck disable=SC2086
+	"$bin" "$@" $EXTRA -daemonize 2>&1 | head -5
+	sleep 0.3
+	[ -n "$(vm_pid "$n")" ] && echo "$n started (ssh port $SSH_PORT, display $DISPLAY_MODE)" || vm_err "$n failed to start"
+}
+
+vm_stop() {
+	n=$1; vm_load "$n"; pid=$(vm_pid "$n")
+	[ -n "$pid" ] || { echo "$n is not running"; return; }
+	if vm_qmp "$n" system_powerdown; then echo "$n: shutdown requested (ACPI); use kill if the guest ignores it"
+	else kill -TERM "$pid" && echo "$n: sent SIGTERM"; fi
+}
+vm_kill() {
+	n=$1; vm_load "$n"; pid=$(vm_pid "$n")
+	[ -n "$pid" ] || { echo "$n is not running"; return; }
+	lt_confirm "kill $n hard (like pulling the plug)?" && kill -KILL "$pid" && echo "$n killed"
+}
+vm_reset()  { vm_load "$1"; vm_qmp "$1" system_reset && echo "$1 reset" || vm_err "$1: not started by ezcon (no monitor socket)"; }
+vm_pause()  { vm_load "$1"; vm_qmp "$1" stop && echo "$1 paused" || vm_err "$1: not started by ezcon (no monitor socket)"; }
+vm_resume() { vm_load "$1"; vm_qmp "$1" cont && echo "$1 resumed" || vm_err "$1: not started by ezcon (no monitor socket)"; }
+
+vm_ssh() {
+	vm_load "$1"; [ -n "$(vm_pid "$1")" ] || { vm_err "$1 is not running"; return; }
+	mkdir -p "$VM_CONF"
+	ssh -p "$SSH_PORT" -o UserKnownHostsFile="$VM_CONF/known_hosts" -o StrictHostKeyChecking=accept-new "$SSH_USER@127.0.0.1"
+}
+vm_console() {
+	vm_load "$1"; sock=$RUN_DIR/$1.serial
+	[ -S "$sock" ] || { vm_err "$1: no serial socket (start it from ezcon)"; return; }
+	command -v socat >/dev/null 2>&1 || { vm_err "socat not found"; return; }
+	echo "serial console of $1 - Ctrl-] to leave" >&2
+	socat -,raw,echo=0,escape=0x1d "UNIX-CONNECT:$sock"
+}
+
+vm_snapshots() { qemu-img snapshot -l "$DISK" 2>/dev/null | awk 'NR > 2 { print $2 "\t" $0 }'; }
+vm_snap() {
+	vm_load "$1"; [ -n "$(vm_pid "$1")" ] && { vm_err "stop $1 first (offline snapshots)"; return; }
+	printf 'snapshot name (empty = timestamp): ' >&2; read -r tag </dev/tty
+	[ -n "$tag" ] || tag=$(date +%Y%m%d_%H%M%S)
+	qemu-img snapshot -c "$tag" "$DISK" && echo "snapshot '$tag' created" || vm_err "snapshot failed"
+}
+vm_snaprestore() {
+	vm_load "$1"; [ -n "$(vm_pid "$1")" ] && { vm_err "stop $1 first"; return; }
+	tag=$(vm_snapshots | lt_select --nth 2 --header "restore which snapshot of $1?" --prompt 'snapshot> ') || return
+	lt_confirm "revert $1 to '$tag' (later changes are lost)?" && qemu-img snapshot -a "$tag" "$DISK" && echo "reverted to '$tag'" || vm_err "revert failed or cancelled"
+}
+vm_snapdel() {
+	vm_load "$1"; [ -n "$(vm_pid "$1")" ] && { vm_err "stop $1 first"; return; }
+	tag=$(vm_snapshots | lt_select --nth 2 --header "delete which snapshot of $1?" --prompt 'snapshot> ') || return
+	lt_confirm "delete snapshot '$tag'?" && qemu-img snapshot -d "$tag" "$DISK" && echo "deleted '$tag'"
+}
+
+vm_conf_set() {   # NAME VAR VALUE: set or add VAR="VALUE" in NAME.conf
+	mkdir -p "$VM_CONF"; f=$VM_CONF/$1.conf; [ -f "$f" ] || : >"$f"
+	awk -v k="$2" -v v="$3" '$0 ~ "^" k "=" { print k "=\"" v "\""; d = 1; next } { print } END { if (!d) print k "=\"" v "\"" }' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+}
+vm_iso() {
+	iso=$( { printf 'none\t(eject: boot from the disk)\n'
+		for d in $ISO_DIRS; do [ -d "$d" ] && find "$d" -maxdepth 2 -iname '*.iso' -type f 2>/dev/null; done | sort -u | while read -r f; do printf '%s\t%s\n' "$f" "$f"; done; } \
+		| lt_select --nth 2 --header "installer ISO for $1" --prompt 'iso> ') || return
+	[ "$iso" = none ] && iso=
+	vm_conf_set "$1" ISO "$iso" && echo "ISO for $1: ${iso:-none}"
+}
+vm_edit() {
+	f=$VM_CONF/$1.conf; mkdir -p "$VM_CONF"
+	[ -f "$f" ] || cat >"$f" <<EOF
+# settings for $1 - uncomment to change, then start the VM again
+#RAM=4096
+#CPUS=4
+#ISO=
+#SSH_PORT=
+#SSH_USER=
+#DISPLAY_MODE=gtk     # gtk, sdl, vnc or none
+#UEFI=0               # 1 = boot with OVMF
+#DISK_IF=virtio       # virtio, sata or ide (some systems have no virtio driver)
+#NIC=virtio-net-pci   # e1000 or rtl8139 for old systems
+#EXTRA=""             # more qemu arguments
+EOF
+	${EDITOR:-${VISUAL:-vi}} "$f"
+}
+vm_new() {
+	eval "$(lt_wizard <<'X'
+name|VM name
+size|Disk size|10G,20G,40G,80G,160G|40G
+ram|Memory in MB|1024,2048,4096,8192,16384|4096
+cpus|CPUs|1,2,4,8|4
+iso|Installer ISO path (empty = none)
+fw|Firmware|bios,uefi|bios
+X
+)" || return
+	[ -n "${name:-}" ] || return
+	case $name in */* | .* ) vm_err "bad name"; return ;; esac
+	dir=
+	for d in $VM_IMAGES; do [ -d "$d" ] && [ -w "$d" ] && { dir=$d; break; }; done
+	[ -n "$dir" ] || { dir=$HOME/.local/share/ezcon/vms; mkdir -p "$dir"; }
+	[ -e "$dir/$name.qcow2" ] && { vm_err "$dir/$name.qcow2 exists"; return; }
+	qemu-img create -f qcow2 "$dir/$name.qcow2" "$size" >/dev/null || { vm_err "qemu-img create failed"; return; }
+	vm_conf_set "$name" DISK "$dir/$name.qcow2"; vm_conf_set "$name" RAM "$ram"; vm_conf_set "$name" CPUS "$cpus"
+	[ -n "$iso" ] && vm_conf_set "$name" ISO "$iso"
+	[ "$fw" = uefi ] && vm_conf_set "$name" UEFI 1
+	echo "created $name ($size disk in $dir); start it with Enter"
+}
+vm_delete() {
+	vm_load "$1"; [ -n "$(vm_pid "$1")" ] && { vm_err "stop $1 first"; return; }
+	lt_confirm "forget VM $1 (removes its config)?" || return
+	rm -f "$VM_CONF/$1.conf" "$VM_CONF/$1.vars.fd"
+	if [ -n "$DISK" ] && [ -e "$DISK" ]; then
+		printf 'to also DELETE the disk %s type the VM name (empty keeps it): ' "$DISK" >&2; read -r ans </dev/tty
+		[ "$ans" = "$1" ] && rm -f "$DISK" && echo "disk deleted" || echo "disk kept"
+	fi
+}
+
+_vm() {
+	act=$1; shift
+	case $act in
+		start | stop | kill | reset | pause | resume) for n in "$@"; do "vm_$act" "$n"; done ;;
+		ssh | console | snap | snaprestore | snapdel | iso | edit | new | delete)
+			[ "$act" = new ] && vm_new || "vm_$act" "$1" ;;
+	esac
+	if [ "$VMERR" = 1 ]; then pause; fi
+	exit 0
+}
+
+_vmpreview() {
+	vm_load "$1"
+	printf 'RAM %s MB, %s cpu, disk interface %s, display %s, ssh %s@127.0.0.1:%s\n' "$RAM" "$CPUS" "$DISK_IF" "$DISPLAY_MODE" "$SSH_USER" "$SSH_PORT"
+	printf 'ISO: %s   UEFI: %s\nimage: %s\n\n' "${ISO:-none}" "$UEFI" "${DISK:-?}"
+	[ -n "$DISK" ] && qemu-img info -U "$DISK" 2>&1
+}
+
+case ${1:-} in
+	_vm)       shift; _vm "$@" ;;
+	_rows)     shift; _rows "$@"; exit 0 ;;
+	_do)       shift; _do "$@" ;;
+	_prune)    shift; _prune "$@" ;;
+	_sysprune) _sysprune ;;
+	_logs)     shift; _logs "$@" ;;
+	_exec)     shift; _exec "$@" ;;
+	_inspect)  shift; _inspect "$@" ;;
+	_history)  shift; _history "$@" ;;
+	_stats)    shift; _stats "$@" ;;
+	_runimg)   shift; _runimg "$@" ;;
+	_new)      shift; _new "$@" ;;
+	_preview)  shift; _preview "$@"; exit 0 ;;
+esac
+
+# ---- key maps per view ------------------------------------------------
+views_line() {
+	printf '%s\n' "---" "alt-1: >$SELF containers # Containers" "alt-2: >$SELF images # Images" \
+		"alt-3: >$SELF volumes # Volumes" "alt-4: >$SELF networks # Networks"
+	case " $ENGINES " in *" podman "*) printf '%s\n' "alt-5: >$SELF pods # Pods" ;; esac
+	printf '%s\n' "alt-6: >$SELF vms # VMs"
+	[ -n "$ENGINES" ] && printf '%s\n' "alt-y: !$SELF _sysprune # System prune"
+	# Tab / Shift-Tab: cycle the top-level tabs, e.g. both -> docker ->
+	# podman -> qemu -> both (only the ones that exist on this machine)
+	set -- $AVAIL
+	tabs=; [ $# -gt 1 ] && tabs=both
+	tabs="$tabs $AVAIL"
+	command -v qemu-img >/dev/null 2>&1 && tabs="$tabs qemu"
+	tabs=${tabs# }
+	set -- $tabs
+	if [ $# -gt 1 ]; then
+		if [ "$view" = vms ]; then cur=qemu
+		elif [ "$ENGINES" = "$AVAIL" ] && [ "$(printf '%s\n' $AVAIL | wc -l)" -gt 1 ]; then cur=both
+		else cur=$ENGINES; fi
+		nxt= prv= last= first=$1; found=0
+		for t in $tabs; do
+			[ "$found" = 1 ] && [ -z "$nxt" ] && nxt=$t
+			[ "$t" = "$cur" ] && { found=1; prv=$last; }
+			last=$t
+		done
+		[ -n "$nxt" ] || nxt=$first
+		[ -n "$prv" ] || prv=$last
+		tab_action() { case $1 in
+			qemu) printf '>%s vms' "$SELF" ;;
+			both) printf '>env EZCON_ENGINES="%s" %s containers' "$AVAIL" "$SELF" ;;
+			*)    printf '>env EZCON_ENGINES="%s" %s containers' "$1" "$SELF" ;;
+		esac; }
+		printf '%s\n' "tab: $(tab_action "$nxt") # Tab: $nxt" "btab: $(tab_action "$prv")"
+	fi
+}
+
+keys_for() {
+	case $1 in
+	containers) cat <<EOF
+enter:  !$SELF _logs          # Logs
+alt-l:  !$SELF _logs follow   # Follow
+ctrl-e: !$SELF _exec          # Shell
+ctrl-u: !$SELF _do start container   # Start
+ctrl-x: !$SELF _do stop container    # Stop
+ctrl-t: !$SELF _do restart container # Restart
+ctrl-k: !$SELF _do kill container    # Kill
+ctrl-o: !$SELF _do pause container   # Pause
+alt-o:  !$SELF _do unpause container # Unpause
+ctrl-d: !$SELF _do rm container      # Remove
+---
+alt-i:  !$SELF _inspect container    # Inspect
+alt-s:  !$SELF _stats         # Stats
+alt-n:  !$SELF _new container # Run new
+alt-a:  !$SELF _prune container # Prune stopped
+EOF
+	;;
+	images) cat <<EOF
+enter:  !$SELF _runimg        # Run
+alt-u:  !$SELF _do pull image # Update
+alt-n:  !$SELF _new image     # Search/pull
+ctrl-d: !$SELF _do rm image   # Remove
+---
+alt-i:  !$SELF _inspect image # Inspect
+alt-h:  !$SELF _history       # History
+alt-a:  !$SELF _prune image   # Prune dangling
+EOF
+	;;
+	volumes) cat <<EOF
+enter:  !$SELF _inspect volume # Inspect
+alt-n:  !$SELF _new volume     # Create
+ctrl-d: !$SELF _do rm volume   # Remove
+alt-a:  !$SELF _prune volume   # Prune unused
+EOF
+	;;
+	networks) cat <<EOF
+enter:  !$SELF _inspect network # Inspect
+alt-n:  !$SELF _new network     # Create
+ctrl-d: !$SELF _do rm network   # Remove
+alt-a:  !$SELF _prune network   # Prune unused
+EOF
+	;;
+	vms) cat <<EOF
+enter:  !$SELF _vm start        # Start
+ctrl-x: !$SELF _vm stop         # Stop
+ctrl-k: !$SELF _vm kill         # Kill
+ctrl-t: !$SELF _vm reset        # Reset
+ctrl-o: !$SELF _vm pause        # Pause
+alt-o:  !$SELF _vm resume       # Resume
+ctrl-s: !$SELF _vm ssh          # SSH
+alt-c:  !$SELF _vm console      # Console
+---
+alt-n:  !$SELF _vm new          # New VM
+alt-i:  !$SELF _vm iso          # ISO
+alt-e:  !$SELF _vm edit         # Edit config
+alt-p:  !$SELF _vm snap         # Snapshot
+alt-r:  !$SELF _vm snaprestore  # Revert
+alt-x:  !$SELF _vm snapdel      # Drop snapshot
+ctrl-d: !$SELF _vm delete       # Delete VM
+EOF
+	;;
+	pods) cat <<EOF
+enter:  !$SELF _inspect pod     # Inspect
+ctrl-u: !$SELF _do start pod    # Start
+ctrl-x: !$SELF _do stop pod     # Stop
+ctrl-t: !$SELF _do restart pod  # Restart
+alt-n:  !$SELF _new pod         # Create
+ctrl-d: !$SELF _do rm pod       # Remove
+EOF
+	;;
+	esac
+	views_line
+}
+
+view=${1:-$DEFAULT_VIEW}
+case $view in containers | images | volumes | networks | vms) ;; pods) case " $ENGINES " in *" podman "*) ;; *) echo "ezcon: pods need podman" >&2; exit 1 ;; esac ;;
+	*) echo "usage: ezcon [-e docker|podman|both|qemu] [containers|images|volumes|networks|pods|vms]" >&2; exit 2 ;; esac
+if [ "$view" = vms ]; then
+	command -v qemu-img >/dev/null 2>&1 || { echo "ezcon: qemu-img not found (install qemu)" >&2; exit 1; }
+	label=qemu
+else
+	[ -n "$ENGINES" ] || { echo "ezcon: neither docker nor podman found" >&2; exit 1; }
+	# drop engines whose daemon isn't answering, but keep going with the rest
+	ok=
+	for e in $ENGINES; do
+		if ce "$e" info >/dev/null 2>&1; then ok="$ok $e"; else echo "ezcon: $e is installed but not answering (daemon down, or not in the docker group?) - skipped" >&2; fi
+	done
+	ENGINES=${ok# }; export EZCON_ENGINES="$ENGINES"
+	[ -n "$ENGINES" ] || exit 1
+	MULTI=0; case $ENGINES in *" "*) MULTI=1 ;; esac
+	label=$(printf '%s' "$ENGINES" | tr ' ' '+')
+fi
+noun=$(noun_of "$view")
+
+LT_KEYS=$(keys_for "$view")
+export LT_KEYS
+lt_select --mode select --refresh "$REFRESH_MS" --header "$label · $view" --prompt 'search> ' --nth 2 \
+	--seed "$SELF _rows $view" --preview "$SELF _preview $noun" --keys - >/dev/null || true

@@ -1,0 +1,43 @@
+#!/bin/sh
+# <manwriter>
+# real trash-can, implementing the actual freedesktop.org Trash spec
+# directly (files/ + a matching .trashinfo per file) rather than
+# depending on trash-cli - not installed on this machine (checked by
+# hand) - so any real spec-compliant GUI file manager sees and can
+# restore what this deletes, not just this script itself.
+#
+# usage: trash FILE...
+# </manwriter>
+
+trash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
+files_dir="$trash_dir/files"
+info_dir="$trash_dir/info"
+mkdir -p "$files_dir" "$info_dir"
+
+if [ -z "$1" ]; then
+	echo "usage: trash FILE..."
+	exit 1
+fi
+
+for f in "$@"; do
+	if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+		echo "trash: no such file: $f"
+		continue
+	fi
+	base="$(basename "$f")"
+	name="$base"
+	n=1
+	while [ -e "$files_dir/$name" ]; do
+		n=$((n + 1))
+		name="${base}.$n"
+	done
+	abs="$(cd "$(dirname "$f")" && pwd)/$base"
+	deleted_at="$(date +%Y-%m-%dT%H:%M:%S)"
+	{
+		echo "[Trash Info]"
+		echo "Path=$abs"
+		echo "DeletionDate=$deleted_at"
+	} > "$info_dir/$name.trashinfo"
+	mv "$f" "$files_dir/$name"
+	echo "trashed: $f"
+done

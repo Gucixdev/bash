@@ -1,0 +1,417 @@
+#!/bin/sh
+# <manwriter>
+# ezgh - terminal browser for GitHub: your repositories, issues, pull requests and workflow runs, built on
+# lib/lazytui.sh. It drives the real `gh`; without gh it falls back to the public REST API through curl
+# (read-only listing, then the browser / git for everything else), so it works on a bare box too.
+#
+#   ezgh [repos [OWNER] | issues [REPO] | prs [REPO] | runs [REPO]]
+#   ezgh clone REPO [DIR]      git clone (DIR defaults to $EZGH_DIR/NAME, EZGH_DIR defaults to ~/dev)
+#   ezgh open [REPO]           the repository in the browser
+#
+# REPO is OWNER/NAME; left out, it is the repository of the current directory (its origin remote).
+# repos with no OWNER lists the account gh is logged in as (or EZGH_USER / git config github.user).
+#
+# Every list is a picker: Enter opens the item in the browser, CTRL-V shows it in the terminal.
+#   repos    CTRL-I issues   CTRL-P pull requests   CTRL-A workflow runs   CTRL-L clone
+#   issues   CTRL-X close    CTRL-O reopen
+#   prs      CTRL-D diff     CTRL-K check the branch out   CTRL-T CI checks
+#   runs     CTRL-F failed log   CTRL-W watch a running one   CTRL-U re-run
+# Everything acts on the marked rows (space) or the current one, CTRL-R refreshes, ALT-B goes back to repos.
+#
+# @flag repos [OWNER]:your repositories (default view)
+# @flag issues [REPO]:open issues
+# @flag prs [REPO]:open pull requests
+# @flag runs [REPO]:workflow runs
+# @flag clone REPO [DIR]:git clone
+# @flag open [REPO]:open in the browser
+# </manwriter>
+
+# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
+# (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
+# (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
+_lt_hint() {
+	_lt_h=$1
+	while :; do
+		case $_lt_h in
+			ctrl-?*)  printf '\033[30;44m Ctrl \033[0m'; _lt_h=${_lt_h#ctrl-} ;;
+			alt-?*)   printf '\033[30;43m Alt \033[0m'; _lt_h=${_lt_h#alt-} ;;
+			shift-?*) printf '\033[30;42m Shift \033[0m'; _lt_h=${_lt_h#shift-} ;;
+			*) break ;;
+		esac
+	done
+	case $_lt_h in
+		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
+		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
+		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
+	esac
+	printf '\033[7m %s \033[0m %s   ' "$_lt_h" "$2"
+}
+
+# _lt_trim STR -> STR without leading/trailing blanks
+_lt_trim() { printf %s "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# _lt_script FILE CMD -> FILE runs CMD "$@" (keeps quoting out of fzf binds)
+_lt_script() { printf '%s "$@"\n' "$2" >"$1"; }
+
+lt_select() {
+	_lt_mode=raw _lt_refresh=${LT_REFRESH:-0} _lt_seed= _lt_more= _lt_reload= _lt_preview= _lt_keys= \
+	_lt_key=1 _lt_nth= _lt_header= _lt_prompt='> '
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--mode)    _lt_mode=$2;    shift 2 ;;
+			--seed)    _lt_seed=$2;    shift 2 ;;
+			--more)    _lt_more=$2;    shift 2 ;;
+			--refresh) _lt_refresh=$2; shift 2 ;;
+			--reload)  _lt_reload=$2;  shift 2 ;;
+			--preview) _lt_preview=$2; shift 2 ;;
+			--keys)    _lt_keys=$2;    shift 2 ;;
+			--key)     _lt_key=$2;     shift 2 ;;
+			--nth)     _lt_nth=$2;     shift 2 ;;
+			--header)  _lt_header=$2;  shift 2 ;;
+			--prompt)  _lt_prompt=$2;  shift 2 ;;
+			*) echo "lt_select: unknown arg $1" >&2; return 2 ;;
+		esac
+	done
+	case $_lt_refresh in '' | *[!0-9]*) echo "lt_select: --refresh wants milliseconds, got '$_lt_refresh'" >&2; return 2 ;; esac
+	case $_lt_mode in raw | select) ;; *) echo "lt_select: --mode must be raw or select" >&2; return 2 ;; esac
+
+	_lt_tmp=$(mktemp -d) || return 1
+	if [ -n "$_lt_seed" ]; then
+		_lt_script "$_lt_tmp/seed.sh" "$_lt_seed"
+	else
+		cat >"$_lt_tmp/list"
+		printf 'cat "%s/list"\n' "$_lt_tmp" >"$_lt_tmp/seed.sh"
+	fi
+
+	if ! command -v fzf >/dev/null 2>&1; then
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
+
+	TAB=$(printf '\t')
+	_lt_k="{+$_lt_key}"
+	set -- --delimiter="$TAB" --ansi --prompt="$_lt_prompt" --footer-border=none --layout=reverse-list
+	[ -n "$_lt_header" ] && set -- "$@" --header="$_lt_header"
+	[ -n "$_lt_nth" ] && set -- "$@" --with-nth="$_lt_nth"
+	if [ -n "$_lt_preview" ]; then
+		_lt_script "$_lt_tmp/preview.sh" "$_lt_preview"
+		set -- "$@" --preview="sh $_lt_tmp/preview.sh {$_lt_key}" \
+			--preview-window="${LT_PREVIEW_WINDOW:-down,60%,wrap}"
+	fi
+	_lt_start=
+	if [ -n "$_lt_more" ]; then
+		cat >"$_lt_tmp/more.sh" <<EOF
+out=\$(mktemp)
+$_lt_more > "\$out" 2>/dev/null || true
+if [ -s "\$out" ]; then
+	curl -s -XPOST "127.0.0.1:\$1" --data "reload(cat \$out; rm -f \$out)" >/dev/null 2>&1 || rm -f "\$out"
+else rm -f "\$out"; fi
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/more.sh \$FZF_PORT &"
+	fi
+	if [ "$_lt_refresh" -gt 0 ] && [ -z "$_lt_reload" ] && command -v curl >/dev/null 2>&1; then
+		# background loop: run the seed, post it to fzf only when it changed;
+		# it ends by itself once fzf's port stops answering
+		_lt_secs=$(awk -v ms="$_lt_refresh" 'BEGIN { if (ms < 50) ms = 50; printf "%.3f", ms / 1000 }')
+		cat >"$_lt_tmp/refresh.sh" <<EOF
+port=\$1; last=$_lt_tmp/last; new=$_lt_tmp/new
+sh $_lt_tmp/seed.sh >"\$last" 2>/dev/null
+while sleep $_lt_secs; do
+	[ -d $_lt_tmp ] || exit 0
+	sh $_lt_tmp/seed.sh >"\$new" 2>/dev/null || continue
+	cmp -s "\$last" "\$new" && continue
+	cp "\$new" "\$last"
+	curl -s -m 2 -XPOST "127.0.0.1:\$port" --data "reload-sync(cat $_lt_tmp/last)" >/dev/null 2>&1 || exit 0
+done
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
+		set -- "$@" --track --id-nth="$_lt_key"
+	fi
+	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
+	if [ -n "$_lt_reload" ]; then
+		printf '%s\n' "$_lt_reload" | sed 's/{q}/"$1"/g' >"$_lt_tmp/reload.sh"
+		set -- "$@" --bind="change:reload(sh $_lt_tmp/reload.sh {q})"
+	fi
+
+	# mode: select = no input line, space marks, / opens search
+	_lt_bar= _lt_ubar=
+	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
+	_lt_hints=
+	case $(fzf --version 2>/dev/null) in *-c\ *) _lt_hints=1 ;; esac
+	if [ "$_lt_mode" = select ]; then
+		set -- "$@" --multi --no-input \
+			--bind='space:toggle+down # mark,tab:down,btab:up,/:show-input # search' \
+			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	else
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint type filter)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	fi
+
+	# yaml key map -> binds + key bar
+	_lt_n=0
+	if [ -n "$_lt_keys" ]; then
+		[ "$_lt_keys" = - ] && printf '%s\n' "${LT_KEYS:-}" >"$_lt_tmp/keys" || cat "$_lt_keys" >"$_lt_tmp/keys"
+		while IFS= read -r _lt_line || [ -n "$_lt_line" ]; do
+			_lt_line=$(_lt_trim "$_lt_line")
+			case $_lt_line in '' | '#'*) continue ;; esac
+			# a line of just --- starts a new line in the key bar
+			[ "$_lt_line" = --- ] && { _lt_ubar="$_lt_ubar
+"; _lt_fresh=1; continue; }
+			_lt_kn=$(_lt_trim "${_lt_line%%:*}")
+			_lt_rest=${_lt_line#*:}
+			case $_lt_rest in
+				*' # '*) _lt_label=$(_lt_trim "${_lt_rest##* # }"); _lt_act=$(_lt_trim "${_lt_rest% # *}") ;;
+				*)       _lt_label=; _lt_act=$(_lt_trim "$_lt_rest") ;;
+			esac
+			_lt_n=$((_lt_n + 1))
+			_lt_reloadact="+reload(sh $_lt_tmp/seed.sh)"
+			case $_lt_act in
+				refresh)  _lt_bind="reload(sh $_lt_tmp/seed.sh)" ;;
+				quit)     _lt_bind=abort ;;
+				'!'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#!}"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)$_lt_reloadact" ;;
+				'>'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#>}"
+				          _lt_bind="become(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+				accept | select-all | deselect-all | toggle | toggle-all | first | last | up | down | page-up | page-down | abort | clear-query | show-input | hide-input)
+				          _lt_bind=$_lt_act ;;
+				*)        _lt_script "$_lt_tmp/a$_lt_n.sh" "$_lt_act"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+			esac
+			if [ -n "$_lt_hints" ] && [ -n "$_lt_label" ]; then set -- "$@" --bind="$_lt_kn:$_lt_bind # $_lt_label"
+			else set -- "$@" --bind="$_lt_kn:$_lt_bind"; fi
+			if [ -n "$_lt_label" ]; then
+				_lt_ubar="$_lt_ubar$(_lt_hint "$_lt_kn" "$_lt_label")"
+				_lt_fresh=
+			fi
+		done <"$_lt_tmp/keys"
+	fi
+	# defaults on line one, the key map's labels on line two
+	if [ -n "$_lt_hints" ]; then set -- "$@" --hints
+	else set -- "$@" --footer="$_lt_bar${_lt_ubar:+
+$_lt_ubar}"; fi
+
+	_lt_sel=$(sh "$_lt_tmp/seed.sh" | fzf "$@"); _lt_rc=$?
+	rm -rf "$_lt_tmp"
+	[ $_lt_rc -eq 0 ] || return 1
+	[ -n "$_lt_sel" ] && printf '%s\n' "$_lt_sel" | cut -f"$_lt_key"
+	return 0
+}
+
+# numbered prompt when fzf is missing
+_lt_fallback() {
+	sh "$_lt_tmp/seed.sh" >"$_lt_tmp/fb"
+	[ -s "$_lt_tmp/fb" ] || return 1
+	awk -F'\t' '{ printf "%3d) %s\n", NR, ($1 == "" ? $0 : $0) }' "$_lt_tmp/fb" | tr '\t' ' ' >&2
+	printf 'pick number%s, q to cancel: ' "$([ "$_lt_mode" = select ] && echo 's (space separated)')" >&2
+	read -r _lt_ans || return 1
+	case $_lt_ans in '' | q) return 1 ;; esac
+	for _lt_i in $_lt_ans; do sed -n "${_lt_i}p" "$_lt_tmp/fb"; done | cut -f"$_lt_key"
+}
+
+# lt_realbin NAME -> path of the real NAME in PATH, skipping this script
+# itself. For tools that wrap a program of the same name (a script called
+# docker or flatpak) so they never call themselves.
+lt_realbin() {
+	_lt_old=$IFS; IFS=:
+	for _lt_d in $PATH; do
+		IFS=$_lt_old
+		_lt_c=$_lt_d/$1
+		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && ! [ "$_lt_c" -ef "$0" ]; then printf '%s\n' "$_lt_c"; return 0; fi
+		IFS=:
+	done
+	IFS=$_lt_old
+	return 1
+}
+
+# <<< lazytui <<<
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SELF=$HERE/$(basename -- "$0")
+GH=$(lt_realbin gh 2>/dev/null) || GH=
+CLONE_DIR=${EZGH_DIR:-$HOME/dev}
+API=https://api.github.com
+
+die() { echo "ezgh: $*" >&2; exit 1; }
+tok() { printf '%s' "${GH_TOKEN:-${GITHUB_TOKEN:-}}"; }
+# api PATH -> JSON on stdout (public API, a token in GH_TOKEN/GITHUB_TOKEN is used when set)
+api() {
+	t=$(tok)
+	if [ -n "$t" ]; then curl -fsS -H "Authorization: Bearer $t" -H 'Accept: application/vnd.github+json' "$API/$1"
+	else curl -fsS -H 'Accept: application/vnd.github+json' "$API/$1"; fi
+}
+# jq or python3: the same little filter language is not portable, so fallbacks are written per view
+have() { command -v "$1" >/dev/null 2>&1; }
+need_json() { have jq || have python3 || die "listing without gh needs jq or python3"; }
+
+# the repo of the current directory: owner/name from the origin remote (needs only git)
+cwd_repo() {
+	u=$(git remote get-url origin 2>/dev/null) || return 1
+	u=${u%.git}; u=${u#*github.com[:/]}
+	case $u in */*) printf '%s\n' "$u" ;; *) return 1 ;; esac
+}
+repo_arg() { if [ -n "${1:-}" ]; then printf '%s\n' "$1"; else cwd_repo || die "no REPO given and this is not a GitHub checkout (ezgh issues OWNER/NAME)"; fi; }
+owner_default() {
+	if [ -n "$GH" ]; then "$GH" api user --jq .login 2>/dev/null && return 0; fi
+	[ -n "${EZGH_USER:-}" ] && { echo "$EZGH_USER"; return 0; }
+	git config github.user 2>/dev/null
+}
+
+# ---- data: one TSV row per item, first column = the key the actions get -------------------------------------
+rows_repos() {   # OWNER
+	o=${1:-$(owner_default)}
+	[ -n "$o" ] || die "whose repositories? ezgh repos OWNER (or set EZGH_USER)"
+	if [ -n "$GH" ]; then
+		"$GH" repo list "$o" --limit 200 --json nameWithOwner,description,isPrivate,isFork,stargazerCount,updatedAt \
+			--jq '.[] | [.nameWithOwner, (.nameWithOwner | tostring), (if .isPrivate then "private" else "public " end), (if .isFork then "fork" else "    " end), ("*" + (.stargazerCount|tostring)), .updatedAt[:10], (.description // "")] | @tsv'
+	else
+		need_json
+		api "users/$o/repos?per_page=100&sort=updated" | if have jq; then
+			jq -r '.[] | [.full_name, .full_name, (if .private then "private" else "public " end), (if .fork then "fork" else "    " end), ("*" + (.stargazers_count|tostring)), .updated_at[:10], (.description // "")] | @tsv'
+		else python3 -c '
+import json,sys
+for r in json.load(sys.stdin):
+    print("\t".join([r["full_name"], r["full_name"], "private" if r["private"] else "public ", "fork" if r["fork"] else "    ", "*%d" % r["stargazers_count"], r["updated_at"][:10], r.get("description") or ""]))'
+		fi
+	fi
+}
+rows_issues() {   # REPO
+	if [ -n "$GH" ]; then
+		"$GH" issue list -R "$1" --limit 100 --state open --json number,title,author,labels,updatedAt \
+			--jq '.[] | [(.number|tostring), ("#" + (.number|tostring)), .updatedAt[:10], .author.login, ([.labels[].name] | join(",")), .title] | @tsv'
+	else
+		need_json
+		api "repos/$1/issues?state=open&per_page=100" | if have jq; then
+			jq -r '.[] | select(.pull_request | not) | [(.number|tostring), ("#" + (.number|tostring)), .updated_at[:10], .user.login, ([.labels[].name] | join(",")), .title] | @tsv'
+		else python3 -c '
+import json,sys
+for r in json.load(sys.stdin):
+    if "pull_request" not in r:
+        print("\t".join([str(r["number"]), "#%d" % r["number"], r["updated_at"][:10], r["user"]["login"], ",".join(l["name"] for l in r["labels"]), r["title"]]))'
+		fi
+	fi
+}
+rows_prs() {   # REPO
+	if [ -n "$GH" ]; then
+		"$GH" pr list -R "$1" --limit 100 --state open --json number,title,author,headRefName,isDraft,updatedAt \
+			--jq '.[] | [(.number|tostring), ("#" + (.number|tostring)), .updatedAt[:10], .author.login, (if .isDraft then "draft" else "     " end), .headRefName, .title] | @tsv'
+	else
+		need_json
+		api "repos/$1/pulls?state=open&per_page=100" | if have jq; then
+			jq -r '.[] | [(.number|tostring), ("#" + (.number|tostring)), .updated_at[:10], .user.login, (if .draft then "draft" else "     " end), .head.ref, .title] | @tsv'
+		else python3 -c '
+import json,sys
+for r in json.load(sys.stdin):
+    print("\t".join([str(r["number"]), "#%d" % r["number"], r["updated_at"][:10], r["user"]["login"], "draft" if r.get("draft") else "     ", r["head"]["ref"], r["title"]]))'
+		fi
+	fi
+}
+rows_runs() {   # REPO
+	if [ -n "$GH" ]; then
+		"$GH" run list -R "$1" --limit 50 --json databaseId,displayTitle,status,conclusion,workflowName,headBranch,createdAt \
+			--jq '.[] | [(.databaseId|tostring), (.databaseId|tostring), (if .status == "completed" then .conclusion else .status end), .createdAt[:16], .workflowName, .headBranch, .displayTitle] | @tsv'
+	else
+		need_json
+		api "repos/$1/actions/runs?per_page=50" | if have jq; then
+			jq -r '.workflow_runs[] | [(.id|tostring), (.id|tostring), (if .status == "completed" then .conclusion else .status end), .created_at[:16], .name, .head_branch, .display_title] | @tsv'
+		else python3 -c '
+import json,sys
+for r in json.load(sys.stdin)["workflow_runs"]:
+    print("\t".join([str(r["id"]), str(r["id"]), r["conclusion"] if r["status"] == "completed" else r["status"], r["created_at"][:16], r["name"], r["head_branch"], r.get("display_title") or ""]))'
+		fi
+	fi
+}
+
+# ---- actions ---------------------------------------------------------------------------------------------------
+web() {   # KIND REPO [ID...]
+	kind=$1; repo=$2; shift 2
+	if [ -z "$*" ]; then set -- ""; fi
+	for id in "$@"; do
+		case $kind in
+			repo)  url=https://github.com/$repo ;;
+			issue) url=https://github.com/$repo/issues/$id ;;
+			pr)    url=https://github.com/$repo/pull/$id ;;
+			run)   url=https://github.com/$repo/actions/runs/$id ;;
+		esac
+		if have xdg-open; then xdg-open "$url" >/dev/null 2>&1 &
+		elif have open; then open "$url"
+		else echo "$url"; fi
+	done
+}
+pager() { if have less; then less -R; else cat; fi; }
+gh_or_url() { [ -n "$GH" ] || { echo "this action needs gh (https://cli.github.com); the browser view still works" >&2; printf 'press Enter ' >&2; read -r _ </dev/tty; return 1; }; }
+
+case ${1:-} in
+	# picker rows and actions, re-run by the pickers themselves
+	_rows) shift; kind=$1; shift; "rows_$kind" "$@"; exit 0 ;;
+	_web)  shift; web "$@"; exit 0 ;;
+	_repo)   shift; exec "$SELF" "$1" "$2" ;;    # _repo KIND REPO-or-first-key: switch the view
+	_view)   shift; gh_or_url || exit 0; kind=$1; repo=$2; shift 2
+	         for id in "$@"; do case $kind in issue) "$GH" issue view "$id" -R "$repo" --comments ;; pr) "$GH" pr view "$id" -R "$repo" --comments ;; run) "$GH" run view "$id" -R "$repo" ;; repo) "$GH" repo view "$id" ;; esac; done | pager ;;
+	_close)  shift; gh_or_url || exit 0; repo=$1; shift; for n in "$@"; do "$GH" issue close "$n" -R "$repo"; done ;;
+	_reopen) shift; gh_or_url || exit 0; repo=$1; shift; for n in "$@"; do "$GH" issue reopen "$n" -R "$repo"; done ;;
+	_diff)   shift; gh_or_url || exit 0; repo=$1; shift; for n in "$@"; do "$GH" pr diff "$n" -R "$repo"; done | pager ;;
+	_checkout) shift; gh_or_url || exit 0; repo=$1; shift; "$GH" pr checkout "$1" -R "$repo" ;;
+	_checks) shift; gh_or_url || exit 0; repo=$1; shift; for n in "$@"; do "$GH" pr checks "$n" -R "$repo"; done | pager ;;
+	_failed) shift; gh_or_url || exit 0; repo=$1; shift; for n in "$@"; do "$GH" run view "$n" -R "$repo" --log-failed; done | pager ;;
+	_watch)  shift; gh_or_url || exit 0; repo=$1; shift; "$GH" run watch "$1" -R "$repo" ;;
+	_rerun)  shift; gh_or_url || exit 0; repo=$1; shift; for n in "$@"; do "$GH" run rerun "$n" -R "$repo"; done ;;
+	_clone)  shift; for r in "$@"; do "$SELF" clone "$r"; done; printf 'press Enter ' >&2; read -r _ </dev/tty ;;
+esac
+
+view=${1:-repos}
+case $view in
+	clone)
+		r=${2:-}; [ -n "$r" ] || die "usage: ezgh clone OWNER/NAME [DIR]"
+		d=${3:-$CLONE_DIR/${r##*/}}
+		[ ! -e "$d" ] || die "$d already exists"
+		mkdir -p "$(dirname -- "$d")"
+		if [ -n "$GH" ]; then "$GH" repo clone "$r" "$d"; else git clone "https://github.com/$r" "$d"; fi ;;
+	open) web repo "$(repo_arg "${2:-}")" ;;
+	repos)
+		o=${2:-}
+		LT_KEYS="enter:  !$SELF _web repo         # Browser
+ctrl-v: !$SELF _view repo x       # View
+ctrl-i: >$SELF _repo issues       # Issues
+ctrl-p: >$SELF _repo prs          # Pull requests
+ctrl-a: >$SELF _repo runs         # Runs
+ctrl-l: !$SELF _clone             # Clone
+ctrl-r: refresh                   # Refresh"
+		export LT_KEYS
+		# the row key is the repo; enter/ctrl-v give it as the LAST argument, so _web/_view take REPO first
+		lt_select --mode select --refresh 0 --header "GitHub: ${o:-your} repositories   (*stars)" --prompt 'search> ' --nth 2,3,4,5,6,7 \
+			--seed "$SELF _rows repos $o" --keys - >/dev/null || true ;;
+	issues | prs | runs)
+		repo=$(repo_arg "${2:-}"); export EZGH_REPO=$repo
+		case $view in
+			issues) LT_KEYS="enter:  !$SELF _web issue $repo   # Browser
+ctrl-v: !$SELF _view issue $repo  # View
+ctrl-x: !$SELF _close $repo       # Close
+ctrl-o: !$SELF _reopen $repo      # Reopen
+ctrl-r: refresh                   # Refresh
+---
+alt-b:  >$SELF repos              # Repositories" ;;
+			prs)    LT_KEYS="enter:  !$SELF _web pr $repo      # Browser
+ctrl-v: !$SELF _view pr $repo     # View
+ctrl-d: !$SELF _diff $repo        # Diff
+ctrl-k: !$SELF _checkout $repo    # Checkout
+ctrl-t: !$SELF _checks $repo      # CI checks
+ctrl-r: refresh                   # Refresh
+---
+alt-b:  >$SELF repos              # Repositories" ;;
+			runs)   LT_KEYS="enter:  !$SELF _web run $repo     # Browser
+ctrl-v: !$SELF _view run $repo    # View
+ctrl-f: !$SELF _failed $repo      # Failed log
+ctrl-w: !$SELF _watch $repo       # Watch
+ctrl-u: !$SELF _rerun $repo       # Re-run
+ctrl-r: refresh                   # Refresh
+---
+alt-b:  >$SELF repos              # Repositories" ;;
+		esac
+		export LT_KEYS
+		lt_select --mode select --refresh 0 --header "$view of $repo" --prompt 'search> ' --nth 2,3,4,5,6,7 \
+			--seed "$SELF _rows ${view} $repo" --keys - >/dev/null || true ;;
+	-h | --help) sed -n '2,/^# <\/manwriter>/p' "$0" | sed 's/^# \{0,1\}//; /manwriter>/d' ;;
+	*) die "usage: ezgh [repos [OWNER] | issues [REPO] | prs [REPO] | runs [REPO] | clone REPO [DIR] | open [REPO]]" ;;
+esac

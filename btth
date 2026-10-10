@@ -1,0 +1,62 @@
+#!/bin/sh
+# <manwriter>
+# real Bluetooth picker over bluetoothctl (BlueZ) - the one real
+# userspace Bluetooth stack on Linux, same "no reimplementation"
+# choice as this dir's own wifi script (iwctl/wpa_cli). Not
+# NetworkManager, for the same "just a frontend, not a real backend"
+# reason wifi's own comment already gives.
+#
+# Needs a real interactive terminal (dispatched via run_interactive by
+# this project's nnn, not captured output - see wifi's own note on
+# the same requirement).
+# </manwriter>
+
+if ! command -v bluetoothctl >/dev/null 2>&1; then
+	echo "bluetoothctl not found (needs BlueZ)"
+	exit 1
+fi
+
+if ! systemctl is-active --quiet bluetooth 2>/dev/null; then
+	echo "bluetooth.service is not running - starting it (needs root)"
+	sudo systemctl start bluetooth || { echo "could not start bluetooth.service"; exit 1; }
+fi
+
+echo "scanning for real Bluetooth devices (10s)..."
+bluetoothctl --timeout 10 scan on >/dev/null 2>&1
+
+tmp_macs="$(mktemp)"
+trap 'rm -f "$tmp_macs"' EXIT
+
+# real bluetoothctl devices: "Device AA:BB:CC:DD:EE:FF Some Name"
+bluetoothctl devices | awk -v macs="$tmp_macs" '
+	{
+		mac = $2
+		name = ""
+		for (i = 3; i <= NF; i++) name = name (i > 3 ? " " : "") $i
+		printf "%2d) %-17s %s\n", ++n, mac, name
+		print mac >> macs
+	}
+'
+
+if [ ! -s "$tmp_macs" ]; then
+	echo "no Bluetooth devices found"
+	exit 1
+fi
+
+printf "pick a device (number), or q to cancel: "
+read -r choice
+if [ "$choice" = "q" ] || [ -z "$choice" ]; then
+	echo "cancelled"
+	exit 0
+fi
+
+mac="$(sed -n "${choice}p" "$tmp_macs")"
+if [ -z "$mac" ]; then
+	echo "invalid choice"
+	exit 1
+fi
+
+echo "pairing/trusting/connecting to real device $mac..."
+bluetoothctl pair "$mac"
+bluetoothctl trust "$mac"
+bluetoothctl connect "$mac"

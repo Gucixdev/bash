@@ -1,0 +1,27 @@
+.TH DSPQ 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+dspq \- a parallel, atomic download queue for shell scripts.
+.SH SYNOPSIS
+.B dspq
+.SH DESCRIPTION
+.B dspq
+.nf
+
+  dq [-j N] ENTRY...          download each ENTRY; up to N at once (default 3)
+  dq [-j N] -                 read ENTRYs from stdin, one per line
+  dq [-j N] --state DIR ...   no bar; write per-item progress into DIR
+
+ENTRY is  url|dest[|label]   (dest = full path).
+
+  sequence : the list is a FIFO - workers pull from it in order
+  parallel : -j N downloads run concurrently
+  atomic   : each lands in <dest>.part, renamed onto <dest> only on success
+  resumable: re-run with the same list; done files skip, .part continue
+
+Default: one aggregate pacmanbar for the whole queue. With --state DIR each
+worker writes "DIR/<label>" as "<cur> <total> <run|done|fail>" and NO bar is
+drawn - for a caller that renders its own per-item UI (e.g. blender's TUI).
+$HF_TOKEN (exported) is sent for huggingface.co URLs.
+.fi
+.SH SEE ALSO
+TODO: related tools here.

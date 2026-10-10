@@ -1,0 +1,27 @@
+.TH LAZYTUI 1 "2026-09-20" "caveutils" "caveutils Manual"
+.SH NAME
+lazytui \- a reusable lazy-loading fzf front-end.
+.SH SYNOPSIS
+.B lazytui
+.SH DESCRIPTION
+.B lazytui
+.nf
+
+  lazytui --seed CMD [--more CMD] [--reload CMD] [--preview CMD]
+          [--accept CMD] [--key N] [--nth LIST] [--header STR] [--prompt STR]
+
+  --seed CMD     stdout is the initial list, shown at once (fast). required.
+  --more CMD     stdout replaces the list when ready (slow) - run in the
+                 background, swapped in live via fzf's --listen port.
+  --reload CMD   run on every query change ({q} = current query) - stdout
+                 replaces the list. The "search as you type" hook.
+  --preview CMD  `CMD <key>` fills the preview pane for the highlighted row.
+  --accept CMD   Enter runs `CMD <key>`, replacing the TUI (fzf `become`).
+                 Omitted -> the key is printed to stdout and lazytui exits.
+  --key N        which TAB-separated field is the row's key (default 1).
+  --nth LIST     fzf --with-nth (default: everything).
+
+TAB is the delimiter. Plain fzf underneath - Ctrl-C / Esc quit.
+.fi
+.SH SEE ALSO
+TODO: related tools here.

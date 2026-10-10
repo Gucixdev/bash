@@ -1,0 +1,7 @@
+# real secrets - never commit, .env.example shows the shape instead
+.env
+
+# per-machine runtime state/cache, not source
+__pycache__/
+*.pyc
+.blenderlauncher/

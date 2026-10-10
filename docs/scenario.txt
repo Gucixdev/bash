@@ -1,0 +1,5 @@
+scennario 
+
+ls 
+run 
+rec 

@@ -1,0 +1,378 @@
+#!/bin/sh
+# <manwriter>
+# ezhf - terminal browser for the Hugging Face Hub and your local cache, built on lib/lazytui.sh. It uses the
+# real `hf` (huggingface-cli) to download; without it, downloads and everything else fall back to curl and the
+# public Hub API, so it works on a bare box too.
+#
+#   ezhf [cache | search QUERY [--datasets] | files REPO [--dataset] | get REPO [FILE...] [--dataset]]
+#
+#   cache    (default) what is downloaded: models, datasets and spaces with sizes, biggest first.
+#            Enter lists the files, CTRL-X deletes the marked ones, CTRL-O opens the folder, CTRL-S searches.
+#   search   the Hub, most downloaded first (models; --datasets for datasets): downloads, likes, task, date.
+#            Enter lists the files of the repo, CTRL-D downloads the whole repo, CTRL-O opens it in the browser.
+#   files    every file of a repo with its size (the header has the total). Mark files with space, Enter or
+#            CTRL-D downloads the marked ones (or the current one) - into the cache with hf, else into ./NAME/.
+#   get      the same without the UI: ezhf get gpt2 config.json model.safetensors
+#
+# The cache is HF_HUB_CACHE, or HF_HOME/hub, or ~/.cache/huggingface/hub. A token in HF_TOKEN (or
+# HF_HOME/token) is used for private and gated repos. REPO is OWNER/NAME (or just NAME for old repos).
+#
+# @flag cache:local cache, biggest first (default)
+# @flag search QUERY [--datasets]:search the Hub
+# @flag files REPO [--dataset]:files of a repo with sizes
+# @flag get REPO [FILE...]:download without the UI
+# </manwriter>
+
+# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
+# (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
+# (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
+_lt_hint() {
+	_lt_h=$1
+	while :; do
+		case $_lt_h in
+			ctrl-?*)  printf '\033[30;44m Ctrl \033[0m'; _lt_h=${_lt_h#ctrl-} ;;
+			alt-?*)   printf '\033[30;43m Alt \033[0m'; _lt_h=${_lt_h#alt-} ;;
+			shift-?*) printf '\033[30;42m Shift \033[0m'; _lt_h=${_lt_h#shift-} ;;
+			*) break ;;
+		esac
+	done
+	case $_lt_h in
+		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
+		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
+		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
+	esac
+	printf '\033[7m %s \033[0m %s   ' "$_lt_h" "$2"
+}
+
+# _lt_trim STR -> STR without leading/trailing blanks
+_lt_trim() { printf %s "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# _lt_script FILE CMD -> FILE runs CMD "$@" (keeps quoting out of fzf binds)
+_lt_script() { printf '%s "$@"\n' "$2" >"$1"; }
+
+lt_input() {   # lt_input "prompt" [default] -> stdout
+	printf '%s%s: ' "$1" "${2:+ [$2]}" >&2
+	read -r _lt_a || return 1
+	printf '%s\n' "${_lt_a:-${2:-}}"
+}
+
+lt_select() {
+	_lt_mode=raw _lt_refresh=${LT_REFRESH:-0} _lt_seed= _lt_more= _lt_reload= _lt_preview= _lt_keys= \
+	_lt_key=1 _lt_nth= _lt_header= _lt_prompt='> '
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--mode)    _lt_mode=$2;    shift 2 ;;
+			--seed)    _lt_seed=$2;    shift 2 ;;
+			--more)    _lt_more=$2;    shift 2 ;;
+			--refresh) _lt_refresh=$2; shift 2 ;;
+			--reload)  _lt_reload=$2;  shift 2 ;;
+			--preview) _lt_preview=$2; shift 2 ;;
+			--keys)    _lt_keys=$2;    shift 2 ;;
+			--key)     _lt_key=$2;     shift 2 ;;
+			--nth)     _lt_nth=$2;     shift 2 ;;
+			--header)  _lt_header=$2;  shift 2 ;;
+			--prompt)  _lt_prompt=$2;  shift 2 ;;
+			*) echo "lt_select: unknown arg $1" >&2; return 2 ;;
+		esac
+	done
+	case $_lt_refresh in '' | *[!0-9]*) echo "lt_select: --refresh wants milliseconds, got '$_lt_refresh'" >&2; return 2 ;; esac
+	case $_lt_mode in raw | select) ;; *) echo "lt_select: --mode must be raw or select" >&2; return 2 ;; esac
+
+	_lt_tmp=$(mktemp -d) || return 1
+	if [ -n "$_lt_seed" ]; then
+		_lt_script "$_lt_tmp/seed.sh" "$_lt_seed"
+	else
+		cat >"$_lt_tmp/list"
+		printf 'cat "%s/list"\n' "$_lt_tmp" >"$_lt_tmp/seed.sh"
+	fi
+
+	if ! command -v fzf >/dev/null 2>&1; then
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
+
+	TAB=$(printf '\t')
+	_lt_k="{+$_lt_key}"
+	set -- --delimiter="$TAB" --ansi --prompt="$_lt_prompt" --footer-border=none --layout=reverse-list
+	[ -n "$_lt_header" ] && set -- "$@" --header="$_lt_header"
+	[ -n "$_lt_nth" ] && set -- "$@" --with-nth="$_lt_nth"
+	if [ -n "$_lt_preview" ]; then
+		_lt_script "$_lt_tmp/preview.sh" "$_lt_preview"
+		set -- "$@" --preview="sh $_lt_tmp/preview.sh {$_lt_key}" \
+			--preview-window="${LT_PREVIEW_WINDOW:-down,60%,wrap}"
+	fi
+	_lt_start=
+	if [ -n "$_lt_more" ]; then
+		cat >"$_lt_tmp/more.sh" <<EOF
+out=\$(mktemp)
+$_lt_more > "\$out" 2>/dev/null || true
+if [ -s "\$out" ]; then
+	curl -s -XPOST "127.0.0.1:\$1" --data "reload(cat \$out; rm -f \$out)" >/dev/null 2>&1 || rm -f "\$out"
+else rm -f "\$out"; fi
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/more.sh \$FZF_PORT &"
+	fi
+	if [ "$_lt_refresh" -gt 0 ] && [ -z "$_lt_reload" ] && command -v curl >/dev/null 2>&1; then
+		# background loop: run the seed, post it to fzf only when it changed;
+		# it ends by itself once fzf's port stops answering
+		_lt_secs=$(awk -v ms="$_lt_refresh" 'BEGIN { if (ms < 50) ms = 50; printf "%.3f", ms / 1000 }')
+		cat >"$_lt_tmp/refresh.sh" <<EOF
+port=\$1; last=$_lt_tmp/last; new=$_lt_tmp/new
+sh $_lt_tmp/seed.sh >"\$last" 2>/dev/null
+while sleep $_lt_secs; do
+	[ -d $_lt_tmp ] || exit 0
+	sh $_lt_tmp/seed.sh >"\$new" 2>/dev/null || continue
+	cmp -s "\$last" "\$new" && continue
+	cp "\$new" "\$last"
+	curl -s -m 2 -XPOST "127.0.0.1:\$port" --data "reload-sync(cat $_lt_tmp/last)" >/dev/null 2>&1 || exit 0
+done
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
+		set -- "$@" --track --id-nth="$_lt_key"
+	fi
+	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
+	if [ -n "$_lt_reload" ]; then
+		printf '%s\n' "$_lt_reload" | sed 's/{q}/"$1"/g' >"$_lt_tmp/reload.sh"
+		set -- "$@" --bind="change:reload(sh $_lt_tmp/reload.sh {q})"
+	fi
+
+	# mode: select = no input line, space marks, / opens search
+	_lt_bar= _lt_ubar=
+	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
+	_lt_hints=
+	case $(fzf --version 2>/dev/null) in *-c\ *) _lt_hints=1 ;; esac
+	if [ "$_lt_mode" = select ]; then
+		set -- "$@" --multi --no-input \
+			--bind='space:toggle+down # mark,tab:down,btab:up,/:show-input # search' \
+			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	else
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint type filter)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	fi
+
+	# yaml key map -> binds + key bar
+	_lt_n=0
+	if [ -n "$_lt_keys" ]; then
+		[ "$_lt_keys" = - ] && printf '%s\n' "${LT_KEYS:-}" >"$_lt_tmp/keys" || cat "$_lt_keys" >"$_lt_tmp/keys"
+		while IFS= read -r _lt_line || [ -n "$_lt_line" ]; do
+			_lt_line=$(_lt_trim "$_lt_line")
+			case $_lt_line in '' | '#'*) continue ;; esac
+			# a line of just --- starts a new line in the key bar
+			[ "$_lt_line" = --- ] && { _lt_ubar="$_lt_ubar
+"; _lt_fresh=1; continue; }
+			_lt_kn=$(_lt_trim "${_lt_line%%:*}")
+			_lt_rest=${_lt_line#*:}
+			case $_lt_rest in
+				*' # '*) _lt_label=$(_lt_trim "${_lt_rest##* # }"); _lt_act=$(_lt_trim "${_lt_rest% # *}") ;;
+				*)       _lt_label=; _lt_act=$(_lt_trim "$_lt_rest") ;;
+			esac
+			_lt_n=$((_lt_n + 1))
+			_lt_reloadact="+reload(sh $_lt_tmp/seed.sh)"
+			case $_lt_act in
+				refresh)  _lt_bind="reload(sh $_lt_tmp/seed.sh)" ;;
+				quit)     _lt_bind=abort ;;
+				'!'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#!}"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)$_lt_reloadact" ;;
+				'>'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#>}"
+				          _lt_bind="become(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+				accept | select-all | deselect-all | toggle | toggle-all | first | last | up | down | page-up | page-down | abort | clear-query | show-input | hide-input)
+				          _lt_bind=$_lt_act ;;
+				*)        _lt_script "$_lt_tmp/a$_lt_n.sh" "$_lt_act"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+			esac
+			if [ -n "$_lt_hints" ] && [ -n "$_lt_label" ]; then set -- "$@" --bind="$_lt_kn:$_lt_bind # $_lt_label"
+			else set -- "$@" --bind="$_lt_kn:$_lt_bind"; fi
+			if [ -n "$_lt_label" ]; then
+				_lt_ubar="$_lt_ubar$(_lt_hint "$_lt_kn" "$_lt_label")"
+				_lt_fresh=
+			fi
+		done <"$_lt_tmp/keys"
+	fi
+	# defaults on line one, the key map's labels on line two
+	if [ -n "$_lt_hints" ]; then set -- "$@" --hints
+	else set -- "$@" --footer="$_lt_bar${_lt_ubar:+
+$_lt_ubar}"; fi
+
+	_lt_sel=$(sh "$_lt_tmp/seed.sh" | fzf "$@"); _lt_rc=$?
+	rm -rf "$_lt_tmp"
+	[ $_lt_rc -eq 0 ] || return 1
+	[ -n "$_lt_sel" ] && printf '%s\n' "$_lt_sel" | cut -f"$_lt_key"
+	return 0
+}
+
+# numbered prompt when fzf is missing
+_lt_fallback() {
+	sh "$_lt_tmp/seed.sh" >"$_lt_tmp/fb"
+	[ -s "$_lt_tmp/fb" ] || return 1
+	awk -F'\t' '{ printf "%3d) %s\n", NR, ($1 == "" ? $0 : $0) }' "$_lt_tmp/fb" | tr '\t' ' ' >&2
+	printf 'pick number%s, q to cancel: ' "$([ "$_lt_mode" = select ] && echo 's (space separated)')" >&2
+	read -r _lt_ans || return 1
+	case $_lt_ans in '' | q) return 1 ;; esac
+	for _lt_i in $_lt_ans; do sed -n "${_lt_i}p" "$_lt_tmp/fb"; done | cut -f"$_lt_key"
+}
+
+# lt_realbin NAME -> path of the real NAME in PATH, skipping this script
+# itself. For tools that wrap a program of the same name (a script called
+# docker or flatpak) so they never call themselves.
+lt_realbin() {
+	_lt_old=$IFS; IFS=:
+	for _lt_d in $PATH; do
+		IFS=$_lt_old
+		_lt_c=$_lt_d/$1
+		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && ! [ "$_lt_c" -ef "$0" ]; then printf '%s\n' "$_lt_c"; return 0; fi
+		IFS=:
+	done
+	IFS=$_lt_old
+	return 1
+}
+
+# <<< lazytui <<<
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SELF=$HERE/$(basename -- "$0")
+HF_HOME_DIR=${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}
+CACHE=${HF_HUB_CACHE:-$HF_HOME_DIR/hub}
+HUB=https://huggingface.co
+HF=$(lt_realbin hf 2>/dev/null) || HF=$(lt_realbin huggingface-cli 2>/dev/null) || HF=
+
+die() { echo "ezhf: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+tok() { if [ -n "${HF_TOKEN:-}" ]; then printf '%s' "$HF_TOKEN"; elif [ -r "$HF_HOME_DIR/token" ]; then cat "$HF_HOME_DIR/token"; fi; }
+api() {   # PATH -> JSON
+	t=$(tok)
+	if [ -n "$t" ]; then curl -fsS -H "Authorization: Bearer $t" "$HUB/api/$1"; else curl -fsS "$HUB/api/$1"; fi
+}
+human() { awk -v b="${1:-0}" 'BEGIN { split("B K M G T", u, " "); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ } printf (i == 1 ? "%d%s" : "%.1f%s"), b, u[i] }'; }
+# a JSON list -> TSV rows: one filter per tool, jq when there is one, python3 otherwise
+json_rows() {   # $1 = jq filter, $2 = python body (reads the list as `d`, prints rows)
+	if have jq; then jq -r "$1"
+	elif have python3; then python3 -c "import json,sys
+d=json.load(sys.stdin)
+$2"
+	else die "this needs jq or python3"; fi
+}
+kind_path() { case $1 in dataset | datasets) echo datasets ;; *) echo models ;; esac; }
+
+# ---- data --------------------------------------------------------------------------------------------------
+rows_cache() {
+	[ -d "$CACHE" ] || return 0
+	for d in "$CACHE"/*--*; do
+		[ -d "$d" ] || continue
+		b=$(basename -- "$d"); type=${b%%--*}; repo=$(printf '%s' "${b#*--}" | sed 's|--|/|g')
+		kb=$(du -sk "$d" 2>/dev/null | cut -f1)
+		when=$(stat -c %y "$d" 2>/dev/null | cut -c1-10)
+		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$kb" "$b" "${type%s}" "$(human $((kb * 1024)))" "$when" "$repo"
+	done | sort -t "$(printf '\t')" -k1,1nr | cut -f2-
+}
+rows_search() {   # QUERY [datasets]
+	k=$(kind_path "${2:-}")
+	q=$(printf '%s' "$1" | sed 's/ /%20/g')
+	api "$k?search=$q&sort=downloads&direction=-1&limit=40" | json_rows \
+		'.[] | [.id, .id, ("v" + (.downloads // 0 | tostring)), ("<3 " + (.likes // 0 | tostring)), (.pipeline_tag // ""), ((.lastModified // "")[:10])] | @tsv' \
+		'for r in d: print("\t".join([r["id"], r["id"], "v%d" % r.get("downloads", 0), "<3 %d" % r.get("likes", 0), r.get("pipeline_tag") or "", (r.get("lastModified") or "")[:10]]))'
+}
+rows_files() {   # REPO [dataset]
+	k=$(kind_path "${2:-}")
+	api "$k/$1/tree/main?recursive=true" | json_rows \
+		'.[] | select(.type == "file") | [.path, (((.lfs.size // .size) // 0) | tostring), .path] | @tsv' \
+		'for r in d:
+    if r.get("type") == "file": print("\t".join([r["path"], str((r.get("lfs") or {}).get("size", r.get("size", 0))), r["path"]]))' \
+		| while IFS='	' read -r path size _; do printf '%s\t%8s  %s\n' "$path" "$(human "$size")" "$path"; done
+}
+total_size() {   # REPO [dataset] -> human total
+	k=$(kind_path "${2:-}")
+	api "$k/$1/tree/main?recursive=true" | json_rows \
+		'[.[] | select(.type == "file") | ((.lfs.size // .size) // 0)] | add // 0' \
+		'print(sum((r.get("lfs") or {}).get("size", r.get("size", 0)) for r in d if r.get("type") == "file"))' | { read -r n; human "${n:-0}"; }
+}
+
+# ---- actions -----------------------------------------------------------------------------------------------
+dl() {   # REPO KIND FILE...   (no FILE = the whole repo)
+	repo=$1; kind=$2; shift 2
+	if [ -n "$HF" ]; then
+		type=model; [ "$(kind_path "$kind")" = datasets ] && type=dataset
+		"$HF" download "$repo" "$@" --repo-type "$type"
+	else
+		have curl || die "no hf and no curl"
+		pre=; [ "$(kind_path "$kind")" = datasets ] && pre=datasets/   # models have no prefix in file URLs
+		base=$(basename -- "$repo")
+		[ $# -gt 0 ] || set -- $(rows_files "$repo" "$kind" | cut -f1)
+		t=$(tok)
+		for f in "$@"; do
+			mkdir -p "$base/$(dirname -- "$f")"
+			echo "  $f"
+			if [ -n "$t" ]; then curl -fL -C - -H "Authorization: Bearer $t" -o "$base/$f" "$HUB/$pre$repo/resolve/main/$f" || die "failed: $f"
+			else curl -fL -C - -o "$base/$f" "$HUB/$pre$repo/resolve/main/$f" || die "failed: $f"; fi
+		done
+		echo "downloaded into ./$base/ (install hf to use the shared cache)"
+	fi
+}
+cache_files() {   # DIRNAME... -> the files inside the newest snapshot of each
+	for b in "$@"; do
+		snap=$(ls -1dt "$CACHE/$b"/snapshots/*/ 2>/dev/null | head -n 1)
+		echo "== $b"; [ -n "$snap" ] && (cd "$snap" && find . -type l -o -type f | sed 's|^\./||' | sort)
+	done | { if have less; then less; else cat; fi; }
+}
+cache_rm() {   # DIRNAME...
+	for b in "$@"; do case $b in *--*) ;; *) echo "ezhf: refusing $b" >&2; return 1 ;; esac; done
+	printf 'delete %s from the cache? [y/N] ' "$*" >&2; read -r a </dev/tty
+	case $a in y | Y | yes | t | T | tak) for b in "$@"; do rm -rf -- "${CACHE:?}/$b" && echo "deleted $b"; done ;; *) echo cancelled ;; esac
+	printf 'press Enter ' >&2; read -r _ </dev/tty
+}
+web() { url=$HUB/$1; if have xdg-open; then xdg-open "$url" >/dev/null 2>&1 & elif have open; then open "$url"; else echo "$url"; fi; }
+
+case ${1:-} in
+	_rows)   shift; k=$1; shift; "rows_$k" "$@"; exit 0 ;;
+	_files)  shift; cache_files "$@"; exit 0 ;;
+	_rm)     shift; cache_rm "$@"; exit 0 ;;
+	_dir)    shift; d=$CACHE/$1; if have xdg-open; then xdg-open "$d" >/dev/null 2>&1 & else echo "$d"; fi; exit 0 ;;
+	_web)    shift; for r in "$@"; do web "$r"; done; exit 0 ;;
+	_dl)     shift; kind=$1; repo=$2; shift 2; dl "$repo" "$kind" "$@"; printf 'press Enter ' >&2; read -r _ </dev/tty; exit 0 ;;
+	_dlrepo) shift; kind=$1; shift; for r in "$@"; do dl "$r" "$kind"; done; printf 'press Enter ' >&2; read -r _ </dev/tty; exit 0 ;;
+	_ask)    shift; q=$(lt_input "search the Hub for") || exit 0; [ -n "$q" ] && exec "$SELF" search "$q" ;;
+	_repofiles) shift; exec "$SELF" files "$1" ;;
+esac
+
+view=${1:-cache}
+case $view in
+	cache)
+		LT_KEYS="enter:  !$SELF _files          # Files
+ctrl-x: !$SELF _rm             # Delete from cache
+ctrl-o: !$SELF _dir            # Open folder
+ctrl-s: >$SELF _ask            # Search the Hub
+ctrl-r: refresh                # Refresh"
+		export LT_KEYS
+		lt_select --mode select --refresh 0 --header "cache: $CACHE   (biggest first, space marks)" --prompt 'search> ' --nth 2,3,4 \
+			--seed "$SELF _rows cache" --keys - >/dev/null || true ;;
+	search)
+		q=${2:-}; [ -n "$q" ] || die "usage: ezhf search QUERY [--datasets]"
+		kind=model; [ "${3:-}" = --datasets ] && kind=dataset
+		LT_KEYS="enter:  >$SELF _repofiles         # Files
+ctrl-d: !$SELF _dlrepo $kind   # Download all
+ctrl-o: !$SELF _web            # Browser
+alt-b:  >$SELF cache           # Cache"
+		export LT_KEYS
+		lt_select --refresh 0 --header "Hub $kind search: $q   (most downloaded first)" --prompt 'filter> ' --nth 2,3,4,5,6 \
+			--seed "$SELF _rows search '$q' $kind" --keys - >/dev/null || true ;;
+	files)
+		repo=${2:-}; [ -n "$repo" ] || die "usage: ezhf files REPO [--dataset]"
+		kind=model; [ "${3:-}" = --dataset ] && kind=dataset
+		tot=$(total_size "$repo" "$kind" 2>/dev/null)
+		LT_KEYS="enter:  !$SELF _dl $kind $repo   # Download
+ctrl-d: !$SELF _dl $kind $repo   # Download
+alt-b:  >$SELF cache             # Cache"
+		export LT_KEYS
+		lt_select --mode select --refresh 0 --header "$repo   total ${tot:-?}   (space marks, Enter downloads)" --prompt 'filter> ' --nth 2 \
+			--seed "$SELF _rows files $repo $kind" --keys - >/dev/null || true ;;
+	get)
+		repo=${2:-}; [ -n "$repo" ] || die "usage: ezhf get REPO [FILE...] [--dataset]"; shift 2
+		kind=model; args=; for a in "$@"; do if [ "$a" = --dataset ]; then kind=dataset; else args="$args
+$a"; fi; done
+		IFS='
+'; set -- $args; unset IFS
+		dl "$repo" "$kind" "$@" ;;
+	-h | --help) sed -n '2,/^# <\/manwriter>/p' "$0" | sed 's/^# \{0,1\}//; /manwriter>/d' ;;
+	*) die "usage: ezhf [cache | search QUERY [--datasets] | files REPO [--dataset] | get REPO [FILE...]]" ;;
+esac

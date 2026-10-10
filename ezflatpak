@@ -1,0 +1,781 @@
+#!/bin/sh
+# <manwriter>
+# ezflatpak - terminal manager for Flatpak apps and their permissions, in
+# one tool, built on lib/lazytui.sh. It wraps the real flatpak, which it
+# finds in PATH skipping itself.
+#
+#   ezflatpak [apps | perms APP | global | audit | who KEY | APP-ID]
+#   ezflatpak allow|deny|default APP KEY...     scripting, no UI
+#   ezflatpak show APP|@global [modified]       the effective permissions as text
+#   ezflatpak export [FILE] | import FILE       copy your overrides out / back in
+#
+# Apps (the default view) lists what is installed. Arrows or Tab move,
+# space marks rows like nnn, / searches, and update / uninstall act on all
+# marked rows. Enter opens the permissions of the current app. The first row,
+# "All applications", is the global layer (like Flatseal): Enter opens the global
+# overrides; Uninstall / Update / Run do nothing useful on it.
+#
+# Permissions is Flatseal in the terminal. Every permission the app really
+# has is listed with its effective state, layered the way flatpak layers
+# them: the app's manifest, then your global overrides, then your overrides
+# for that app:
+#
+#   on   allowed        off   denied
+#   *    set by an override of this app      g   set by a global override
+#
+# Rows cover sockets, devices, shares, features, filesystems, persistent
+# dirs, environment variables and the D-Bus names, plus the usual
+# suspects the app doesn't mention. Broad ones that are on show in red.
+# Space marks rows; Enter toggles every marked row (or the current one).
+# Allow, deny and "default" (drop your override) all work on the layer you
+# are in, so denying something globally and re-allowing it for one app both
+# work - the two things Flatseal's users asked for most.
+#
+# Global is the same list for the "all applications" layer, i.e. plain
+# `flatpak override --user`. Everything is a per-user override, exactly
+# what Flatseal writes, and no manifest is ever touched.
+#
+# Beyond what Flatseal does:
+#   Portals    notifications, background, microphone, speakers, camera and location are rows too
+#              (the xdg-desktop-portal permission store); Flatseal can only edit them once the portal
+#              has stored something for the app, here they can be set any time.
+#   Audit      ALT-A: every app with a risk score (whole filesystem, session/system bus, all devices,
+#              sandbox escape via org.freedesktop.Flatpak, ...), riskiest first. CTRL-W: which apps
+#              have a given permission. Also `ezflatpak audit --plain` and `ezflatpak who KEY --plain`.
+#   Try once   ALT-T: run the app with the marked rows flipped, without saving anything.
+#   Bulk       ALT-P (in the apps list): allow / deny / drop one permission for all marked apps.
+#   Version    permissions the installed flatpak is too old to know are not listed.
+#   Scripts    allow / deny / default / show / export / import work without any UI.
+#
+# The lists refresh by themselves every REFRESH_MS milliseconds (top of
+# the script, or FLATPAK_REFRESH; 0 turns it off).
+#
+# @flag apps:installed apps (default)
+# @flag perms APP:permissions of an app (APP-ID alone works too)
+# @flag global:permissions of all apps at once
+# @flag ENTER:apps: open permissions, permissions: toggle marked rows
+# @flag CTRL-G:allow the marked rows
+# @flag CTRL-X:deny the marked rows
+# @flag CTRL-U:drop your override of the marked rows
+# @flag CTRL-N:add a permission that isn't listed
+# @flag CTRL-Z:reset every override of this layer (asks first)
+# @flag ALT-Z:undo the last change to this layer; up to 20 versions are kept in
+#             ~/.local/state/flatpak-tui/backups
+# @flag ALT-M:show only what is overridden
+# @flag ALT-G:switch to the global layer
+# @flag ALT-A:audit: risk score of every app; CTRL-W there: who has a permission
+# @flag ALT-T:run the app once with the marked rows flipped (not saved)
+# @flag ALT-P:apps: change one permission for all marked apps
+# @flag ALT-B:back to the app list
+# </manwriter>
+
+# ---- edit me ---------------------------------------------------------
+REFRESH_MS="${FLATPAK_REFRESH:-1500}"   # auto-refresh, milliseconds, 0 = off
+# ----------------------------------------------------------------------
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SELF=$HERE/$(basename -- "$0")
+# >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
+# _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
+# (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
+# (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
+_lt_hint() {
+	_lt_h=$1
+	while :; do
+		case $_lt_h in
+			ctrl-?*)  printf '\033[30;44m Ctrl \033[0m'; _lt_h=${_lt_h#ctrl-} ;;
+			alt-?*)   printf '\033[30;43m Alt \033[0m'; _lt_h=${_lt_h#alt-} ;;
+			shift-?*) printf '\033[30;42m Shift \033[0m'; _lt_h=${_lt_h#shift-} ;;
+			*) break ;;
+		esac
+	done
+	case $_lt_h in
+		?) _lt_h=$(printf %s "$_lt_h" | tr a-z A-Z) ;;
+		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
+		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
+		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
+	esac
+	printf '\033[7m %s \033[0m %s   ' "$_lt_h" "$2"
+}
+
+# _lt_trim STR -> STR without leading/trailing blanks
+_lt_trim() { printf %s "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# _lt_script FILE CMD -> FILE runs CMD "$@" (keeps quoting out of fzf binds)
+_lt_script() { printf '%s "$@"\n' "$2" >"$1"; }
+
+lt_confirm() {   # lt_confirm "question" -> 0 on y
+	printf '%s [y/N] ' "$1" >&2
+	read -r _lt_a || return 1
+	case $_lt_a in y | Y | yes | YES | t | T | tak) return 0 ;; *) return 1 ;; esac
+}
+
+lt_input() {   # lt_input "prompt" [default] -> stdout
+	printf '%s%s: ' "$1" "${2:+ [$2]}" >&2
+	read -r _lt_a || return 1
+	printf '%s\n' "${_lt_a:-${2:-}}"
+}
+
+lt_select() {
+	_lt_mode=raw _lt_refresh=${LT_REFRESH:-0} _lt_seed= _lt_more= _lt_reload= _lt_preview= _lt_keys= \
+	_lt_key=1 _lt_nth= _lt_header= _lt_prompt='> '
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--mode)    _lt_mode=$2;    shift 2 ;;
+			--seed)    _lt_seed=$2;    shift 2 ;;
+			--more)    _lt_more=$2;    shift 2 ;;
+			--refresh) _lt_refresh=$2; shift 2 ;;
+			--reload)  _lt_reload=$2;  shift 2 ;;
+			--preview) _lt_preview=$2; shift 2 ;;
+			--keys)    _lt_keys=$2;    shift 2 ;;
+			--key)     _lt_key=$2;     shift 2 ;;
+			--nth)     _lt_nth=$2;     shift 2 ;;
+			--header)  _lt_header=$2;  shift 2 ;;
+			--prompt)  _lt_prompt=$2;  shift 2 ;;
+			*) echo "lt_select: unknown arg $1" >&2; return 2 ;;
+		esac
+	done
+	case $_lt_refresh in '' | *[!0-9]*) echo "lt_select: --refresh wants milliseconds, got '$_lt_refresh'" >&2; return 2 ;; esac
+	case $_lt_mode in raw | select) ;; *) echo "lt_select: --mode must be raw or select" >&2; return 2 ;; esac
+
+	_lt_tmp=$(mktemp -d) || return 1
+	if [ -n "$_lt_seed" ]; then
+		_lt_script "$_lt_tmp/seed.sh" "$_lt_seed"
+	else
+		cat >"$_lt_tmp/list"
+		printf 'cat "%s/list"\n' "$_lt_tmp" >"$_lt_tmp/seed.sh"
+	fi
+
+	if ! command -v fzf >/dev/null 2>&1; then
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
+
+	TAB=$(printf '\t')
+	_lt_k="{+$_lt_key}"
+	set -- --delimiter="$TAB" --ansi --prompt="$_lt_prompt" --footer-border=none --layout=reverse-list
+	[ -n "$_lt_header" ] && set -- "$@" --header="$_lt_header"
+	[ -n "$_lt_nth" ] && set -- "$@" --with-nth="$_lt_nth"
+	if [ -n "$_lt_preview" ]; then
+		_lt_script "$_lt_tmp/preview.sh" "$_lt_preview"
+		set -- "$@" --preview="sh $_lt_tmp/preview.sh {$_lt_key}" \
+			--preview-window="${LT_PREVIEW_WINDOW:-down,60%,wrap}"
+	fi
+	_lt_start=
+	if [ -n "$_lt_more" ]; then
+		cat >"$_lt_tmp/more.sh" <<EOF
+out=\$(mktemp)
+$_lt_more > "\$out" 2>/dev/null || true
+if [ -s "\$out" ]; then
+	curl -s -XPOST "127.0.0.1:\$1" --data "reload(cat \$out; rm -f \$out)" >/dev/null 2>&1 || rm -f "\$out"
+else rm -f "\$out"; fi
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/more.sh \$FZF_PORT &"
+	fi
+	if [ "$_lt_refresh" -gt 0 ] && [ -z "$_lt_reload" ] && command -v curl >/dev/null 2>&1; then
+		# background loop: run the seed, post it to fzf only when it changed;
+		# it ends by itself once fzf's port stops answering
+		_lt_secs=$(awk -v ms="$_lt_refresh" 'BEGIN { if (ms < 50) ms = 50; printf "%.3f", ms / 1000 }')
+		cat >"$_lt_tmp/refresh.sh" <<EOF
+port=\$1; last=$_lt_tmp/last; new=$_lt_tmp/new
+sh $_lt_tmp/seed.sh >"\$last" 2>/dev/null
+while sleep $_lt_secs; do
+	[ -d $_lt_tmp ] || exit 0
+	sh $_lt_tmp/seed.sh >"\$new" 2>/dev/null || continue
+	cmp -s "\$last" "\$new" && continue
+	cp "\$new" "\$last"
+	curl -s -m 2 -XPOST "127.0.0.1:\$port" --data "reload-sync(cat $_lt_tmp/last)" >/dev/null 2>&1 || exit 0
+done
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
+		set -- "$@" --track --id-nth="$_lt_key"
+	fi
+	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
+	if [ -n "$_lt_reload" ]; then
+		printf '%s\n' "$_lt_reload" | sed 's/{q}/"$1"/g' >"$_lt_tmp/reload.sh"
+		set -- "$@" --bind="change:reload(sh $_lt_tmp/reload.sh {q})"
+	fi
+
+	# mode: select = no input line, space marks, / opens search
+	_lt_bar= _lt_ubar=
+	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
+	_lt_hints=
+	case $(fzf --version 2>/dev/null) in *-c\ *) _lt_hints=1 ;; esac
+	if [ "$_lt_mode" = select ]; then
+		set -- "$@" --multi --no-input \
+			--bind='space:toggle+down # mark,tab:down,btab:up,/:show-input # search' \
+			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	else
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint type filter)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	fi
+
+	# yaml key map -> binds + key bar
+	_lt_n=0
+	if [ -n "$_lt_keys" ]; then
+		[ "$_lt_keys" = - ] && printf '%s\n' "${LT_KEYS:-}" >"$_lt_tmp/keys" || cat "$_lt_keys" >"$_lt_tmp/keys"
+		while IFS= read -r _lt_line || [ -n "$_lt_line" ]; do
+			_lt_line=$(_lt_trim "$_lt_line")
+			case $_lt_line in '' | '#'*) continue ;; esac
+			# a line of just --- starts a new line in the key bar
+			[ "$_lt_line" = --- ] && { _lt_ubar="$_lt_ubar
+"; _lt_fresh=1; continue; }
+			_lt_kn=$(_lt_trim "${_lt_line%%:*}")
+			_lt_rest=${_lt_line#*:}
+			case $_lt_rest in
+				*' # '*) _lt_label=$(_lt_trim "${_lt_rest##* # }"); _lt_act=$(_lt_trim "${_lt_rest% # *}") ;;
+				*)       _lt_label=; _lt_act=$(_lt_trim "$_lt_rest") ;;
+			esac
+			_lt_n=$((_lt_n + 1))
+			_lt_reloadact="+reload(sh $_lt_tmp/seed.sh)"
+			case $_lt_act in
+				refresh)  _lt_bind="reload(sh $_lt_tmp/seed.sh)" ;;
+				quit)     _lt_bind=abort ;;
+				'!'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#!}"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)$_lt_reloadact" ;;
+				'>'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#>}"
+				          _lt_bind="become(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+				accept | select-all | deselect-all | toggle | toggle-all | first | last | up | down | page-up | page-down | abort | clear-query | show-input | hide-input)
+				          _lt_bind=$_lt_act ;;
+				*)        _lt_script "$_lt_tmp/a$_lt_n.sh" "$_lt_act"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+			esac
+			if [ -n "$_lt_hints" ] && [ -n "$_lt_label" ]; then set -- "$@" --bind="$_lt_kn:$_lt_bind # $_lt_label"
+			else set -- "$@" --bind="$_lt_kn:$_lt_bind"; fi
+			if [ -n "$_lt_label" ]; then
+				_lt_ubar="$_lt_ubar$(_lt_hint "$_lt_kn" "$_lt_label")"
+				_lt_fresh=
+			fi
+		done <"$_lt_tmp/keys"
+	fi
+	# defaults on line one, the key map's labels on line two
+	if [ -n "$_lt_hints" ]; then set -- "$@" --hints
+	else set -- "$@" --footer="$_lt_bar${_lt_ubar:+
+$_lt_ubar}"; fi
+
+	_lt_sel=$(sh "$_lt_tmp/seed.sh" | fzf "$@"); _lt_rc=$?
+	rm -rf "$_lt_tmp"
+	[ $_lt_rc -eq 0 ] || return 1
+	[ -n "$_lt_sel" ] && printf '%s\n' "$_lt_sel" | cut -f"$_lt_key"
+	return 0
+}
+
+# numbered prompt when fzf is missing
+_lt_fallback() {
+	sh "$_lt_tmp/seed.sh" >"$_lt_tmp/fb"
+	[ -s "$_lt_tmp/fb" ] || return 1
+	awk -F'\t' '{ printf "%3d) %s\n", NR, ($1 == "" ? $0 : $0) }' "$_lt_tmp/fb" | tr '\t' ' ' >&2
+	printf 'pick number%s, q to cancel: ' "$([ "$_lt_mode" = select ] && echo 's (space separated)')" >&2
+	read -r _lt_ans || return 1
+	case $_lt_ans in '' | q) return 1 ;; esac
+	for _lt_i in $_lt_ans; do sed -n "${_lt_i}p" "$_lt_tmp/fb"; done | cut -f"$_lt_key"
+}
+
+# lt_realbin NAME -> path of the real NAME in PATH, skipping this script
+# itself. For tools that wrap a program of the same name (a script called
+# docker or flatpak) so they never call themselves.
+lt_realbin() {
+	_lt_old=$IFS; IFS=:
+	for _lt_d in $PATH; do
+		IFS=$_lt_old
+		_lt_c=$_lt_d/$1
+		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && ! [ "$_lt_c" -ef "$0" ]; then printf '%s\n' "$_lt_c"; return 0; fi
+		IFS=:
+	done
+	IFS=$_lt_old
+	return 1
+}
+
+# <<< lazytui <<<
+FP=$(lt_realbin flatpak) || { echo "ezflatpak: the real flatpak was not found in PATH" >&2; exit 1; }
+flatpak() { "$FP" "$@"; }
+
+# permissions worth showing even when the app doesn't mention them:
+# KEY<TAB>description, KEY = kind=value (kind = the flatpak override option)
+catalog() {
+	# KEY <TAB> description <TAB> first flatpak version that knows it (empty = always); "broad" = shown in red when on
+	cat <<'EOF'
+socket=x11	X11 windowing (weak isolation)	0.4.0
+socket=wayland	Wayland windowing	0.4.0
+socket=fallback-x11	X11 only if no Wayland	0.11.1
+socket=inherit-wayland-socket	use the parent's Wayland socket	1.15.7
+socket=pulseaudio	sound	0.4.0
+socket=ssh-auth	SSH agent (broad)	0.99.1
+socket=gpg-agent	GPG agent (broad)	1.14.0
+socket=pcsc	smart cards	1.3.2
+socket=cups	printing	1.5.2
+socket=session-bus	whole session D-Bus (broad)	0.4.0
+socket=system-bus	whole system D-Bus (broad)	0.4.0
+share=network	network access	0.4.0
+share=ipc	shared memory with X11	0.4.0
+device=dri	GPU acceleration	0.4.0
+device=input	input devices (gamepads, ...)	1.15.6
+device=usb	USB devices (see --usb rules)	1.15.11
+device=kvm	virtualisation	0.6.12
+device=shm	/dev/shm	1.6.1
+device=all	all devices, e.g. webcam (broad)	0.6.6
+feature=bluetooth	bluetooth	0.11.8
+feature=devel	ptrace, perf (debuggers)	0.6.10
+feature=multiarch	programs from other architectures	0.6.12
+feature=canbus	CAN bus	1.0.3
+feature=per-app-dev-shm	own /dev/shm for this app	1.11.1
+filesystem=home	whole home directory (broad)	0.4.0
+filesystem=host	whole filesystem (broad)	0.4.0
+filesystem=host-os	system libraries, executables and static data (broad)	1.7.1
+filesystem=host-etc	system configuration (broad)	1.7.1
+filesystem=xdg-download	Downloads	0.4.0
+filesystem=xdg-documents	Documents	0.4.0
+filesystem=xdg-pictures	Pictures	0.4.0
+filesystem=xdg-music	Music	0.4.0
+filesystem=xdg-videos	Videos	0.4.0
+talk-name=org.freedesktop.Notifications	desktop notifications	0.4.0
+talk-name=org.freedesktop.secrets	keyring / secrets	0.4.0
+talk-name=org.freedesktop.Flatpak	run anything on the host: sandbox escape (broad)	1.0.0
+EOF
+}
+
+# catalog | _gate: drops what the installed flatpak is too old to know (Flatseal does the same)
+_gate() {
+	_cur=$("$FP" --version 2>/dev/null | sed 's/[^0-9.]//g'); [ -n "$_cur" ] || _cur=99
+	while IFS='	' read -r _k _d _min; do
+		if [ -z "$_min" ] || [ "$(printf '%s\n%s\n' "$_min" "$_cur" | sort -V | head -n 1)" = "$_min" ]; then
+			printf '%s\t%s\n' "$_k" "$_d"
+		fi
+	done
+}
+
+# Portal permissions (what Flatseal shows under "Portals"): they live in the xdg-desktop-portal permission store,
+# not in the override files, and are read and written with `flatpak permissions` / permission-set / permission-remove.
+# Unlike Flatseal this also works before the portal has stored anything for the app (it creates the entry).
+# KEY <TAB> description <TAB> table <TAB> id <TAB> allow values <TAB> deny values
+_portals() {
+	cat <<'EOF'
+portal=background/background	background: keep running without a window	background	background	yes	no
+portal=notifications/notification	notifications (portal)	notifications	notification	yes	no
+portal=devices/microphone	microphone (portal)	devices	microphone	yes	no
+portal=devices/speakers	speakers (portal)	devices	speakers	yes	no
+portal=devices/camera	camera (portal)	devices	camera	yes	no
+portal=location/location	location (portal)	location	location	EXACT 0	NONE 0
+EOF
+}
+
+# _portal_rows APP -> table rows for the portal permissions (nothing when the permission store is not running)
+_portal_rows() {
+	[ -z "${EZFP_NOPORTAL:-}" ] || return 0
+	flatpak permissions >/dev/null 2>&1 || return 0
+	_portals | while IFS='	' read -r key desc table id allow deny; do
+		cur=$(flatpak permissions "$table" 2>/dev/null | awk -F'\t' -v id="$id" -v app="$1" '$2 == id && $3 == app { print $4; exit }')
+		if [ -z "$cur" ]; then printf '%s\toff\t0\t%s (not set: the app is asked)\n' "$key" "$desc"
+		elif [ "${cur%%,*}" = "${allow%% *}" ]; then printf '%s\ton\t2\t%s\n' "$key" "$desc"
+		else printf '%s\toff\t2\t%s\n' "$key" "$desc"; fi
+	done
+}
+
+# _portal_set allow|deny|drop APP KEY
+_portal_set() {
+	set -- "$1" "$2" "$(_portals | awk -F'\t' -v k="$3" '$1 == k')"
+	[ -n "$3" ] || return 1
+	IFS='	' read -r _k _d _t _i _al _de <<EOF
+$3
+EOF
+	case $1 in
+		allow) flatpak permission-set "$_t" "$_i" "$2" $_al ;;
+		deny)  flatpak permission-set "$_t" "$_i" "$2" $_de ;;
+		drop)  flatpak permission-remove "$_t" "$_i" "$2" ;;
+	esac
+}
+
+# _table APP -> KEY<TAB>on|off<TAB>0|1|2<TAB>description: the effective
+# permissions, layered like flatpak does it - the app's manifest, then your
+# global overrides, then your overrides for the app. Column 3 says which
+# layer set it last: 0 manifest/default, 1 global, 2 the app itself. APP
+# @global shows just the global layer (as layer 2).
+_table() {
+	{
+		catalog | _gate | sed 's/^/C\t/'
+		if [ "$1" = @global ]; then
+			flatpak override --user --show 2>/dev/null | sed 's/^/O\t/'
+		else
+			flatpak info --show-metadata "$1" 2>/dev/null | sed 's/^/B\t/'
+			flatpak override --user --show 2>/dev/null | sed 's/^/G\t/'
+			flatpak override --user --show "$1" 2>/dev/null | sed 's/^/O\t/'
+		fi
+	} | awk -F'\t' '
+	function note(key, desc) { if (!(key in seen)) { seen[key] = 1; order[++n] = key } if (desc != "") d[key] = desc }
+	function set(src, key, on, desc) {
+		note(key, desc)
+		st[key] = on
+		if (src == "G") gv[key] = 1
+		else if (src == "O") ov[key] = 1
+	}
+	function kind(k) {
+		if (k == "sockets") return "socket"; if (k == "shared") return "share"
+		if (k == "devices") return "device"; if (k == "features") return "feature"
+		if (k == "filesystems") return "filesystem"; if (k == "persistent") return "persist"
+		return ""
+	}
+	function bus(sec, pol) {
+		p = (sec ~ /^System/) ? "system-" : ""
+		if (pol == "own") return p "own-name"
+		if (pol == "see") return p "see-name"
+		return p "talk-name"
+	}
+	$1 == "C" { note($2, $3); if (!($2 in st)) st[$2] = "off"; next }
+	{
+		line = $2
+		if (line ~ /^\[/) { sec = substr(line, 2, length(line) - 2); next }
+		i = index(line, "="); if (i == 0) next
+		k = substr(line, 1, i - 1); v = substr(line, i + 1); src = $1
+		if (sec == "Context") {
+			kd = kind(k); if (kd == "") next
+			m = split(v, t, ";")
+			for (j = 1; j <= m; j++) {
+				if (t[j] == "") continue
+				neg = (substr(t[j], 1, 1) == "!"); val = neg ? substr(t[j], 2) : t[j]
+				set(src, kd "=" val, neg ? "off" : "on", (src == "B") ? "(app)" : (src == "G") ? "(global)" : "(override)")
+			}
+		} else if (sec ~ /Bus Policy$/) {
+			if (v == "none") { key = bus(sec, "talk") "=" k; set(src, key, "off", (src == "G") ? "(global)" : "(override)") }
+			else { key = bus(sec, v) "=" k; set(src, key, "on", (src == "B") ? "(app)" : (src == "G") ? "(global)" : "(override)") }
+		} else if (sec == "Environment") {
+			key = "env=" k
+			set(src, key, (v == "" && src == "O") ? "off" : "on", "= " v)
+		}
+	}
+	END { for (i = 1; i <= n; i++) { k = order[i]; printf "%s\t%s\t%d\t%s\n", k, (k in st) ? st[k] : "off", (k in ov) ? 2 : (k in gv) ? 1 : 0, d[k] } }'
+	[ "$1" = @global ] || _portal_rows "$1"
+}
+
+# _rows APP [only] -> KEY<TAB>display for fzf: coloured state, layer marker
+# (* = this app's override, g = a global override), key, description.
+# "only" lists just what is overridden.
+_rows() {
+	_table "$1" | while IFS='	' read -r key st ov desc; do
+		[ "${2:-}" = only ] && [ "$ov" = 0 ] && continue
+		if [ "$st" = on ]; then s=$(printf '\033[32m on\033[0m'); else s=$(printf '\033[31moff\033[0m'); fi
+		case $ov in 2) mark='*' ;; 1) mark=g ;; *) mark=' ' ;; esac
+		case $desc in *broad*) [ "$st" = on ] && desc=$(printf '\033[1;31m%s\033[0m' "$desc") ;; esac
+		printf '%s\t%s%s %-40s %s\n' "$key" "$s" "$mark" "$key" "$desc"
+	done
+}
+
+# Every change first saves the layer it is about to change, so ^Z reset,
+# drop and mistakes can be taken back with Alt-Z (undo).
+_odir() { echo "${FLATPAK_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/flatpak}/overrides"; }
+_ofile() { if [ "$1" = @global ]; then echo "$(_odir)/global"; else echo "$(_odir)/$1"; fi; }
+_bdir() { echo "${XDG_STATE_HOME:-$HOME/.local/state}/flatpak-tui/backups/$(printf %s "$1" | tr -c 'A-Za-z0-9._-' _)"; }
+_backup() {
+	d=$(_bdir "$1"); mkdir -p "$d" || return 0
+	if [ "$1" = @global ]; then cur=$(flatpak override --user --show 2>/dev/null); else cur=$(flatpak override --user --show "$1" 2>/dev/null); fi
+	[ -n "$cur" ] || return 0
+	last=$(ls -1 "$d" 2>/dev/null | tail -n 1)
+	[ -n "$last" ] && [ "$(cat "$d/$last")" = "$cur" ] && return 0
+	printf '%s\n' "$cur" >"$d/$(date +%Y%m%d_%H%M%S_%N)"
+	ls -1 "$d" | head -n -20 | while read -r old; do rm -f "$d/$old"; done
+}
+_undo() {
+	d=$(_bdir "$1"); last=$(ls -1 "$d" 2>/dev/null | tail -n 1)
+	[ -n "$last" ] || { echo "ezflatpak: nothing to undo for $1" >&2; printf 'press Enter ' >&2; read -r _ </dev/tty; return 0; }
+	f=$(_ofile "$1"); mkdir -p "$(dirname "$f")"
+	cp "$d/$last" "$f.tmp.$$" && mv "$f.tmp.$$" "$f" && rm -f "$d/$last"
+	echo "restored the overrides of $1 from $last"
+}
+
+# _ov APP OPTION... -> flatpak override --user for one app, or globally for @global
+_ov() {
+	_a=$1; shift
+	_backup "$_a"
+	if [ "$_a" = @global ]; then flatpak override --user "$@"; else flatpak override --user "$@" "$_a"; fi
+}
+
+# _opts VERB KEY -> the flatpak override option that allows/denies KEY
+_opts() {
+	kind=${2%%=*}; val=${2#*=}
+	if [ "$1" = allow ]; then
+		case $kind in
+			feature) printf -- '--allow=%s' "$val" ;;
+			persist) printf -- '--persist=%s' "$val" ;;
+			env)     printf -- '--env=%s=%s' "$val" "${ENVVAL:-1}" ;;
+			*)       printf -- '--%s=%s' "$kind" "$val" ;;
+		esac
+	else
+		case $kind in
+			share)              printf -- '--unshare=%s' "$val" ;;
+			feature)            printf -- '--disallow=%s' "$val" ;;
+			env)                printf -- '--unset-env=%s' "$val" ;;
+			talk-name)          printf -- '--no-talk-name=%s' "$val" ;;
+			system-talk-name)   printf -- '--system-no-talk-name=%s' "$val" ;;
+			own-name | system-own-name | see-name | system-see-name | persist)
+				echo "ezflatpak: $kind can't be denied one by one - use ^U to drop its override or ^Z to reset" >&2
+				return 1 ;;
+			*)                  printf -- '--no%s=%s' "$kind" "$val" ;;
+		esac
+	fi
+}
+
+# _apply VERB APP KEY... -> one flatpak override call per key
+_apply() {
+	verb=$1; app=$2; shift 2
+	for key in "$@"; do
+		case $key in portal=*) _portal_set "$verb" "$app" "$key" || echo "ezflatpak: failed for $key" >&2; continue ;; esac
+		opt=$(_opts "$verb" "$key") || continue
+		_ov "$app" "$opt" || echo "ezflatpak: failed for $key" >&2
+	done
+}
+
+# _drop APP KEY... -> remove the keys from the user override file, so the
+# app's own default applies again
+_drop() {
+	app=$1; shift
+	_backup "$app"
+	f="${FLATPAK_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/flatpak}/overrides/$app"
+	[ "$app" = @global ] && f="${f%/@global}/global"
+	[ -f "$f" ] || return 0
+	tmp=$(mktemp) || return 1
+	awk -v keys="$(printf '%s\n' "$@")" '
+	BEGIN { n = split(keys, kk, "\n"); for (i = 1; i <= n; i++) drop[kk[i]] = 1 }
+	function ctx(k) {
+		if (k == "sockets") return "socket"; if (k == "shared") return "share"
+		if (k == "devices") return "device"; if (k == "features") return "feature"
+		if (k == "filesystems") return "filesystem"; if (k == "persistent") return "persist"
+		return ""
+	}
+	function busk(sec, pol) { p = (sec ~ /^System/) ? "system-" : ""; return p ((pol == "own") ? "own-name" : (pol == "see") ? "see-name" : "talk-name") }
+	/^\[/ { sec = substr($0, 2, length($0) - 2); print; next }
+	{
+		i = index($0, "="); if (i == 0) { print; next }
+		k = substr($0, 1, i - 1); v = substr($0, i + 1)
+		if (sec == "Context" && ctx(k) != "") {
+			m = split(v, t, ";"); out = ""
+			for (j = 1; j <= m; j++) {
+				if (t[j] == "") continue
+				val = (substr(t[j], 1, 1) == "!") ? substr(t[j], 2) : t[j]
+				if (!((ctx(k) "=" val) in drop)) out = out t[j] ";"
+			}
+			if (out != "") print k "=" out
+		} else if (sec ~ /Bus Policy$/) {
+			if (!((busk(sec, v) "=" k) in drop) && !((busk(sec, "talk") "=" k) in drop)) print
+		} else if (sec == "Environment") {
+			if (!(("env=" k) in drop)) print
+		} else print
+	}' "$f" >"$tmp" && cat "$tmp" >"$f"
+	rm -f "$tmp"
+}
+
+# ---- across all apps (Flatseal shows one app at a time) -------------------------------------------------
+# _audit_rows -> score TAB app TAB name TAB what is broad, riskiest first. The score adds up the broad
+# permissions an app has in effect (manifest + global + own overrides).
+_audit_rows() {
+	flatpak list --app --columns=application,name | while IFS='	' read -r app name; do
+		EZFP_NOPORTAL=1 _table "$app" | awk -F'\t' -v app="$app" -v name="$name" '
+		BEGIN {
+			w["filesystem=host"] = 10;                  l["filesystem=host"] = "whole filesystem"
+			w["talk-name=org.freedesktop.Flatpak"] = 10; l["talk-name=org.freedesktop.Flatpak"] = "sandbox escape"
+			w["socket=session-bus"] = 8;                l["socket=session-bus"] = "session bus"
+			w["socket=system-bus"] = 8;                 l["socket=system-bus"] = "system bus"
+			w["device=all"] = 6;                        l["device=all"] = "all devices"
+			w["filesystem=home"] = 5;                   l["filesystem=home"] = "home"
+			w["filesystem=host-os"] = 5;                l["filesystem=host-os"] = "host os"
+			w["filesystem=host-etc"] = 4;               l["filesystem=host-etc"] = "host etc"
+			w["socket=ssh-auth"] = 4;                   l["socket=ssh-auth"] = "ssh agent"
+			w["socket=gpg-agent"] = 3;                  l["socket=gpg-agent"] = "gpg agent"
+			w["feature=devel"] = 3;                     l["feature=devel"] = "ptrace"
+			w["socket=x11"] = 2;                        l["socket=x11"] = "x11"
+		}
+		$2 == "on" {
+			k = $1
+			if (k in w) { score += w[k]; list = list (list == "" ? "" : ", ") l[k] }
+			else if (k ~ /^filesystem=/ && k !~ /^filesystem=xdg-/) { paths++; score += 2 }
+		}
+		END {
+			if (paths) list = list (list == "" ? "" : ", ") paths " extra path" (paths > 1 ? "s" : "")
+			printf "%d\t%s\t%s\t%s\n", score, app, name, list
+		}'
+	done | sort -t "$(printf '\t')" -k1,1nr -k3,3
+}
+
+# _audit_view -> rows for the picker: APP TAB coloured line
+_audit_view() {
+	_audit_rows | while IFS='	' read -r score app name list; do
+		if [ "$score" -ge 15 ]; then c='1;31'; elif [ "$score" -ge 6 ]; then c='33'; else c='32'; fi
+		printf '%s\t\033[%sm%3d\033[0m  %-30s %s\n' "$app" "$c" "$score" "$name" "$list"
+	done
+}
+
+# _who_rows KEY -> the apps that have KEY in effect, and on which layer it was set
+_who_rows() {
+	flatpak list --app --columns=application,name | while IFS='	' read -r app name; do
+		EZFP_NOPORTAL=1 _table "$app" | awk -F'\t' -v k="$1" -v app="$app" -v name="$name" \
+			'$1 == k && $2 == "on" { printf "%s\t%-30s %s\n", app, name, ($3 == 2 ? "(its own override)" : $3 == 1 ? "(global override)" : "(manifest)") }'
+	done
+}
+
+case ${1:-} in
+	# scripting: ezflatpak allow|deny|default APP KEY...   ezflatpak show APP [modified]
+	allow | deny)
+		verb=$1; app=${2:-}
+		[ -n "$app" ] && [ $# -ge 3 ] || { echo "usage: ezflatpak $verb APP KEY...   (KEY like share=network, filesystem=home, portal=notifications/notification)" >&2; exit 2; }
+		shift 2; _apply "$verb" "$app" "$@"; exit 0 ;;
+	default)
+		app=${2:-}; [ -n "$app" ] && [ $# -ge 3 ] || { echo "usage: ezflatpak default APP KEY...   (drops your override)" >&2; exit 2; }
+		shift; exec "$SELF" _drop "$@" ;;
+	show)
+		app=${2:-}; [ -n "$app" ] || { echo "usage: ezflatpak show APP|@global [modified]" >&2; exit 2; }
+		_table "$app" | awk -F'\t' -v only="${3:-}" '
+			only == "modified" && $3 == 0 { next }
+			{ printf "%-3s %s %-46s %s\n", $2, ($3 == 2 ? "*" : $3 == 1 ? "g" : " "), $1, $4 }'
+		exit 0 ;;
+	# a copy of every override you set (they are plain files), and the way back
+	export)
+		out=${2:-ezflatpak-overrides-$(date +%Y%m%d).tar}
+		tar -cf "$out" -C "$(_odir)/.." overrides && echo "wrote $out"; exit 0 ;;
+	import)
+		in=${2:-}; [ -f "$in" ] || { echo "usage: ezflatpak import FILE   (a file made by ezflatpak export)" >&2; exit 2; }
+		lt_confirm "replace ALL your overrides with the ones in $in? (a backup tar is written first)" || exit 0
+		bak=ezflatpak-overrides-before-import-$(date +%Y%m%d%H%M%S).tar
+		tar -cf "$bak" -C "$(_odir)/.." overrides 2>/dev/null && echo "backup: $bak"
+		tar -xf "$in" -C "$(_odir)/.." && echo "imported $in"; exit 0 ;;
+	# run the app once with the marked rows flipped, nothing is saved
+	_try)
+		app=$2; shift 2; _n=$#
+		while [ "$_n" -gt 0 ]; do
+			_k=$1; shift; _n=$((_n - 1))
+			case $_k in portal=*) continue ;; esac
+			_cur=$(_table "$app" | awk -F'\t' -v k="$_k" '$1 == k { print $2 }')
+			if [ "$_cur" = on ]; then _v=deny; else _v=allow; fi
+			_o=$(_opts "$_v" "$_k") || continue
+			set -- "$@" "$_o"
+		done
+		[ $# -gt 0 ] || { printf 'nothing to flip. press Enter ' >&2; read -r _ </dev/tty; exit 0; }
+		echo "running $app once with: $*   (not saved)"
+		setsid -f "$FP" run "$@" "$app" </dev/null >/dev/null 2>&1
+		sleep 1; exit 0 ;;
+	# change one permission for every marked app at once
+	_bulk)
+		[ $# -gt 1 ] || { printf 'mark apps with Space first. press Enter ' >&2; read -r _ </dev/tty; exit 0; }
+		shift
+		_v=$(printf '%s\n' allow deny default | lt_select --header "$# app(s): what to do" --prompt 'do> ') || exit 0
+		_k=$(catalog | _gate | lt_select --header "$_v for $# app(s)" --prompt 'permission> ' --nth 1,2) || exit 0
+		_k=${_k%%	*}
+		lt_confirm "$_v $_k for $# app(s)?" || exit 0
+		for _a in "$@"; do
+			if [ "$_v" = default ]; then "$SELF" _drop "$_a" "$_k"; else _apply "$_v" "$_a" "$_k"; fi
+		done
+		exit 0 ;;
+	_audit) _audit_view; exit 0 ;;
+	_who)   shift; _who_rows "$1"; exit 0 ;;
+	_whopick)
+		key=$(catalog | _gate | lt_select --header 'which apps have ...' --prompt 'permission> ' --nth 1,2) || exit 0
+		exec "$SELF" who "$key" ;;
+	_rows)   shift; _rows "$@"; exit 0 ;;
+	# first row = the global layer ("All applications", like Flatseal), then every installed app
+	_approws) printf '@global\tAll applications\t(global overrides)\t\n'
+		flatpak list --app --columns=application,name,version,origin; exit 0 ;;
+	_preview) shift
+		if [ "$1" = @global ]; then
+			printf 'All applications\n\nGlobal overrides apply to every app; an app can still override them\nfor itself. Enter opens them.\n\nCurrent global overrides:\n\n'
+			flatpak override --user --show 2>/dev/null
+		else flatpak info "$1"; fi
+		exit 0 ;;
+	_table)  shift; _table "$@"; exit 0 ;;
+	_allow | _deny) verb=${1#_}; shift; _apply "$verb" "$@"; exit 0 ;;
+	_toggle)
+		app=$2; shift 2
+		for key in "$@"; do
+			cur=$(_table "$app" | awk -F'\t' -v k="$key" '$1 == k { print $2 }')
+			if [ "$cur" = on ]; then _apply deny "$app" "$key"; else _apply allow "$app" "$key"; fi
+		done
+		exit 0 ;;
+	_drop)   shift; _dapp=$1; shift
+		# portal keys are removed from the permission store, the rest is edited in the override file
+		_n=$#
+		while [ "$_n" -gt 0 ]; do
+			_k=$1; shift; _n=$((_n - 1))
+			case $_k in portal=*) _portal_set drop "$_dapp" "$_k" ;; *) set -- "$@" "$_k" ;; esac
+		done
+		[ $# -eq 0 ] || _drop "$_dapp" "$@"
+		exit 0 ;;
+	_undo)   _undo "$2"; exit 0 ;;
+	_add)
+		app=$2
+		kind=$(printf '%s\n' filesystem env talk-name own-name system-talk-name persist socket device share feature \
+			| lt_select --header "add to $app" --prompt 'kind> ') || exit 0
+		case $kind in
+			filesystem) hint='path, e.g. ~/Games, /mnt/data, xdg-download, home:ro' ;;
+			env)        hint='variable name' ;;
+			*-name)     hint='bus name, e.g. org.freedesktop.Flatpak' ;;
+			persist)    hint='dir under home, e.g. .mozilla' ;;
+			*)          hint='name' ;;
+		esac
+		val=$(lt_input "$kind ($hint)") || exit 0
+		[ -n "$val" ] || exit 0
+		if [ "$kind" = env ]; then ENVVAL=$(lt_input "value of $val") || exit 0; export ENVVAL; fi
+		_apply allow "$app" "$kind=$val"
+		exit 0 ;;
+	_reset)
+		app=$2
+		lt_confirm "reset ALL overrides of $app?" && _ov "$app" --reset
+		exit 0 ;;
+esac
+
+
+view=${1:-apps}
+mode=${2:-}
+case $view in
+	apps)
+		LT_KEYS="enter:  >$SELF perms      # Permissions
+alt-g:  >$SELF global             # Global
+alt-a:  >$SELF audit              # Audit
+alt-p:  !$SELF _bulk              # Permission for marked apps
+alt-r:  >sh -c 'exec \"$FP\" run \"\$1\"' _   # Run
+ctrl-u: !$FP update               # Update
+ctrl-a: !sh -c '$FP update'       # Update all
+ctrl-d: !$FP uninstall            # Uninstall
+ctrl-r: refresh                   # Refresh"
+		export LT_KEYS
+		lt_select --mode select --refresh "$REFRESH_MS" --header 'Flatpak apps' --prompt 'search> ' --nth 2,3,4 \
+			--seed "$SELF _approws" --preview "$SELF _preview" --keys - >/dev/null || true
+		exit 0 ;;
+	audit)
+		if [ "${2:-}" = --plain ]; then _audit_rows | awk -F'\t' '{ printf "%3d  %-42s %-28s %s\n", $1, $2, $3, $4 }'; exit 0; fi
+		LT_KEYS="enter:  >$SELF perms      # Permissions
+ctrl-w: >$SELF _whopick          # Who has ...
+ctrl-r: refresh                   # Refresh
+alt-b:  >$SELF apps               # Apps"
+		export LT_KEYS
+		lt_select --refresh 0 --header 'audit: risk score of every app (red >=15, yellow >=6); broad = whole filesystem/home, buses, all devices, ...' \
+			--prompt 'search> ' --nth 2 --seed "$SELF _audit" --keys - >/dev/null || true
+		exit 0 ;;
+	who)
+		key=${2:-}; [ -n "$key" ] || { echo "usage: ezflatpak who KEY   (e.g. share=network, filesystem=home)" >&2; exit 2; }
+		if [ "${3:-}" = --plain ]; then _who_rows "$key" | cut -f2-; exit 0; fi
+		LT_KEYS="enter:  >$SELF perms      # Permissions
+alt-b:  >$SELF audit              # Audit"
+		export LT_KEYS
+		lt_select --refresh 0 --header "apps that have $key" --prompt 'search> ' --nth 2 \
+			--seed "$SELF _who $key" --keys - >/dev/null || true
+		exit 0 ;;
+	perms) app=${2:-}; mode=${3:-}
+		[ -n "$app" ] || { echo "usage: ezflatpak perms APP-ID" >&2; exit 2; } ;;
+	global) app=@global; mode=${2:-} ;;
+	*.*)    app=$view; mode=${2:-} ;;
+	*)      echo "usage: ezflatpak [apps | perms APP | global | audit [--plain] | who KEY [--plain] | APP-ID]" >&2; exit 2 ;;
+esac
+
+case $mode in only) other=all; mlabel='Show all' ;; *) other=only; mlabel='Only modified' ;; esac
+[ "$app" = @global ] && title='all applications (global overrides)' || title=$app
+LT_KEYS="enter:  !$SELF _toggle $app   # Toggle
+ctrl-g: !$SELF _allow $app     # Allow
+ctrl-x: !$SELF _deny $app      # Deny
+ctrl-u: !$SELF _drop $app      # Default
+ctrl-n: !$SELF _add $app       # Add
+ctrl-z: !$SELF _reset $app     # Reset all
+alt-t:  !$SELF _try $app       # Try once (not saved)
+alt-z:  !$SELF _undo $app      # Undo
+---
+alt-m:  >$SELF $( [ "$app" = @global ] && echo global || echo perms $app ) $other   # $mlabel
+alt-g:  >$SELF global          # Global layer
+alt-b:  >$SELF apps            # Apps"
+export LT_KEYS
+lt_select --mode select --refresh "$REFRESH_MS" --header "permissions: $title   (on/off = effective, * this layer, g global)" \
+	--prompt 'search> ' --nth 2 --seed "$SELF _rows $app $mode" --keys - >/dev/null || true

@@ -1,0 +1,168 @@
+#!/bin/sh
+# <manwriter>
+# refreshfork - bring your forks up to date with the projects they were
+# forked from, showing what would change and asking first.
+#
+#   refreshfork [-n] [-y] [DIR...]
+#
+# For every git repo it fetches the "upstream" remote, compares your
+# current branch with the same branch upstream (or upstream's default
+# branch when it has none) and, when upstream is ahead, prints the new
+# commits and a diffstat and asks:
+#
+#   y  update now       n  skip       d  read the full diff, then ask again
+#   q  stop (skips the remaining repos)
+#
+# Updating fast-forwards when you have no commits of your own, otherwise it
+# uses METHOD (rebase by default). A failed rebase or merge is aborted, so
+# a repo is never left half-updated; a repo with uncommitted changes is
+# skipped. Afterwards you are asked whether to push to your fork (origin);
+# after a rebase that needs --force-with-lease, which is asked separately.
+#
+# With no DIR it looks for repos under DIRS (top of the script). A repo
+# with no "upstream" remote is checked against GitHub: if origin is a
+# fork, gh finds the parent and the remote is added for you. Repos that
+# aren't forks are ignored. Without a terminal, or with -n, it only
+# shows what is new.
+#
+# The settings at the top (DIRS, METHOD, PUSH, LOG_LINES) each have a
+# REFRESHFORK_* environment override.
+#
+# @flag -n:only show what is new, change nothing
+# @flag -y:update and push without asking
+# @flag DIR:repo to refresh instead of scanning DIRS
+# </manwriter>
+
+# ---- edit me ---------------------------------------------------------
+DIRS="${REFRESHFORK_DIRS:-$HOME/.dotfiles/forked $HOME/dev $HOME/dev/repos}"  # searched for repos
+DEPTH="${REFRESHFORK_DEPTH:-3}"                # how deep below DIRS to look
+METHOD="${REFRESHFORK_METHOD:-rebase}"         # your own commits: rebase | merge | ff (refuse)
+PUSH="${REFRESHFORK_PUSH:-ask}"                # push to your fork afterwards: ask | yes | no
+LOG_LINES="${REFRESHFORK_LOG:-25}"             # new commits listed before "...and N more"
+# ----------------------------------------------------------------------
+
+export GIT_PAGER=cat
+ASSUME= DRY=
+while [ $# -gt 0 ]; do
+	case $1 in
+		-n) DRY=1; shift ;;
+		-y) ASSUME=1; shift ;;
+		-h | --help) sed -n '2,/^# <\/manwriter>/p' "$0" | sed 's/^# \{0,1\}//; /manwriter>/d'; exit 0 ;;
+		-*) echo "refreshfork: unknown option $1" >&2; exit 2 ;;
+		*) break ;;
+	esac
+done
+[ -t 0 ] || [ -n "$ASSUME" ] || DRY=1
+case $METHOD in rebase | merge | ff) ;; *) echo "refreshfork: METHOD must be rebase, merge or ff" >&2; exit 2 ;; esac
+command -v git >/dev/null 2>&1 || { echo "refreshfork: git not found" >&2; exit 1; }
+
+if [ -t 1 ]; then B=$(printf '\033[1m'); G=$(printf '\033[32m'); Y=$(printf '\033[33m'); R=$(printf '\033[31m'); Z=$(printf '\033[0m'); else B= G= Y= R= Z=; fi
+COLOR=never; [ -t 1 ] && COLOR=always
+
+UPDATED=0 CURRENT=0 SKIPPED=0 FAILED=0 QUIT=
+
+# ask "question" "letters" -> prints the letter; -y answers the first
+ask() {
+	[ -n "$ASSUME" ] && { printf %s "${2%"${2#?}"}"; return; }
+	printf '%s [%s] ' "$1" "$2" >&2
+	read -r a </dev/tty || a=q
+	a=$(printf %s "$a" | cut -c1 | tr A-Z a-z)
+	printf %s "$a"
+}
+
+# ensure_upstream DIR: make sure a remote called upstream exists
+ensure_upstream() {
+	git -C "$1" remote get-url upstream >/dev/null 2>&1 && return 0
+	origin=$(git -C "$1" remote get-url origin 2>/dev/null) || return 1
+	case $origin in *github.com*) ;; *) return 1 ;; esac
+	command -v gh >/dev/null 2>&1 || return 1
+	slug=${origin#*github.com[:/]}; slug=${slug%.git}
+	parent=$(gh repo view "$slug" --json isFork,parent -q 'select(.isFork) | .parent.owner.login + "/" + .parent.name' 2>/dev/null) || return 1
+	[ -n "$parent" ] || return 1
+	case $origin in http*) url="https://github.com/$parent.git" ;; *) url="git@github.com:$parent.git" ;; esac
+	git -C "$1" remote add upstream "$url" || return 1
+	ADDED="  added remote upstream = $url"
+}
+
+refresh_one() {
+	dir=$1; name=$(basename -- "$dir")
+	git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || { echo "${Y}$name: not a git repo${Z}"; SKIPPED=$((SKIPPED + 1)); return; }
+	ensure_upstream "$dir" || return 0    # not a fork: stay quiet
+	echo "${B}$name${Z}"; [ -n "${ADDED:-}" ] && { echo "$ADDED"; ADDED=; }
+	br=$(git -C "$dir" branch --show-current)
+	[ -n "$br" ] || { echo "  detached HEAD, skipped"; SKIPPED=$((SKIPPED + 1)); return; }
+	git -C "$dir" fetch -q upstream 2>/dev/null || { echo "  ${R}fetch from upstream failed${Z}"; FAILED=$((FAILED + 1)); return; }
+	if git -C "$dir" rev-parse -q --verify "refs/remotes/upstream/$br" >/dev/null; then
+		ref=upstream/$br
+	else
+		git -C "$dir" remote set-head upstream -a >/dev/null 2>&1
+		ref=$(git -C "$dir" symbolic-ref -q --short refs/remotes/upstream/HEAD) || { echo "  no upstream branch to compare with"; SKIPPED=$((SKIPPED + 1)); return; }
+	fi
+	behind=$(git -C "$dir" rev-list --count "$br..$ref")
+	ahead=$(git -C "$dir" rev-list --count "$ref..$br")
+	if [ "$behind" -eq 0 ]; then
+		echo "  ${G}up to date${Z} with $ref${ahead:+ (your branch is $ahead ahead)}"
+		CURRENT=$((CURRENT + 1)); return
+	fi
+	echo "  $br is ${Y}$behind behind${Z} $ref, $ahead ahead of it"
+
+	while :; do
+		git -C "$dir" log --no-decorate --color=$COLOR --format='  %C(yellow)%h%C(reset) %s %C(dim)(%an, %ar)%C(reset)' -n "$LOG_LINES" "$br..$ref"
+		[ "$behind" -gt "$LOG_LINES" ] && echo "  ...and $((behind - LOG_LINES)) more"
+		git -C "$dir" diff --stat=100 --color=$COLOR "$br...$ref" | sed 's/^/  /'
+		[ -n "$DRY" ] && { SKIPPED=$((SKIPPED + 1)); return; }
+		case $(ask "  update $name?" "y/n/d/q") in
+			y) break ;;
+			d) git -C "$dir" diff --color=always "$br...$ref" | ${PAGER:-less -R} ;;
+			q) QUIT=1; SKIPPED=$((SKIPPED + 1)); return ;;
+			*) SKIPPED=$((SKIPPED + 1)); return ;;
+		esac
+	done
+
+	if [ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]; then
+		echo "  ${R}uncommitted changes in $name - commit or stash them first, skipped${Z}"
+		FAILED=$((FAILED + 1)); return
+	fi
+	if [ "$ahead" -eq 0 ]; then
+		git -C "$dir" merge --ff-only -q "$ref" >/dev/null || { echo "  ${R}fast-forward failed${Z}"; FAILED=$((FAILED + 1)); return; }
+	else
+		case $METHOD in
+			rebase) git -C "$dir" rebase "$ref" >/dev/null 2>&1 || { git -C "$dir" rebase --abort >/dev/null 2>&1
+				echo "  ${R}rebase of your $ahead commit(s) conflicts - aborted, nothing changed${Z}"; FAILED=$((FAILED + 1)); return; } ;;
+			merge)  git -C "$dir" merge --no-edit -q "$ref" >/dev/null 2>&1 || { git -C "$dir" merge --abort >/dev/null 2>&1
+				echo "  ${R}merge conflicts - aborted, nothing changed${Z}"; FAILED=$((FAILED + 1)); return; } ;;
+			ff)     echo "  ${Y}you have $ahead commit(s) of your own and METHOD=ff - skipped${Z}"; SKIPPED=$((SKIPPED + 1)); return ;;
+		esac
+	fi
+	echo "  ${G}updated to $(git -C "$dir" rev-parse --short HEAD)${Z}"
+	UPDATED=$((UPDATED + 1))
+
+	git -C "$dir" remote get-url origin >/dev/null 2>&1 || return
+	case $PUSH in
+		no) return ;;
+		yes) p=y ;;
+		*) p=$(ask "  push $br to your fork (origin)?" "y/n") ;;
+	esac
+	[ "$p" = y ] || return
+	if git -C "$dir" push -q origin "$br" 2>/dev/null; then echo "  ${G}pushed${Z}"
+	elif [ "$ahead" -gt 0 ] && [ "$METHOD" = rebase ] && [ "$(ask "  history was rewritten; force-push with --force-with-lease?" "y/n")" = y ]; then
+		git -C "$dir" push -q --force-with-lease origin "$br" && echo "  ${G}pushed (forced)${Z}" || echo "  ${R}push failed${Z}"
+	else echo "  ${R}push failed or declined${Z}"; fi
+}
+
+if [ $# -gt 0 ]; then
+	for d in "$@"; do [ -n "$QUIT" ] || refresh_one "$d"; done
+else
+	if [ -d "$(pwd)/.git" ] && [ -z "${REFRESHFORK_DIRS:-}" ] && [ "$PWD" != "$HOME" ]; then
+		refresh_one "$PWD"
+	else
+		for root in $DIRS; do
+			[ -d "$root" ] || continue
+			find "$root" -maxdepth "$DEPTH" -name .git -prune -print 2>/dev/null | sort | while read -r g; do echo "${g%/.git}"; done
+		done >"${TMPDIR:-/tmp}/refreshfork.$$"
+		while read -r repo; do [ -n "$QUIT" ] || refresh_one "$repo"; done <"${TMPDIR:-/tmp}/refreshfork.$$"
+		rm -f "${TMPDIR:-/tmp}/refreshfork.$$"
+	fi
+fi
+echo "${B}done:${Z} $UPDATED updated, $CURRENT current, $SKIPPED skipped, $FAILED failed"
+[ "$FAILED" -eq 0 ]
