@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# tos - TempleOS in QEMU: downloads the official ISO, makes a disk, boots it.
+# TempleOS installs itself to the virtual disk on first boot (it's a
+# single-floppy-sized OS, no real "build" step beyond that) - after the
+# first run has finished installing, later `tos run`s boot straight off
+# the disk image without the ISO attached.
+#
+#   tos             download (if needed) + create disk (if needed) + run
+#   tos run         just run (no download/create, fails if missing)
+#   tos info        show detected paths/sizes
+#   tos clean       delete the disk image (keeps the downloaded ISO)
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DATA_HOME=${TOS_HOME:-$ROOT/.tos}
+ISO_URL=${TOS_ISO_URL:-https://templeos.org/Downloads/TempleOS.ISO}
+ISO=${TOS_ISO:-$DATA_HOME/TempleOS.ISO}
+DISK=${TOS_DISK:-$DATA_HOME/disk.img}
+DISK_SIZE=${TOS_DISK_SIZE:-64M}   # real TempleOS installs fit well under this
+RAM=${TOS_RAM:-256}               # MiB - TempleOS wants 256 or less for some versions' memory manager
+
+say() { printf '\033[36m>>\033[0m %s\n' "$*"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "tos: need '$1' on PATH" >&2; exit 1; }; }
+
+fetch_iso() {
+	[ -f "$ISO" ] && { say "ISO already at $ISO"; return 0; }
+	need curl
+	mkdir -p "$DATA_HOME"
+	say "downloading TempleOS ISO from $ISO_URL"
+	curl -fL --retry 3 -o "$ISO.part" "$ISO_URL"
+	mv "$ISO.part" "$ISO"
+	say "saved to $ISO"
+}
+
+make_disk() {
+	[ -f "$DISK" ] && { say "disk already at $DISK"; return 0; }
+	need qemu-img
+	mkdir -p "$DATA_HOME"
+	qemu-img create -f raw "$DISK" "$DISK_SIZE" >/dev/null
+	say "created blank disk: $DISK ($DISK_SIZE)"
+}
+
+run_vm() {
+	need qemu-system-x86_64
+	local extra=()
+	# first boot (disk still has no install on it) needs the ISO attached
+	# and set to boot first; once installed, boot straight from the disk.
+	if [ ! -s "$DISK" ] || [ "$(stat -c%s "$DISK" 2>/dev/null || echo 0)" -le 65536 ]; then
+		extra=(-cdrom "$ISO" -boot d)
+	fi
+	say "booting ($RAM MiB RAM, disk=$DISK)"
+	qemu-system-x86_64 \
+		-m "$RAM" \
+		-hda "$DISK" \
+		"${extra[@]}"
+}
+
+case "${1:-}" in
+'' )
+	fetch_iso
+	make_disk
+	run_vm
+	;;
+run)
+	[ -f "$ISO" ] || { echo "tos: no ISO at $ISO - run 'tos' once first" >&2; exit 1; }
+	[ -f "$DISK" ] || { echo "tos: no disk at $DISK - run 'tos' once first" >&2; exit 1; }
+	run_vm
+	;;
+info)
+	echo "ISO:  $ISO $([ -f "$ISO" ] && echo "($(du -h "$ISO" | cut -f1))" || echo "(missing)")"
+	echo "disk: $DISK $([ -f "$DISK" ] && echo "($(du -h "$DISK" | cut -f1))" || echo "(missing)")"
+	echo "RAM:  ${RAM}MiB"
+	;;
+clean)
+	rm -f "$DISK"
+	say "removed $DISK (ISO kept - delete $ISO yourself if you want that gone too)"
+	;;
+*)
+	echo "usage: tos [run | info | clean]" >&2
+	exit 2
+	;;
+esac
