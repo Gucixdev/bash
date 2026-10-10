@@ -26,12 +26,6 @@ setup() {
 	rm -rf "$tmp"
 }
 
-@test "sniff: clear error when tcpdump missing" {
-	run ./sniff
-	[ "$status" -eq 1 ]
-	[[ "$output" == *"tcpdump"* ]]
-}
-
 @test "nmap: passthrough mode reaches the real nmap" {
 	run ./nmap -- --version
 	[ "$status" -eq 0 ]

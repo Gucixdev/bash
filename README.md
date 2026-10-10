@@ -44,7 +44,7 @@ like nnn, `/` to search, a key bar always showing what is available.
 | `flatseal` | Flatpak apps and their permissions, layered the way flatpak layers them (manifest, global override, app override). Also scriptable: `flatseal allow\|deny\|default APP KEY`, `export`/`import`. | flatpak, fzf |
 | `ezhf` | Browse the Hugging Face Hub and the local cache, sizes first, download or delete marked files. | curl and jq (or python3), `hf` optional |
 | `scenario` | Record and replay keyboard and mouse input, one recorder per device. | evemu (root) or xnee |
-| `screenshot` | Full, screen, area, window or active window on Wayland or X11, to file and clipboard, with a notification. | grim/slurp, spectacle, maim, scrot, ... |
+| `screenshot` | Full, screen, area, window or active window on Wayland or X11, to file and clipboard, with a notification. `-c` is clipboard only, nothing written to disk; `-d N` waits first. | grim/slurp, spectacle, maim, scrot, ... |
 
 ## Utilities
 
@@ -57,10 +57,8 @@ like nnn, `/` to search, a key bar always showing what is available.
 | `todo` | todo.txt capture: `todo "task"`, `todo ls`, `todo done N`. |
 | `wifi` | Wi-Fi picker over NetworkManager, iwd or wpa_supplicant. |
 | `btth` | Bluetooth picker over `bluetoothctl`. |
-| `snip` | Region screenshot straight to the clipboard, no file. |
 | `metadata_cleaner` | Strip EXIF and other metadata into a new `clean-NAME` file. mat2 or exiftool, else ffmpeg or ImageMagick. |
 | `nmap` | Presets in front of the real nmap, `nmap -- ARGS` passes through. Installed as `nmap-presets` by `make install` so it does not shadow the real one. |
-| `sniff` | tcpdump with interface and filter presets. |
 | `manwriter` | Turn a script's header comment into a man page: `manwriter -d man tool...`. `manwriter new` writes a skeleton. |
 
 ## Installers

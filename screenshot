@@ -2,7 +2,11 @@
 # screenshot - take a screenshot on Wayland or X11 with whatever tools the
 # machine has.
 #
-#   screenshot [-d SECONDS] [-n] [MODE]
+#   screenshot [-d SECONDS] [-c] [-n] [MODE]
+#
+#   -d SECONDS  wait before capturing
+#   -c          clipboard only: nothing is written to disk
+#   -n          no clipboard copy, no notification
 
 # ---- edit me ---------------------------------------------------------
 # >>> lazytui (vendored from lib/lazytui.sh by ./vendor - edit the library, not this block) >>>
@@ -337,9 +341,11 @@ to_clipboard() {   # FILE
 
 # ---- args ------------------------------------------------------------
 MODE=
+CLIPONLY=0
 while [ $# -gt 0 ]; do
 	case $1 in
 		-d) DELAY=${2:?-d needs seconds}; shift 2 ;;
+		-c) CLIPONLY=1; shift ;;
 		-n) COPY=0; NOTIFY=0; shift ;;
 		-h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
 		-*) die "unknown option $1" ;;
@@ -355,13 +361,26 @@ fi
 case " $MODES " in *" $MODE "*) ;; *) die "unknown mode '$MODE' (one of: $MODES)" ;; esac
 
 backend=$(pick_backend) || die "no screenshot tool found (wayland: grim slurp; x11: maim, scrot or import)"
-mkdir -p "$DIR" || die "cannot create $DIR"
-base="$DIR/$(date +"$NAME_FMT")_screenshot"
-out="$base.$FORMAT"; n=1
-while [ -e "$out" ]; do n=$((n + 1)); out="$base-$n.$FORMAT"; done
+if [ "$CLIPONLY" = 1 ]; then
+	COPY=1
+	tmpd=$(mktemp -d) || die "cannot create a temp dir"
+	trap 'rm -rf "$tmpd"' EXIT INT TERM
+	out="$tmpd/shot.$FORMAT"
+else
+	mkdir -p "$DIR" || die "cannot create $DIR"
+	base="$DIR/$(date +"$NAME_FMT")_screenshot"
+	out="$base.$FORMAT"; n=1
+	while [ -e "$out" ]; do n=$((n + 1)); out="$base-$n.$FORMAT"; done
+fi
 
 capture_$backend "$MODE" "$out" || { rm -f "$out"; die "cancelled or failed"; }
 [ -s "$out" ] || { rm -f "$out"; die "capture produced no file"; }
+
+if [ "$CLIPONLY" = 1 ]; then
+	to_clipboard "$out" || die "no clipboard tool (wl-copy or xclip)"
+	[ "$NOTIFY" = 1 ] && have notify-send && notify-send -i "$out" "Screenshot copied" "to the clipboard"
+	exit 0
+fi
 
 echo "$out"
 [ "$COPY" = 1 ] && { to_clipboard "$out" || echo "screenshot: no clipboard tool, not copied" >&2; }

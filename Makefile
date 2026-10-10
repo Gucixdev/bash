@@ -9,7 +9,7 @@ BIN    ?= $(PREFIX)/bin
 
 # nmap is installed as nmap-presets: a wrapper named nmap would shadow the real one
 TOOLS = btth cleaner ezcontainers ezhf flatseal gitgrab logcollector manwriter \
-        metadata_cleaner scenario screenshot sniff snip todo trash wifi
+        metadata_cleaner scenario screenshot todo trash wifi
 SCRIPTS = $(TOOLS) nmap lib/lazytui.sh lib/dspq lib/evq \
           installer/blenderlauncher installer/comfysetup installer/tos
 
