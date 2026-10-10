@@ -1,0 +1,11 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tools the tests exercise
+        run: sudo apt-get update && sudo apt-get install -y shellcheck bats imagemagick nmap zstd
+      - name: tests
+        run: bats tests/

@@ -194,6 +194,17 @@ setup() {
 	rm -rf "$tmp"
 }
 
+@test "gitgrab: falls back to the token gh is logged in with" {
+	tmp=$(mktemp -d)
+	printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "$tmp/curl"
+	printf '#!/bin/sh\n[ "$1 $2" = "auth token" ] && echo fromgh\n' > "$tmp/gh"
+	chmod +x "$tmp/curl" "$tmp/gh"
+	env -u GH_TOKEN PATH="$tmp:$PATH" run ./gitgrab o/r f -o -
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"Authorization: Bearer fromgh"* ]]
+	rm -rf "$tmp"
+}
+
 @test "gitgrab: OWNER/REPO PATH [REF] defaults to HEAD and honours the ref" {
 	tmp=$(mktemp -d)
 	printf '#!/bin/sh\nfor a; do u=$a; done\nprintf "%%s\\n" "$u"\n' > "$tmp/curl"

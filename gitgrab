@@ -1,7 +1,7 @@
 #!/bin/sh
 # gitgrab - download one file from a GitHub repo: no clone, no history.
 # Takes a github.com URL (blob or raw) or OWNER/REPO plus a path. Private
-# repos work when GH_TOKEN is set; never overwrites unless told to.
+# repos work with GH_TOKEN or a logged-in gh; never overwrites unless told to.
 #
 # usage: gitgrab URL [-o OUT] [-f]
 #        gitgrab OWNER/REPO PATH [REF] [-o OUT] [-f]
@@ -69,6 +69,11 @@ esac
 if [ "$out" != "-" ] && [ -e "$out" ] && [ "$force" -ne 1 ]; then
 	echo "gitgrab: $out exists (use -f to overwrite)" >&2
 	exit 1
+fi
+
+# no GH_TOKEN in the environment: take the one gh is logged in with, if any
+if [ -z "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+	GH_TOKEN=$(gh auth token 2>/dev/null) || GH_TOKEN=
 fi
 
 # fetch URL -> stdout; token goes in a header, never on the command line URL

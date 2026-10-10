@@ -14,6 +14,50 @@ ln -s "$PWD/logcollector" ~/.local/bin/    # put any tool on PATH
 `bats tests/` runs the tests. Scripts are also kept clean under
 `shellcheck -S warning`.
 
+## What it looks like
+
+`logcollector -n -s "2 hours ago"` on a desktop with a couple of failing units:
+
+```
+logcollector summary (since 2 hours ago)
+
+err      1 lines
+warning  44 lines
+
+failed units:
+  cachyos-iw-set-regdomain.service     loaded failed failed Set Wireless Regulatory Domain on Timezone Change
+  systemd-networkd-wait-online.service loaded failed failed Wait for Network to be Online
+
+most repeated errors:
+  1   entries --
+
+skipped:
+  coredumps.txt: no output (needs privileges, or nothing logged)
+```
+
+`sniff -` on a few lines of `tcpdump -nn` output (sample, a synthetic capture):
+
+```
+9 packets, 3.2 KiB in 4.4s (749.318 B/s)
+
+protocols
+  icmp         1 packets        64 B
+  udp          4 packets       240 B
+  arp          1 packets        28 B
+  tcp          3 packets     2.9 KiB
+
+busiest conversations
+     1.9 KiB  142.250.74.46 <-> 192.168.1.10
+      1000 B  2001:db8::1 <-> 2001:db8::2
+
+services
+     2.9 KiB  tcp/https (443)
+       74 B  udp/dns (53)
+
+DNS names asked
+           1  example.com.
+```
+
 ## Principles
 
 - **One file, no runtime dependency on this repo.** Interactive tools
@@ -51,7 +95,7 @@ like nnn, `/` to search, a key bar always showing what is available.
 | Tool | What it does |
 |---|---|
 | `logcollector` | Support bundle for a time window: journal, warnings, errors, kernel log, failed units, package history, disk and memory. Secrets are redacted before anything is written, and it prints a summary of the most repeated errors. `-s "2 hours ago"`, `-I` also masks IPs and MACs. |
-| `gitgrab` | One file from a GitHub repo, no clone: `gitgrab owner/repo path/in/repo [ref]` or a `blob`/`raw` URL. `GH_TOKEN` opens private repos. |
+| `gitgrab` | One file from a GitHub repo, no clone: `gitgrab owner/repo path/in/repo [ref]` or a `blob`/`raw` URL. `GH_TOKEN` or a logged-in `gh` opens private repos. |
 | `cleaner` | Bloat across package cache, journal, containers, Flatpak runtimes, language caches, `~/.cache` and Trash. Dry run first, one confirmation. Backend: pacman, apt, dnf, zypper, apk, xbps or portage. |
 | `trash` | The freedesktop.org Trash spec, implemented directly, so file managers can restore what it deletes. |
 | `todo` | todo.txt capture: `todo "task"`, `todo ls`, `todo done N`. |
