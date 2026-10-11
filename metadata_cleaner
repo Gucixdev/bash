@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # metadata_cleaner - strip metadata (EXIF, author, GPS, camera tags) from
 # files before you share them.
 #

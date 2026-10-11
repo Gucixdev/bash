@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # morph - mv for formats: convert a file to the format of the output name.
 # The backend is picked by what the two extensions are:
 #   images     magick, convert or ffmpeg

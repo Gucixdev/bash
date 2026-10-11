@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # todo - minimal todo.txt task capture.
 #
 # One task per line in ${XDG_DATA_HOME:-~/.local/share}/todo/todo.txt,

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # settings - per-app key/value settings for shell scripts.
 #
 # usage: settings get APP KEY [DEFAULT]    print the value (exit 1 when unset and no DEFAULT)

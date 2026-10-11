@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # flatseal - terminal manager for Flatpak apps and their permissions, in
 # one tool, built on lib/lazytui. It wraps the real flatpak, which it
 # finds in PATH skipping itself.

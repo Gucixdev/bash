@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # nmap - presets in front of the real nmap.
 #
 # Picks the first nmap on PATH that is not this script, so it is safe to

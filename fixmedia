@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # fixmedia - try to repair broken audio, video and image files. The
 # original is never touched: the result is written as fixed-NAME next to it.
 #

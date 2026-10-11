@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # cleaner - find disk bloat with the real tool for each kind, show what
 # would go, ask once.
 #

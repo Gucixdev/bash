@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # wizard - ask a series of questions, print the answers as shell assignments.
 #
 # usage: wizard [STEPS_FILE]        steps on stdin when no file is given

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # lazytui - the lt_* terminal-UI helpers (selection menus with
 # preview and key hints, prompts, confirmations) that the interactive
 # tools share. Tools never source this file at run time: each carries

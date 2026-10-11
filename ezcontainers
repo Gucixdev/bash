@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # ezcontainers (short name: ezcon) - terminal manager for containers, images, volumes and
 # networks, built on lib/lazytui. One tool for both Docker and Podman
 # (pods too); it wraps the real binary, found in PATH skipping this script,

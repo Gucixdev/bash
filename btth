@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # btth - Bluetooth device picker over bluetoothctl (BlueZ).
 #
 # Scans for ten seconds, lists what it found as a numbered menu, then

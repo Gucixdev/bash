@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # trash - move files to the freedesktop.org Trash.
 #
 # Implements the Trash spec directly (files/ plus a .trashinfo per file),

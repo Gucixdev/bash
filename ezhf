@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # ezhf - terminal browser for the Hugging Face Hub and your local cache, built on lib/lazytui. It uses the
 # real `hf` (huggingface-cli) to download; without it, downloads and everything else fall back to curl and the
 # public Hub API, so it works on a bare box too.

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # screenshot - take a screenshot on Wayland or X11 with whatever tools the
 # machine has.
 #

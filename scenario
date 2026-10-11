@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # scenario - keyboard and mouse macro recorder and player.
 #
 # usage: scenario record [NAME] [DEVICE...]

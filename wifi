@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # wifi - Wi-Fi picker over the Linux Wi-Fi backends, first one that is
 # running wins: NetworkManager (nmcli), then iwd (iwctl), then bare
 # wpa_supplicant (wpa_cli).

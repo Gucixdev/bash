@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # logcollector - collect a support bundle for a time window: boot log,
 # warnings and errors, kernel log, failed units, package history, core
 # dumps, disk and memory. Everything passes a redaction filter (tokens,

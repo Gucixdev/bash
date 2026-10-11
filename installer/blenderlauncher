@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # blenderlauncher.sh - single-file Blender/Bforartists build download and
 # version manager. Same behavior as the old blender/{run,scripts/_lib,
 # scripts/dq,scripts/pacmanbar} split, consolidated into one file: no

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # findfat - where did the disk go? The biggest files and directories under
 # a path, largest first, without crossing into other filesystems.
 #
@@ -40,7 +40,7 @@ human() {
 
 if [ "$want_dir" -eq 1 ]; then
 	[ "$want_file" -eq 1 ] && echo "directories:"
-	# du -k is POSIX; cumulative size per directory, the top directory itself is skipped
+	# du -k is portable; cumulative size per directory, the top directory itself is skipped
 	du -x -k "$dir" 2>/dev/null | awk -v top="$dir" -F'\t' '$2 != top { printf "%d\t%s\n", $1 * 1024, $2 }' |
 		sort -rn | head -n "$count" | human
 fi

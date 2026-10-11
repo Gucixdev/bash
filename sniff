@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # sniff - what is this machine talking to? Captures for a few seconds and
 # summarizes: totals, protocols, busiest conversations, services, DNS names.
 #

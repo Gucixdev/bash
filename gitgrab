@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # gitgrab - download one file from a GitHub repo: no clone, no history.
 # Takes a github.com URL (blob or raw) or OWNER/REPO plus a path. Private
 # repos work with GH_TOKEN or a logged-in gh; never overwrites unless told to.

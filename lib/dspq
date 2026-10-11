@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # dq - a parallel, atomic download queue for shell scripts.
 #
 #   dq [-j N] ENTRY...          download each ENTRY; up to N at once (default 3)

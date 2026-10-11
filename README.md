@@ -1,6 +1,6 @@
 # bash
 
-Small terminal tools in POSIX `sh`, one file each. They wrap the real
+Small terminal tools in bash, one file each. They wrap the real
 program (`flatpak`, `docker`/`podman`, `nmcli`, `grim`, `journalctl`)
 instead of reimplementing it, fall back to the next-best backend when
 it is missing, and run on their own once copied out of this repo.

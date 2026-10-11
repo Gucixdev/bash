@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # manwriter - turn the comment block at the top of a script (the lines
 # right after the shebang) into a man(7) page, so the header stays the
 # single source of truth. "name - description" on the first line becomes
