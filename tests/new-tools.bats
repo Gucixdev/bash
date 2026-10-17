@@ -77,6 +77,7 @@ setup() {
 		'-----BEGIN OPENSSH PRIVATE KEY-----' 'AAAAsecret' '-----END OPENSSH PRIVATE KEY-----' \
 		'plain line' | redact)
 	[[ "$out" != *ghp_abc* ]]
+	[[ "$out" != *0123456789* ]]
 	[[ "$out" != *hunter2* ]]
 	[[ "$out" != *AAAAsecret* ]]
 	[[ "$out" == *"plain line"* ]]
@@ -260,6 +261,27 @@ setup() {
 	[[ "$out" != *abcdef1234567890* ]]
 	[[ "$out" != *s3cret* ]]
 	[[ "$out" == *example.com* ]]
+}
+
+@test "logcollector: redaction works under mawk (the default awk on Debian/Ubuntu)" {
+	command -v mawk >/dev/null || skip "mawk not installed"
+	tmp=$(mktemp -d)
+	ln -s "$(command -v mawk)" "$tmp/awk"
+	PATH="$tmp:$PATH"
+	hash -r
+	eval "$(sed -n '/^redact() {/,/^}/p' ./logcollector)"
+	redact_ip=1
+	out=$(printf '%s\n' \
+		'x ghp_abcdefghijklmnopqrstuvwxyz0123456789 y' \
+		'link 192.168.1.20 aa:bb:cc:dd:ee:ff' \
+		'curl -H "Authorization: Bearer abcdef1234567890" https://bob:s3cret@example.com/x' \
+		'plain line' | redact)
+	rm -rf "$tmp"
+	[[ "$out" != *0123456789* ]]
+	[[ "$out" != *192.168.1.20* ]]
+	[[ "$out" != *aa:bb:cc* ]]
+	[[ "$out" != *s3cret* ]]
+	[[ "$out" == *"plain line"* ]]
 }
 
 @test "nmap: each preset maps to the right real flags" {

@@ -36,20 +36,36 @@ done
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Reads stdin, writes redacted stdout. One awk so a multi-line private
-# key block is dropped as a unit, not line by line.
+# key block is dropped as a unit, not line by line. No {n,m} intervals in
+# the regexes: mawk (the default awk on Debian/Ubuntu) rejects some and
+# mis-reads others, so rep() spells the repeats out.
 redact() {
 	awk -v ip="$redact_ip" '
+	function rep(c, n,   s) { s = ""; while (n-- > 0) s = s c; return s }
+	BEGIN {
+		an = "[A-Za-z0-9]"; hx = "[0-9A-Fa-f]"; d = "[0-9]"
+		tok_gh  = "gh[pousr]_" rep(an, 20) an "*"
+		tok_pat = "github_pat_" rep("[A-Za-z0-9_]", 20) "[A-Za-z0-9_]*"
+		tok_hf  = "hf_" rep(an, 20) an "*"
+		tok_sk  = "sk-" rep("[A-Za-z0-9_-]", 20) "[A-Za-z0-9_-]*"
+		tok_aws = "AKIA" rep("[0-9A-Z]", 16)
+		tok_xox = "xox[abprs]-" rep("[A-Za-z0-9-]", 10) "[A-Za-z0-9-]*"
+		bearer  = "[Bb]earer +" rep("[A-Za-z0-9._~+/=-]", 8) "[A-Za-z0-9._~+/=-]*"
+		octet   = d "(" d ")?(" d ")?"
+		ipv4    = octet "[.]" octet "[.]" octet "[.]" octet
+		mac     = hx hx rep(":" hx hx, 5)
+	}
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { inkey = 1; print "[REDACTED private key]"; next }
 	inkey { if ($0 ~ /-----END [A-Z ]*PRIVATE KEY-----/) inkey = 0; next }
 	{
 		line = $0
-		gsub(/gh[pousr]_[A-Za-z0-9]{20,}/, "[REDACTED token]", line)
-		gsub(/github_pat_[A-Za-z0-9_]{20,}/, "[REDACTED token]", line)
-		gsub(/hf_[A-Za-z0-9]{20,}/, "[REDACTED token]", line)
-		gsub(/sk-[A-Za-z0-9_-]{20,}/, "[REDACTED token]", line)
-		gsub(/AKIA[0-9A-Z]{16}/, "[REDACTED aws key]", line)
-		gsub(/xox[abprs]-[A-Za-z0-9-]{10,}/, "[REDACTED token]", line)
-		gsub(/[Bb]earer +[A-Za-z0-9._~+\/=-]{8,}/, "Bearer [REDACTED]", line)
+		gsub(tok_gh, "[REDACTED token]", line)
+		gsub(tok_pat, "[REDACTED token]", line)
+		gsub(tok_hf, "[REDACTED token]", line)
+		gsub(tok_sk, "[REDACTED token]", line)
+		gsub(tok_aws, "[REDACTED aws key]", line)
+		gsub(tok_xox, "[REDACTED token]", line)
+		gsub(bearer, "Bearer [REDACTED]", line)
 		gsub(/[Aa]uthorization: *[^ ]+( +[^ ]+)?/, "Authorization: [REDACTED]", line)
 		# consume the line left to right so an already-redacted value is not matched again
 		res = ""
@@ -63,8 +79,8 @@ redact() {
 		line = res rest
 		gsub(/:\/\/[^\/ :@]+:[^\/ @]+@/, "://[REDACTED]@", line)
 		if (ip == 1) {
-			gsub(/[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/, "[ip]", line)
-			gsub(/[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}/, "[mac]", line)
+			gsub(ipv4, "[ip]", line)
+			gsub(mac, "[mac]", line)
 		}
 		print line
 	}'
