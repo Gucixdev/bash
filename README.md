@@ -66,7 +66,11 @@ DNS names asked
   so a tool still runs after being copied to another machine.
 - **Wrap the real thing.** `ezcontainers` drives whichever of Docker and
   Podman is installed, `flatseal` drives `flatpak`, `wifi` drives
-  NetworkManager, iwd or wpa_supplicant, whichever is running.
+  NetworkManager, iwd or wpa_supplicant, whichever is running. `gh`, `hf`
+  and `nmap` go on PATH under the real tool's name: they add their own
+  commands and views and hand everything else to the real one, which they
+  find by skipping themselves. Link them into a directory that comes before
+  the real one on PATH (`~/.local/bin` usually does).
 - **Degrade, don't die.** A missing optional dependency means a simpler
   path and a one-line message. A missing required one fails fast with the
   install command.
@@ -74,6 +78,7 @@ DNS names asked
   and asks once. `cleaner` never removes packages on its own.
 - **No secrets in the repo.** Tokens come from the environment
   (`GH_TOKEN`, `HF_TOKEN`, see `secrets.example`; the shell loads them from `~/.secrets`).
+  `gh` hands its token to curl on stdin, so it never shows up in `ps`.
 
 Every tool prints its header with `--help`.
 
@@ -81,12 +86,15 @@ Every tool prints its header with `--help`.
 
 Built on `lib/lazytui`: arrows or Tab to move, space to mark rows
 like nnn, `/` to search, a key bar always showing what is available.
+The views need fzf 0.71 or newer (or the C fzf they were built with): the
+key labels in the bar and `--id-nth` come from there.
 
 | Tool | What it does | Needs |
 |---|---|---|
+| `gh` | lazygit, gh and GitHub in one. The git repo here: changes (stage, commit, push, pull, discard, stash, amend), log (show, checkout, cherry-pick, revert, reset), branches, stash. GitHub: your repos (public/private, remove, new), search, and `lens`, a repo's files without cloning it. Commands: `grab` (a file, a folder or a shallow clone), `grabdir`, `create`, `remove`, `public`, `private`, `lens`, `search`; anything else is the real gh. | git, curl, jq (or python3), fzf for the views; the real gh optional |
 | `ezcontainers` | Containers, images, volumes, networks, pods and QEMU VMs in one list. Docker and Podman rows show up together, each action goes to the row's own engine. | docker or podman, qemu for VMs, fzf |
 | `flatseal` | Flatpak apps and their permissions, layered the way flatpak layers them (manifest, global override, app override). Also scriptable: `flatseal allow\|deny\|default APP KEY`, `export`/`import`. | flatpak, fzf |
-| `ezhf` | Browse the Hugging Face Hub and the local cache, sizes first, download or delete marked files. | curl and jq (or python3), `hf` optional |
+| `hf` | Browse the Hugging Face Hub and the local cache, sizes first, download or delete marked files; anything else (`hf download`, `hf auth login`, `hf cache ls`) is the real hf. | curl and jq (or python3), the real `hf` optional |
 | `scenario` | Record and replay keyboard and mouse input, one recorder per device. | evemu (root) or xnee |
 | `screenshot` | Full, screen, area, window or active window on Wayland or X11, to file and clipboard, with a notification. `-c` is clipboard only, nothing written to disk; `-d N` waits first. | grim/slurp, spectacle, maim, scrot, ... |
 
@@ -95,7 +103,6 @@ like nnn, `/` to search, a key bar always showing what is available.
 | Tool | What it does |
 |---|---|
 | `logcollector` | Support bundle for a time window: journal, warnings, errors, kernel log, failed units, package history, disk and memory. Secrets are redacted before anything is written, and it prints a summary of the most repeated errors. `-s "2 hours ago"`, `-I` also masks IPs and MACs. |
-| `gitgrab` | One file from a GitHub repo, no clone: `gitgrab owner/repo path/in/repo [ref]` or a `blob`/`raw` URL. `GH_TOKEN` or a logged-in `gh` opens private repos. |
 | `cleaner` | Bloat across package cache, journal, containers, Flatpak runtimes, language caches, `~/.cache` and Trash. Dry run first, one confirmation. Backend: pacman, apt, dnf, zypper, apk, xbps or portage. |
 | `trash` | The freedesktop.org Trash spec, implemented directly, so file managers can restore what it deletes. |
 | `todo` | todo.txt capture: `todo "task"`, `todo ls`, `todo done N`. |

@@ -1,0 +1,1135 @@
+#!/usr/bin/env bash
+# gh - lazygit, gh and GitHub in one, built on lib/lazytui: the git repo you are in (changes, log, branches,
+# stash), your GitHub repos, search, and a look inside any repo without cloning it. It sits on PATH under the
+# name of the real `gh` and in front of it: the commands below are its own, everything else goes to the real
+# gh unchanged (gh pr list, gh auth login, gh api ...). It finds the real one by skipping itself on PATH.
+#
+#   gh                     the views: this repo's changes inside a git repo, your GitHub repos outside one
+#   gh files | log | branches | stash        a view of the git repo here
+#   gh repos [OWNER]       your repos (or OWNER's): lens, grab, public/private, remove, new, browser
+#   gh search QUERY...     GitHub repos, most stars first (gh search repos|code|issues|prs|commits: the real one)
+#   gh lens [REPO|URL [PATH [REF]]] [--search QUERY]
+#                          a repo's files without cloning it: read, grab files and folders, search its code;
+#                          no REPO: the GitHub repo behind this one's origin (also spelled lense)
+#   gh grab REPO|URL [PATH [REF]] [-o OUT] [-f]
+#                          no PATH: a shallow clone; PATH: one file, never overwritten without -f (-o - prints
+#                          it); a blob, raw or tree URL picks the file or folder itself
+#   gh grabdir REPO|URL DIR [REF] [-o OUT] [-f]   one folder of a repo, without the rest
+#   gh create [NAME|ORG/NAME] [--public] [-d DESCRIPTION] [--no-push] [-y]
+#                          a new repo, private unless --public. Inside a git repo with no origin it offers
+#                          to make it the origin and push (-y: without asking)
+#   gh remove REPO...      delete repos for good: shows each one and wants its name typed back
+#   gh public REPO...  |  gh private REPO...     change who can see them (asks first)
+#   gh ANYTHING ELSE       the real gh
+#
+# REPO is OWNER/NAME, a github.com URL, or just NAME for one of yours. The token is GH_TOKEN, GITHUB_TOKEN or
+# the one the real gh is logged in with; without one, public repos still work (60 API calls an hour). It goes
+# to curl in a header on stdin, never on a command line. Deleting needs the delete_repo scope:
+# gh auth refresh -h github.com -s delete_repo. A new origin uses GH_PROTOCOL (ssh or https), else the real
+# gh's git_protocol, else https.
+#
+# Views: arrows move, space marks, / searches, Tab or Alt+1..7 switch views, the bar at the bottom shows the
+# rest. Commits ask for a Conventional Commits message (type(scope): summary) and check its shape.
+# shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose
+
+# >>> lazytui (copy of lib/lazytui) >>>
+# _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
+# (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
+# (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
+_lt_hint() {
+	_lt_h=$1
+	while :; do
+		case $_lt_h in
+			ctrl-?*)  printf '\033[30;44m Ctrl \033[0m'; _lt_h=${_lt_h#ctrl-} ;;
+			alt-?*)   printf '\033[30;43m Alt \033[0m'; _lt_h=${_lt_h#alt-} ;;
+			shift-?*) printf '\033[30;42m Shift \033[0m'; _lt_h=${_lt_h#shift-} ;;
+			*) break ;;
+		esac
+	done
+	case $_lt_h in
+		?) _lt_h=$(printf %s "$_lt_h" | tr '[:lower:]' '[:upper:]') ;;
+		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
+		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
+		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
+	esac
+	printf '\033[7m %s \033[0m %s   ' "$_lt_h" "$2"
+}
+
+# _lt_trim STR -> STR without leading/trailing blanks
+_lt_trim() { printf %s "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# _lt_script FILE CMD -> FILE runs CMD "$@" (keeps quoting out of fzf binds)
+_lt_script() { printf '%s "$@"\n' "$2" >"$1"; }
+
+lt_confirm() {   # lt_confirm "question" -> 0 on y
+	printf '%s [y/N] ' "$1" >&2
+	read -r _lt_a || return 1
+	case $_lt_a in y | Y | yes | YES | t | T | tak) return 0 ;; *) return 1 ;; esac
+}
+
+lt_input() {   # lt_input "prompt" [default] -> stdout
+	printf '%s%s: ' "$1" "${2:+ [$2]}" >&2
+	read -r _lt_a || return 1
+	printf '%s\n' "${_lt_a:-${2:-}}"
+}
+
+lt_select() {
+	_lt_mode=raw _lt_refresh=${LT_REFRESH:-0} _lt_seed= _lt_more= _lt_reload= _lt_preview= _lt_keys= \
+	_lt_key=1 _lt_nth= _lt_header= _lt_prompt='> '
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--mode)    _lt_mode=$2;    shift 2 ;;
+			--seed)    _lt_seed=$2;    shift 2 ;;
+			--more)    _lt_more=$2;    shift 2 ;;
+			--refresh) _lt_refresh=$2; shift 2 ;;
+			--reload)  _lt_reload=$2;  shift 2 ;;
+			--preview) _lt_preview=$2; shift 2 ;;
+			--keys)    _lt_keys=$2;    shift 2 ;;
+			--key)     _lt_key=$2;     shift 2 ;;
+			--nth)     _lt_nth=$2;     shift 2 ;;
+			--header)  _lt_header=$2;  shift 2 ;;
+			--prompt)  _lt_prompt=$2;  shift 2 ;;
+			*) echo "lt_select: unknown arg $1" >&2; return 2 ;;
+		esac
+	done
+	case $_lt_refresh in '' | *[!0-9]*) echo "lt_select: --refresh wants milliseconds, got '$_lt_refresh'" >&2; return 2 ;; esac
+	case $_lt_mode in raw | select) ;; *) echo "lt_select: --mode must be raw or select" >&2; return 2 ;; esac
+
+	_lt_tmp=$(mktemp -d) || return 1
+	if [ -n "$_lt_seed" ]; then
+		_lt_script "$_lt_tmp/seed.sh" "$_lt_seed"
+	else
+		cat >"$_lt_tmp/list"
+		printf 'cat "%s/list"\n' "$_lt_tmp" >"$_lt_tmp/seed.sh"
+	fi
+
+	if ! command -v fzf >/dev/null 2>&1; then
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
+
+	TAB=$(printf '\t')
+	_lt_k="{+$_lt_key}"
+	set -- --delimiter="$TAB" --ansi --prompt="$_lt_prompt" --footer-border=none --layout=reverse-list
+	[ -n "$_lt_header" ] && set -- "$@" --header="$_lt_header"
+	[ -n "$_lt_nth" ] && set -- "$@" --with-nth="$_lt_nth"
+	if [ -n "$_lt_preview" ]; then
+		_lt_script "$_lt_tmp/preview.sh" "$_lt_preview"
+		set -- "$@" --preview="sh $_lt_tmp/preview.sh {$_lt_key}" \
+			--preview-window="${LT_PREVIEW_WINDOW:-down,60%,wrap}"
+	fi
+	_lt_start=
+	if [ -n "$_lt_more" ]; then
+		cat >"$_lt_tmp/more.sh" <<EOF
+out=\$(mktemp)
+$_lt_more > "\$out" 2>/dev/null || true
+if [ -s "\$out" ]; then
+	curl -s -XPOST "127.0.0.1:\$1" --data "reload(cat \$out; rm -f \$out)" >/dev/null 2>&1 || rm -f "\$out"
+else rm -f "\$out"; fi
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/more.sh \$FZF_PORT &"
+	fi
+	if [ "$_lt_refresh" -gt 0 ] && [ -z "$_lt_reload" ] && command -v curl >/dev/null 2>&1; then
+		# background loop: run the seed, post it to fzf only when it changed;
+		# it ends by itself once fzf's port stops answering
+		_lt_secs=$(awk -v ms="$_lt_refresh" 'BEGIN { if (ms < 50) ms = 50; printf "%.3f", ms / 1000 }')
+		cat >"$_lt_tmp/refresh.sh" <<EOF
+port=\$1; last=$_lt_tmp/last; new=$_lt_tmp/new
+sh $_lt_tmp/seed.sh >"\$last" 2>/dev/null
+while sleep $_lt_secs; do
+	[ -d $_lt_tmp ] || exit 0
+	sh $_lt_tmp/seed.sh >"\$new" 2>/dev/null || continue
+	cmp -s "\$last" "\$new" && continue
+	cp "\$new" "\$last"
+	curl -s -m 2 -XPOST "127.0.0.1:\$port" --data "reload-sync(cat $_lt_tmp/last)" >/dev/null 2>&1 || exit 0
+done
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
+		set -- "$@" --track --id-nth="$_lt_key"
+	fi
+	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
+	if [ -n "$_lt_reload" ]; then
+		printf '%s\n' "$_lt_reload" | sed 's/{q}/"$1"/g' >"$_lt_tmp/reload.sh"
+		set -- "$@" --bind="change:reload(sh $_lt_tmp/reload.sh {q})"
+	fi
+
+	# mode: select = no input line, space marks, / opens search
+	_lt_bar= _lt_ubar=
+	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
+	_lt_hints=
+	case $(fzf --version 2>/dev/null) in *-c\ *) _lt_hints=1 ;; esac
+	if [ "$_lt_mode" = select ]; then
+		set -- "$@" --multi --no-input \
+			--bind='space:toggle+down # mark,tab:down,btab:up,/:show-input # search' \
+			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	else
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint type filter)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	fi
+
+	# yaml key map -> binds + key bar
+	_lt_n=0
+	if [ -n "$_lt_keys" ]; then
+		[ "$_lt_keys" = - ] && printf '%s\n' "${LT_KEYS:-}" >"$_lt_tmp/keys" || cat "$_lt_keys" >"$_lt_tmp/keys"
+		while IFS= read -r _lt_line || [ -n "$_lt_line" ]; do
+			_lt_line=$(_lt_trim "$_lt_line")
+			case $_lt_line in '' | '#'*) continue ;; esac
+			# a line of just --- starts a new line in the key bar
+			[ "$_lt_line" = --- ] && { _lt_ubar="$_lt_ubar
+"; _lt_fresh=1; continue; }
+			_lt_kn=$(_lt_trim "${_lt_line%%:*}")
+			_lt_rest=${_lt_line#*:}
+			case $_lt_rest in
+				*' # '*) _lt_label=$(_lt_trim "${_lt_rest##* # }"); _lt_act=$(_lt_trim "${_lt_rest% # *}") ;;
+				*)       _lt_label=; _lt_act=$(_lt_trim "$_lt_rest") ;;
+			esac
+			_lt_n=$((_lt_n + 1))
+			_lt_reloadact="+reload(sh $_lt_tmp/seed.sh)"
+			case $_lt_act in
+				refresh)  _lt_bind="reload(sh $_lt_tmp/seed.sh)" ;;
+				quit)     _lt_bind=abort ;;
+				'!'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#!}"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)$_lt_reloadact" ;;
+				'>'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#>}"
+				          _lt_bind="become(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+				accept | select-all | deselect-all | toggle | toggle-all | first | last | up | down | page-up | page-down | abort | clear-query | show-input | hide-input)
+				          _lt_bind=$_lt_act ;;
+				*)        _lt_script "$_lt_tmp/a$_lt_n.sh" "$_lt_act"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+			esac
+			if [ -n "$_lt_hints" ] && [ -n "$_lt_label" ]; then set -- "$@" --bind="$_lt_kn:$_lt_bind # $_lt_label"
+			else set -- "$@" --bind="$_lt_kn:$_lt_bind"; fi
+			if [ -n "$_lt_label" ]; then
+				_lt_ubar="$_lt_ubar$(_lt_hint "$_lt_kn" "$_lt_label")"
+				_lt_fresh=
+			fi
+		done <"$_lt_tmp/keys"
+	fi
+	# defaults on line one, the key map's labels on line two
+	if [ -n "$_lt_hints" ]; then set -- "$@" --hints
+	else set -- "$@" --footer="$_lt_bar${_lt_ubar:+
+$_lt_ubar}"; fi
+
+	_lt_sel=$(sh "$_lt_tmp/seed.sh" | fzf "$@"); _lt_rc=$?
+	rm -rf "$_lt_tmp"
+	[ $_lt_rc -eq 0 ] || return 1
+	[ -n "$_lt_sel" ] && printf '%s\n' "$_lt_sel" | cut -f"$_lt_key"
+	return 0
+}
+
+# numbered prompt when fzf is missing
+_lt_fallback() {
+	sh "$_lt_tmp/seed.sh" >"$_lt_tmp/fb"
+	[ -s "$_lt_tmp/fb" ] || return 1
+	awk -F'\t' '{ printf "%3d) %s\n", NR, ($1 == "" ? $0 : $0) }' "$_lt_tmp/fb" | tr '\t' ' ' >&2
+	printf 'pick number%s, q to cancel: ' "$([ "$_lt_mode" = select ] && echo 's (space separated)')" >&2
+	read -r _lt_ans || return 1
+	case $_lt_ans in '' | q) return 1 ;; esac
+	for _lt_i in $_lt_ans; do sed -n "${_lt_i}p" "$_lt_tmp/fb"; done | cut -f"$_lt_key"
+}
+
+# lt_wizard: steps on stdin, one per line:
+#   var|prompt              free text
+#   var|prompt|a,b,c        pick one (fzf)
+#   var|prompt|a,b,c|def    same, with default
+# prints eval-able VAR='value' lines; Esc goes back a step, Esc on the
+# first step cancels (return 1). Usage: eval "$(lt_wizard <<EOF ... EOF)"
+lt_wizard() {
+	_lt_wd=$(mktemp -d) || return 1
+	cat >"$_lt_wd/steps"
+	_lt_total=$(wc -l <"$_lt_wd/steps")
+	_lt_i=1
+	while [ "$_lt_i" -le "$_lt_total" ]; do
+		IFS='|' read -r _lt_var _lt_q _lt_ch _lt_def <<EOF
+$(sed -n "${_lt_i}p" "$_lt_wd/steps")
+EOF
+		_lt_prev=
+		[ -f "$_lt_wd/v.$_lt_i" ] && _lt_prev=$(cat "$_lt_wd/v.$_lt_i")
+		_lt_hdr="[$_lt_i/$_lt_total] $_lt_q"
+		if [ -n "$_lt_ch" ]; then
+			_lt_pick=${_lt_prev:-$_lt_def}
+			_lt_ans=$( { [ -n "$_lt_pick" ] && printf '%s\n' "$_lt_pick"; printf '%s\n' "$_lt_ch" | tr ',' '\n' | grep -vxF -- "$_lt_pick"; } | fzf --layout=reverse-list --header="$_lt_hdr" --footer='↑↓ move · enter accept · esc back' --no-multi) || _lt_ans=__back__
+		else
+			_lt_ans=$(printf '' | fzf --print-query --no-info --bind=enter:accept-or-print-query --header="$_lt_hdr" --footer='type · enter accept · esc back' --query="${_lt_prev:-$_lt_def}" | head -1) || _lt_ans=__back__
+		fi
+		if [ "$_lt_ans" = __back__ ]; then
+			[ "$_lt_i" -eq 1 ] && { rm -rf "$_lt_wd"; return 1; }
+			_lt_i=$((_lt_i - 1)); continue
+		fi
+		printf '%s' "$_lt_ans" >"$_lt_wd/v.$_lt_i"
+		_lt_i=$((_lt_i + 1))
+	done
+	_lt_i=1
+	while [ "$_lt_i" -le "$_lt_total" ]; do
+		_lt_var=$(sed -n "${_lt_i}p" "$_lt_wd/steps" | cut -d'|' -f1)
+		printf "%s='%s'\n" "$_lt_var" "$(sed "s/'/'\\\\''/g" "$_lt_wd/v.$_lt_i")"
+		_lt_i=$((_lt_i + 1))
+	done
+	rm -rf "$_lt_wd"
+}
+
+# lt_realbin NAME -> path of the real NAME in PATH, skipping this script
+# itself. For tools that wrap a program of the same name (a script called
+# docker or flatpak) so they never call themselves.
+lt_realbin() {
+	_lt_old=$IFS; IFS=:
+	for _lt_d in $PATH; do
+		IFS=$_lt_old
+		_lt_c=$_lt_d/$1
+		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && [ "$(readlink -f -- "$_lt_c" 2>/dev/null || echo "$_lt_c")" != "$(readlink -f -- "$0" 2>/dev/null || echo "$0")" ]; then printf '%s\n' "$_lt_c"; return 0; fi
+		IFS=:
+	done
+	IFS=$_lt_old
+	return 1
+}
+
+
+# <<< lazytui <<<
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SELF=$HERE/$(basename -- "$0")
+REAL=$(lt_realbin gh 2>/dev/null) || REAL=   # the real GitHub CLI, never this script
+API=https://api.github.com
+WEB=https://github.com
+RAW=https://raw.githubusercontent.com
+REFRESH_MS=${GH_REFRESH_MS:-2000}   # the git views re-read the repo this often (milliseconds, 0 = off)
+NL='
+'
+
+die() { echo "gh: $*" >&2; exit 1; }
+usage() { echo "usage: gh $*" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+pause() { printf '\npress Enter ' >&2; read -r _ </dev/tty 2>/dev/null || true; }
+ckey() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
+
+real() {   # ARGS... -> the real gh, unchanged
+	[ -n "$REAL" ] || { echo "gh: 'gh $*' is a command of the real GitHub CLI, which is not installed (pacman -S github-cli)" >&2; exit 127; }
+	exec "$REAL" "$@"
+}
+
+help() {
+	awk 'NR == 1 { next } /^# shellcheck/ { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+	[ -n "$REAL" ] && { printf '\n--- the real gh (%s) ---\n' "$REAL"; "$REAL" --help; }
+	exit 0
+}
+
+# ---- GitHub over HTTP ------------------------------------------------------------------------------------
+TOKEN= _tok=
+token() {   # TOKEN <- GH_TOKEN, GITHUB_TOKEN or the real gh's login; looked up once
+	[ -n "$_tok" ] && return 0
+	_tok=1
+	TOKEN=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+	if [ -z "$TOKEN" ] && [ -n "$REAL" ]; then TOKEN=$("$REAL" auth token 2>/dev/null) || TOKEN=; fi
+	return 0
+}
+
+hcurl() {   # curl ARGS..., the token in a header read from stdin so it never shows up in ps
+	token
+	if [ -n "$TOKEN" ]; then printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl --config - "$@"
+	else curl "$@"; fi
+}
+
+fetch() {   # URL -> stdout; when GitHub turns the token down (an expired one), once more without it
+	if have curl; then
+		hcurl -fsL "$1" && return 0
+		[ -n "$TOKEN" ] || return 1
+		curl -fsL "$1"
+	elif have wget; then
+		token
+		if [ -n "$TOKEN" ]; then wget -qO- --header="Authorization: Bearer $TOKEN" "$1"; else wget -qO- "$1"; fi
+	else echo "gh: need curl or wget (pacman -S curl)" >&2; return 127; fi
+}
+
+api() {   # METHOD PATH [JSON] -> the response; on an error status the API's own message goes to stderr, return 1
+	have curl || die "the GitHub API needs curl (pacman -S curl)"
+	_am=$1 _ap=$2 _aq=${3-}
+	set -- -sS -X "$_am" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' -w '\n%{http_code}'
+	[ -n "$_aq" ] && set -- "$@" -H 'Content-Type: application/json' --data "$_aq"
+	_ar=$(hcurl "$@" "$API/$_ap") || { echo "gh: no answer from $API" >&2; return 1; }
+	_ac=${_ar##*"$NL"}
+	_ab=${_ar%"$NL"*}
+	case $_ac in 2??) [ -n "$_ab" ] && printf '%s\n' "$_ab"; return 0 ;; esac
+	if [ "$_ac" = 401 ] && [ -n "$TOKEN" ]; then
+		echo "gh: GitHub turned the token down (bad or expired) - going on without one" >&2
+		TOKEN=
+		api "$_am" "$_ap" "$_aq"
+		return
+	fi
+	_amsg=$(printf '%s' "$_ab" | jerr 2>/dev/null)
+	echo "gh: $_am /$_ap: HTTP $_ac${_amsg:+ - $_amsg}" >&2
+	return 1
+}
+
+jerr() {   # an API error (JSON) -> its message, with the details GitHub hides in .errors
+	json_rows '(.message // "") as $m | ([.errors[]? | objects | .message // empty] | join("; ")) as $e | if $e == "" then $m else "\($m | rtrimstr(".")) (\($e))" end' \
+		'm = (d.get("message") or "") if isinstance(d, dict) else ""
+e = "; ".join(x.get("message") for x in (d.get("errors") or []) if isinstance(x, dict) and x.get("message")) if isinstance(d, dict) else ""
+print("%s (%s)" % (m.rstrip("."), e) if e else m)'
+}
+
+# JSON -> text: one filter per use, jq when there is one, python3 otherwise
+json_rows() {   # $1 = jq filter, $2 = python body (the value is `d`, prints the rows)
+	if have jq; then jq -r "$1"
+	elif have python3; then python3 -c "import json,sys
+d=json.load(sys.stdin)
+$2"
+	else die "this needs jq or python3"; fi
+}
+jget() { json_rows ".$1 // empty" "v = d.get('$1') if isinstance(d, dict) else None
+if v is not None: print(v)"; }
+jstr() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }   # TEXT -> inside a JSON string
+urlenc() {   # TEXT -> a URL query value
+	if have jq; then printf '%s' "$1" | jq -sRr @uri
+	else printf '%s' "$1" | sed 's/%/%25/g; s/ /%20/g; s/&/%26/g; s/#/%23/g; s/+/%2B/g; s/?/%3F/g'; fi
+}
+urlpath() { printf '%s' "$1" | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g'; }   # a path inside a repo -> URL
+is_sha() { case $1 in '' | *[!0-9a-f]*) return 1 ;; esac; [ ${#1} -ge 7 ]; }
+
+me() {   # -> your login
+	if [ -n "${GH_ME:-}" ]; then printf '%s\n' "$GH_ME"; return 0; fi
+	token
+	if [ -n "$TOKEN" ]; then _me=$(api GET user | jget login) && [ -n "$_me" ] && { printf '%s\n' "$_me"; return 0; }; fi
+	echo "gh: no token, so no idea who you are: give OWNER/NAME, or set GH_TOKEN (or gh auth login)" >&2
+	return 1
+}
+
+full() {   # REPO, URL or NAME -> OWNER/NAME
+	_f=$1
+	case $_f in
+		*github.com/*) _f=${_f#*github.com/} ;;
+		git@github.com:*) _f=${_f#git@github.com:} ;;
+	esac
+	_f=${_f%%[?#]*}
+	case $_f in
+		'' | /*) echo "gh: '$1' is not a repo" >&2; return 1 ;;
+		*/*) _o=${_f%%/*}; _n=${_f#*/}; _n=${_n%%/*}; printf '%s/%s\n' "$_o" "${_n%.git}" ;;
+		*) _o=$(me) || return 1; printf '%s/%s\n' "$_o" "${_f%.git}" ;;
+	esac
+}
+
+origin_repo() {   # -> OWNER/NAME of this git repo's origin when it is on GitHub
+	_u=$(git remote get-url origin 2>/dev/null) || return 1
+	case $_u in *github.com[:/]*) _u=${_u#*github.com[:/]}; printf '%s\n' "${_u%.git}" ;; *) return 1 ;; esac
+}
+
+# git with the token as an extra header for github.com, so a private clone works without a credential
+# helper; a token GitHub turns down gets one more try without it
+gitauth() {
+	token
+	[ -n "$TOKEN" ] || { git "$@"; return; }
+	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$WEB/.extraheader" \
+		GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')" git "$@" ||
+		git "$@"
+}
+
+repo_rows() {   # a repo list or search result (JSON) -> KEY<TAB>display rows
+	json_rows '(if type == "object" then .items else . end)[] | [.full_name, (.private | tostring), (.stargazers_count | tostring), (.language // "-"), ((.pushed_at // "")[:10]), (.fork | tostring), (.archived | tostring), ((.description // "") | gsub("[\t\r\n]+"; " "))] | @tsv' \
+		'for r in (d.get("items", []) if isinstance(d, dict) else d):
+    print("\t".join([r["full_name"], str(bool(r.get("private"))).lower(), str(r.get("stargazers_count", 0)), r.get("language") or "-", (r.get("pushed_at") or "")[:10], str(bool(r.get("fork"))).lower(), str(bool(r.get("archived"))).lower(), " ".join((r.get("description") or "").split())]))' |
+	awk -F'\t' '{
+		vis = ($2 == "true") ? "\033[33mprivate\033[0m" : "\033[32mpublic \033[0m"
+		tag = ($7 == "true") ? " \033[90m[archived]\033[0m" : (($6 == "true") ? " \033[90m[fork]\033[0m" : "")
+		printf "%s\t%s %-38.38s \033[33m★ %-6s\033[0m %-11.11s \033[90m%s\033[0m %s%s\n", $1, vis, $1, $3, $4, $5, $8, tag }'
+}
+
+repo_card() {   # a repo (JSON) -> a few lines about it
+	json_rows '[.full_name, (if .private then "private" else "public" end), (.stargazers_count | tostring), (.forks_count | tostring), ((.pushed_at // "")[:10]), (.description // ""), .html_url] | @tsv' \
+		'print("\t".join([d["full_name"], "private" if d.get("private") else "public", str(d.get("stargazers_count", 0)), str(d.get("forks_count", 0)), (d.get("pushed_at") or "")[:10], d.get("description") or "", d.get("html_url") or ""]))' |
+	awk -F'\t' '{ printf "  %s  (%s, %s stars, %s forks, last push %s)\n  %s\n  %s\n", $1, $2, $3, $4, $5, ($6 == "" ? "no description" : $6), $7 }' >&2
+}
+
+# ---- commands --------------------------------------------------------------------------------------------
+# options may come before or after the positional arguments; sets out, force, n, a1..a3
+grab_args() {
+	out= force=0 n=0 a1= a2= a3=
+	while [ $# -gt 0 ]; do
+		case $1 in
+			-o) [ $# -ge 2 ] || return 2; out=$2; shift ;;
+			-f) force=1 ;;
+			-?*) echo "gh: unknown option $1" >&2; return 2 ;;
+			*) n=$((n + 1)); case $n in 1) a1=$1 ;; 2) a2=$1 ;; 3) a3=$1 ;; esac ;;
+		esac
+		shift
+	done
+}
+
+grab() {
+	grab_args "$@" || exit 2
+	[ "$n" -ge 1 ] && [ "$n" -le 3 ] || usage "grab REPO|URL [PATH [REF]] [-o OUT] [-f]"
+	case $a1 in
+		*github.com/*/tree/*)
+			set -- "$a1"; [ -n "$out" ] && set -- "$@" -o "$out"; [ "$force" = 1 ] && set -- "$@" -f
+			grabdir "$@"; return ;;
+		*github.com/*/blob/*)
+			_r=${a1#*github.com/}; _o=${_r%%/*}; _r=${_r#*/}; _n=${_r%%/*}; _r=${_r#*/blob/}
+			url="$RAW/$_o/$_n/$_r" ;;
+		https://raw.githubusercontent.com/* | https://github.com/*/raw/*) url=$a1 ;;
+		*)
+			r=$(full "$a1") || exit 2
+			[ -n "$a2" ] || { clone "$r" "$out"; return; }
+			url="$RAW/$r/${a3:-HEAD}/$(urlpath "$a2")" ;;
+	esac
+
+	[ -n "$out" ] || out=$(basename -- "${url%%\?*}")
+	if [ "$out" != - ] && [ -e "$out" ] && [ "$force" -ne 1 ]; then
+		echo "gh: $out exists (use -f to overwrite)" >&2; exit 1
+	fi
+	if [ "$out" = - ]; then
+		fetch "$url" || { echo "gh: could not fetch $url" >&2; exit 1; }
+		return 0
+	fi
+	tmp="$out.gh.$$"
+	if fetch "$url" >"$tmp" && [ -s "$tmp" ]; then
+		mv -f "$tmp" "$out" && echo "$out"
+	else
+		rm -f "$tmp"
+		echo "gh: could not fetch $url (wrong path or ref, a folder - gh grabdir - or a private repo without a token)" >&2
+		exit 1
+	fi
+}
+
+clone() {   # OWNER/NAME [DEST] -> a shallow clone
+	have git || die "a whole repo needs git (pacman -S git); one file works without it: gh grab $1 PATH"
+	_d=${2:-${1##*/}}
+	[ -e "$_d" ] && die "$_d exists"
+	gitauth clone --depth 1 "$WEB/$1.git" "$_d"
+}
+
+grabdir() {
+	grab_args "$@" || exit 2
+	case $a1 in
+		*github.com/*/tree/*)
+			[ "$n" -eq 1 ] || usage "grabdir URL [-o OUT] [-f]"
+			_r=${a1#*github.com/}; _o=${_r%%/*}; _r=${_r#*/}; _n=${_r%%/*}; _r=${_r#*/tree/}
+			r=$_o/$_n ref=${_r%%/*} dir=${_r#*/}
+			[ "$dir" = "$_r" ] && dir= ;;
+		*)
+			[ "$n" -ge 2 ] && [ "$n" -le 3 ] || usage "grabdir REPO|URL DIR [REF] [-o OUT] [-f]"
+			r=$(full "$a1") || exit 2
+			dir=$a2 ref=$a3 ;;
+	esac
+	dir=${dir#/}; dir=${dir%/}
+	[ -n "$dir" ] || usage "grabdir REPO|URL DIR [REF] [-o OUT] [-f]"
+	dest=${out:-${dir##*/}}
+	[ -e "$dest" ] && [ "$force" -ne 1 ] && die "$dest exists (use -f to replace it)"
+	parent=$(dirname -- "$dest")
+	mkdir -p -- "$parent" || exit 1
+	tmp=$(mktemp -d "$parent/.gh-grabdir.XXXXXX") || exit 1
+	trap 'rm -rf "$tmp"' EXIT
+	if have git && ! is_sha "$ref"; then
+		# a partial clone fetches only the blobs of the folder that gets checked out
+		set -- clone --quiet --depth 1 --filter=blob:none --sparse
+		[ -n "$ref" ] && set -- "$@" --branch "$ref"
+		gitauth "$@" "$WEB/$r.git" "$tmp/repo" && gitauth -C "$tmp/repo" sparse-checkout set "$dir" ||
+			die "could not fetch $dir from $r"
+		src=$tmp/repo/$dir
+	else
+		have tar || die "need git, or curl and tar"
+		mkdir "$tmp/x" && fetch "$API/repos/$r/tarball/${ref:-HEAD}" | tar -xzf - -C "$tmp/x" || die "could not download $r"
+		src=$(find "$tmp/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)/$dir   # the tarball's one top folder
+	fi
+	[ -d "$src" ] || die "$r has no folder $dir${ref:+ at $ref}"
+	[ -e "$dest" ] && rm -rf -- "$dest"
+	mv -- "$src" "$dest" && echo "$dest/"
+}
+
+remote_url() {   # OWNER/NAME -> the URL a new origin gets
+	_p=${GH_PROTOCOL:-}
+	[ -n "$_p" ] || [ -z "$REAL" ] || _p=$("$REAL" config get git_protocol 2>/dev/null)
+	case $_p in ssh) printf 'git@github.com:%s.git\n' "$1" ;; *) printf '%s/%s.git\n' "$WEB" "$1" ;; esac
+}
+
+create() {
+	pub=0 desc= push=1 yes=0 name=
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--public) pub=1 ;;
+			--private) pub=0 ;;
+			-d | --description) [ $# -ge 2 ] || usage "create [NAME] [--public] [-d DESCRIPTION] [--no-push] [-y]"; desc=$2; shift ;;
+			--no-push) push=0 ;;
+			-y | --yes) yes=1 ;;
+			-?*) echo "gh: unknown option $1" >&2; exit 2 ;;
+			*) [ -z "$name" ] || usage "create [NAME] [--public] [-d DESCRIPTION] [--no-push] [-y]"; name=$1 ;;
+		esac
+		shift
+	done
+	top=$(git rev-parse --show-toplevel 2>/dev/null) || top=
+	[ -n "$name" ] || [ -z "$top" ] || name=$(basename -- "$top")
+	[ -n "$name" ] || usage "create NAME [--public] [-d DESCRIPTION]   (NAME defaults to the git repo you are in)"
+	path=user/repos
+	case $name in */*) path=orgs/${name%%/*}/repos; name=${name#*/} ;; esac
+	case $name in *[!A-Za-z0-9._-]*) die "'$name' is not a repo name (letters, digits, . _ -)" ;; esac
+	priv=true vis=private
+	[ "$pub" = 1 ] && priv=false vis=public
+	resp=$(api POST "$path" "{\"name\":\"$name\",\"private\":$priv,\"description\":\"$(jstr "$desc")\"}") || exit 1
+	r=$(printf '%s' "$resp" | jget full_name)
+	echo "created $r ($vis): $WEB/$r"
+
+	[ -n "$top" ] || return 0
+	if git -C "$top" remote get-url origin >/dev/null 2>&1; then
+		echo "$(basename -- "$top") already has an origin, left as it is: $(git -C "$top" remote get-url origin)"
+		return 0
+	fi
+	url=$(remote_url "$r")
+	what="make it the origin of $(basename -- "$top") ($url)"
+	[ "$push" = 1 ] && git -C "$top" rev-parse -q --verify HEAD >/dev/null && what="$what and push $(git -C "$top" branch --show-current)"
+	[ "$yes" = 1 ] || lt_confirm "$what?" || return 0
+	git -C "$top" remote add origin "$url" && echo "origin -> $url"
+	if [ "$push" = 1 ] && git -C "$top" rev-parse -q --verify HEAD >/dev/null; then
+		git -C "$top" push -u origin HEAD
+	fi
+}
+
+remove() {
+	[ $# -gt 0 ] || usage "remove REPO..."
+	rc=0
+	for a; do
+		r=$(full "$a") || { rc=1; continue; }
+		info=$(api GET "repos/$r") || { rc=1; continue; }
+		printf '%s\n' "$info" | repo_card
+		printf 'type %s to delete it for good (anything else keeps it): ' "${r#*/}" >&2
+		read -r ans || ans=
+		if [ "$ans" != "${r#*/}" ]; then echo "kept $r"; continue; fi
+		if api DELETE "repos/$r" >/dev/null; then echo "deleted $r"
+		else
+			rc=1
+			echo "gh: deleting needs a token with the delete_repo scope: gh auth refresh -h github.com -s delete_repo" >&2
+		fi
+	done
+	return $rc
+}
+
+visibility() {   # public|private REPO...
+	want=$1; shift
+	[ $# -gt 0 ] || usage "$want REPO..."
+	list=
+	for a; do r=$(full "$a") || exit 2; list="$list $r"; done
+	# shellcheck disable=SC2086  # repo names have no blanks
+	set -- $list
+	if [ "$want" = public ]; then priv=false; echo "anyone will be able to see and clone it, its whole history included" >&2
+	else priv=true; echo "GitHub drops its stars and watchers; forks that exist stay public" >&2; fi
+	lt_confirm "make $(echo "$*" | sed 's/ /, /g') $want?" || { echo cancelled; return 1; }
+	rc=0
+	for r; do
+		if api PATCH "repos/$r" "{\"private\":$priv}" >/dev/null; then echo "$r is $want now"; else rc=1; fi
+	done
+	return $rc
+}
+
+# ---- rows for the views: KEY<TAB>display --------------------------------------------------------------------
+rows_files() {   # the branch line, then every change; paths are relative to the repo top, like porcelain
+	printf -- '-\t%s\n' "$(git -c color.status=always status -sb 2>/dev/null | head -n 1)"
+	git -c core.quotePath=false status --porcelain=v1 2>/dev/null | awk '{
+		x = substr($0, 1, 1); y = substr($0, 2, 1); p = substr($0, 4)
+		i = index(p, " -> "); if (i) p = substr(p, i + 4)
+		if (p ~ /^".*"$/) p = substr(p, 2, length(p) - 2)
+		if (x == "?") st = "\033[31m??\033[0m"
+		else st = (x == " " ? " " : "\033[32m" x "\033[0m") (y == " " ? " " : "\033[31m" y "\033[0m")
+		printf "%s\t%s %s\n", p, st, p }'
+}
+
+rows_log() {   # commits with the graph; lines that are only graph get the key -
+	git log --graph --color=always --date=relative -n 500 \
+		--format='%x1f%h%x1f %C(yellow)%h%C(reset) %s %C(blue)%ad%C(reset) %C(green)%an%C(reset)%C(auto)%d%C(reset)' 2>/dev/null |
+	awk '{ i = index($0, "\037"); if (!i) { printf "-\t%s\n", $0; next }
+		rest = substr($0, i + 1); j = index(rest, "\037")
+		printf "%s\t%s%s\n", substr(rest, 1, j - 1), substr($0, 1, i - 1), substr(rest, j + 1) }'
+}
+
+rows_branches() {
+	git for-each-ref --sort=-committerdate refs/heads refs/remotes \
+		--format='%(refname:short)%09%(HEAD)%09%(upstream:track)%09%(committerdate:relative)%09%(subject)%09%(refname)' 2>/dev/null |
+	awk -F'\t' '$6 ~ /\/HEAD$/ { next } {
+		if ($2 == "*") { mark = "\033[32m*"; c = "\033[32m" } else if ($6 ~ /^refs\/remotes\//) { mark = " "; c = "\033[31m" } else { mark = " "; c = "" }
+		printf "%s\t%s %s%-40s\033[0m %-20s \033[90m%-16s\033[0m %s\n", $1, mark, c, $1, $3, $4, $5 }'
+}
+
+rows_stash() { git stash list --color=always --format='%gd%x09%C(yellow)%gd%C(reset) %C(blue)%cr%C(reset) %s' 2>/dev/null; }
+
+rows_repos() {   # [OWNER] -> every page
+	if [ -n "${1:-}" ]; then _p="users/$1/repos?sort=pushed"; else _p="user/repos?sort=pushed&affiliation=owner"; fi
+	_pg=1
+	while :; do
+		_out=$(api GET "$_p&per_page=100&page=$_pg") || return 1
+		printf '%s' "$_out" | repo_rows
+		[ "$(printf '%s' "$_out" | json_rows length 'print(len(d))')" -ge 100 ] && [ "$_pg" -lt 10 ] || break
+		_pg=$((_pg + 1))
+	done
+}
+
+rows_search() { api GET "search/repositories?q=$(urlenc "$1")&sort=stars&order=desc&per_page=50" | repo_rows; }
+
+tree_file() { printf '%s/tree.%s' "${GH_CACHE:-${TMPDIR:-/tmp}}" "$(ckey "$1@$2")"; }
+
+rows_lens() {   # REPO REF [PATH] -> every file and folder (under PATH), sizes for files
+	if [ -n "${GH_CACHE:-}" ]; then _tf=$(tree_file "$1" "$2"); else _tf=$(mktemp) || return 1; fi
+	api GET "repos/$1/git/trees/$(printf '%s' "$2" | sed 's|/|%2F|g')?recursive=1" | json_rows \
+		'.tree[] | [.path, .type, ((.size // 0) | tostring)] | @tsv' \
+		'for e in d.get("tree", []): print("\t".join([e["path"], e["type"], str(e.get("size", 0))]))' >"$_tf" || return 1
+	awk -F'\t' -v pre="${3:-}" '
+	function human(b,    u, i) { split("B K M G T", u, " "); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ }
+		return sprintf(i == 1 ? "%d%s" : "%.1f%s", b, u[i]) }
+	pre != "" && $1 != pre && index($1, pre "/") != 1 { next }
+	$2 == "tree"   { printf "%s/\t\033[34m%8s  %s/\033[0m\n", $1, "", $1; next }
+	$2 == "commit" { printf "%s\t\033[35m%8s  %s\033[0m  (submodule)\n", $1, "", $1; next }
+	{ printf "%s\t%8s  %s\n", $1, human($3 + 0), $1 }' "$_tf"
+	[ -n "${GH_CACHE:-}" ] || rm -f "$_tf"
+}
+
+rows_code() {   # REPO QUERY -> files whose code matches (GitHub code search, needs a token)
+	api GET "search/code?q=$(urlenc "$2")+repo:$1&per_page=100" | json_rows \
+		'.items[] | [.path, .path] | @tsv' 'for e in d.get("items", []): print(e["path"] + "\t" + e["path"])'
+}
+
+# ---- previews ------------------------------------------------------------------------------------------------
+cached() {   # NAME CMD... -> CMD's output, kept for the rest of the session when there is a cache
+	if [ -z "${GH_CACHE:-}" ]; then shift; "$@"; return; fi
+	_c=$GH_CACHE/$(ckey "$1")
+	shift
+	[ -s "$_c" ] || "$@" >"$_c" 2>/dev/null || true
+	cat "$_c"
+}
+
+is_text() { grep -qI . "$1"; }
+
+preview_lens() {   # REPO REF KEY
+	case $3 in
+		*/) # a folder: what is directly inside, from the tree the list was made from
+			_tf=$(tree_file "$1" "$2")
+			[ -s "$_tf" ] && awk -F'\t' -v p="${3%/}/" 'index($1, p) == 1 { r = substr($1, length(p) + 1)
+				if (r !~ /\//) print ($2 == "tree" ? r "/" : r) }' "$_tf" ;;
+		*)  # a file: its first 256 KiB are enough to look at
+			_c=${GH_CACHE:-${TMPDIR:-/tmp}}/file.$(ckey "$1@$2:$3")
+			[ -s "$_c" ] || hcurl -fsSL -r 0-262143 "$RAW/$1/$2/$(urlpath "$3")" >"$_c" 2>/dev/null || true
+			if [ ! -s "$_c" ]; then echo "(could not fetch it)"
+			elif is_text "$_c"; then head -n 400 "$_c"
+			else echo "(binary - Ctrl+G grabs it)"; fi
+			[ -n "${GH_CACHE:-}" ] || rm -f "$_c" ;;
+	esac
+}
+
+readme() { hcurl -fsSL -H 'Accept: application/vnd.github.raw' "$API/repos/$1/readme" 2>/dev/null || echo "(no README)"; }
+
+_preview() {
+	case $1 in
+		files)
+			[ "$2" = - ] && { git log --graph --oneline --color=always -n 30 2>/dev/null; return; }
+			case $(git status --porcelain=v1 -- "$2" | head -n 1) in
+				'??'*) if [ -d "$2" ]; then ls -la -- "$2"; else git diff --no-index --color=always -- /dev/null "$2"; fi ;;
+				*) git diff --cached --color=always -- "$2"; git diff --color=always -- "$2" ;;
+			esac ;;
+		log) [ "$2" = - ] || git show --stat -p --color=always "$2" 2>&1 | head -n 600 ;;
+		branches) git log --graph --oneline --color=always -n 60 "$2" -- 2>&1 ;;
+		stash) git stash show -p --include-untracked --color=always "$2" 2>/dev/null || git stash show -p --color=always "$2" ;;
+		repo) cached "readme $2" readme "$2" | head -n 300 ;;
+		lens) shift; preview_lens "$@" ;;
+	esac
+}
+
+# ---- actions from the views ----------------------------------------------------------------------------------
+to_trash() {   # a new file thrown away goes where it can be restored from
+	if have trash; then trash "$1"; elif have gio; then gio trash -- "$1"; else rm -rf -- "$1"; fi
+}
+
+unstage() {
+	if git rev-parse -q --verify HEAD >/dev/null; then git restore --staged -- "$@" 2>/dev/null || git reset -q -- "$@"
+	else git rm -q -r --cached -- "$@"; fi
+}
+
+clip() {
+	if have wl-copy; then wl-copy; elif have xclip; then xclip -selection clipboard; elif have xsel; then xsel -b
+	elif have pbcopy; then pbcopy; else cat >/dev/null; echo "no clipboard tool (wl-clipboard or xclip)" >&2; pause; fi
+}
+
+st_of() { git status --porcelain=v1 -- "$1" | head -n 1; }
+
+_git() {   # ACTION KEY...
+	act=$1; shift
+	_k=$#   # the branch line (key -) is no file
+	while [ "$_k" -gt 0 ]; do _x=$1; shift; [ "$_x" = - ] || set -- "$@" "$_x"; _k=$((_k - 1)); done
+	cur=$(git branch --show-current 2>/dev/null)
+	case $act in
+	# files
+	stage)
+		for p; do
+			case $(st_of "$p") in
+				'') ;;
+				?' '*) unstage "$p" ;;   # staged, nothing left in the work tree
+				*) git add -A -- "$p" ;;
+			esac
+		done ;;
+	stageall)
+		if git status --porcelain=v1 | grep -q '^.[^ ]'; then git add -A
+		elif git rev-parse -q --verify HEAD >/dev/null; then git reset -q
+		else git rm -q -r --cached .; fi ;;
+	commit)
+		if git diff --cached --quiet 2>/dev/null; then
+			git status --porcelain=v1 | grep -q . || { echo "nothing to commit"; pause; return 0; }
+			lt_confirm "nothing is staged - stage everything and commit?" || return 0
+			git add -A
+		fi
+		msg=$(lt_input "commit message, type(scope): summary") || return 0
+		[ -n "$msg" ] || return 0
+		if ! printf '%s\n' "$msg" | grep -Eq '^[a-z]+(\([^)]*\))?!?: [^ ]'; then
+			lt_confirm "'$msg' is not a Conventional Commits message - commit it anyway?" || return 0
+		fi
+		git commit -q -m "$msg" || pause ;;
+	amend)
+		if [ -n "$(git branch -r --contains HEAD 2>/dev/null)" ]; then
+			lt_confirm "the last commit is already pushed - amend it anyway (it then needs a force push)?" || return 0
+		fi
+		git commit -q --amend --no-edit || pause ;;
+	push)
+		if ! git remote | grep -q .; then
+			lt_confirm "no remote yet - create a private GitHub repo for this one and push to it?" && "$SELF" create -y
+			pause; return 0
+		fi
+		if git rev-parse -q --verify '@{upstream}' >/dev/null 2>&1; then set -- git push
+		else set -- git push -u "$(git remote | grep -x origin || git remote | head -n 1)" HEAD; fi
+		_out=$("$@" 2>&1); _rc=$?
+		printf '%s\n' "$_out"
+		if [ "$_rc" -ne 0 ]; then
+			case $_out in *rejected* | *non-fast-forward* | *"fetch first"*)
+				lt_confirm "the push was rejected - overwrite the remote branch (--force-with-lease)?" && "$@" --force-with-lease ;;
+			esac
+			pause
+		fi ;;
+	pull) git pull || pause ;;
+	fetch) git fetch --all --prune || pause ;;
+	discard)
+		[ $# -gt 0 ] || return 0
+		printf '  %s\n' "$@" >&2
+		lt_confirm "throw away every change to these (new files go to the trash)?" || return 0
+		for p; do
+			case $(st_of "$p") in
+				'??'*) to_trash "$p" ;;
+				A*) git rm -q -r --cached -- "$p" && to_trash "$p" ;;
+				*) git restore --source=HEAD --staged --worktree -- "$p" 2>/dev/null || git checkout -q HEAD -- "$p" ;;
+			esac
+		done ;;
+	stash)
+		msg=$(lt_input "stash message (empty is fine)") || return 0
+		if [ -n "$msg" ]; then git stash push -q -u -m "$msg" || pause; else git stash push -q -u || pause; fi ;;
+	edit) [ $# -gt 0 ] && ${VISUAL:-${EDITOR:-vi}} "$@" ;;
+	diff)
+		for p; do
+			case $(st_of "$p") in
+				'??'*) git diff --no-index --color=always -- /dev/null "$p" ;;
+				*) git diff --cached --color=always -- "$p"; git diff --color=always -- "$p" ;;
+			esac
+		done | ${PAGER:-less -R} ;;
+	# log
+	show) [ $# -gt 0 ] && for h; do git show --color=always "$h"; done | ${PAGER:-less -R} ;;
+	checkout) [ $# -gt 0 ] && lt_confirm "check out $1 (detached HEAD)?" && { git checkout -q "$1" || pause; } ;;
+	revert) [ $# -gt 0 ] && lt_confirm "revert $*?" && { git revert --no-edit "$@" || pause; } ;;
+	pick)
+		[ $# -gt 0 ] || return 0
+		# shellcheck disable=SC2046  # commit hashes have no blanks; oldest first
+		set -- $(printf '%s\n' "$@" | awk '{ a[NR] = $0 } END { for (i = NR; i > 0; i--) print a[i] }')
+		lt_confirm "cherry-pick $* onto ${cur:-HEAD}?" && { git cherry-pick "$@" || pause; } ;;
+	reset)
+		[ $# -gt 0 ] || return 0
+		mode=$(printf '%s\t%s\n' soft 'soft    the changes stay staged' mixed 'mixed   the changes stay, unstaged' \
+			hard 'hard    the changes are thrown away' | lt_select --nth 2 --header "reset ${cur:-HEAD} to $1" --prompt 'mode> ') || return 0
+		[ "$mode" != hard ] || lt_confirm "a hard reset throws away every uncommitted change - sure?" || return 0
+		git reset -q "--$mode" "$1" || pause ;;
+	yank) [ $# -gt 0 ] && printf '%s' "$1" | clip ;;
+	branchat)
+		[ $# -gt 0 ] || return 0
+		name=$(lt_input "new branch at $1") || return 0
+		[ -n "$name" ] && { git switch -q -c "$name" "$1" || pause; } ;;
+	# branches
+	switch)
+		[ $# -gt 0 ] || return 0
+		if git show-ref -q --verify "refs/heads/$1"; then git switch -q "$1" || pause
+		elif git show-ref -q --verify "refs/remotes/$1"; then
+			_l=${1#*/}
+			if git show-ref -q --verify "refs/heads/$_l"; then git switch -q "$_l" || pause
+			else git switch -q -c "$_l" --track "$1" || pause; fi
+		fi ;;
+	newbranch)
+		name=$(lt_input "new branch from ${cur:-HEAD}") || return 0
+		[ -n "$name" ] && { git switch -q -c "$name" || pause; } ;;
+	delbranch)
+		for b; do
+			if git show-ref -q --verify "refs/remotes/$b"; then
+				lt_confirm "delete the branch ${b#*/} on ${b%%/*}?" && { git push -q "${b%%/*}" --delete "${b#*/}" || pause; }
+			else
+				lt_confirm "delete the branch $b?" || continue
+				git branch -q -d "$b" 2>/dev/null ||
+					{ lt_confirm "$b is not merged - delete it anyway (its commits may be lost)?" && git branch -q -D "$b"; } || pause
+			fi
+		done ;;
+	merge) [ $# -gt 0 ] && lt_confirm "merge $1 into ${cur:-HEAD}?" && { git merge "$1" || pause; } ;;
+	rebase) [ $# -gt 0 ] && lt_confirm "rebase ${cur:-HEAD} onto $1?" && { git rebase "$1" || pause; } ;;
+	pushbranch) for b; do git push -u origin "${b#origin/}" || pause; done ;;
+	# stash
+	pop) [ $# -gt 0 ] && { git stash pop -q "$1" || pause; } ;;
+	apply) [ $# -gt 0 ] && { git stash apply -q "$1" || pause; } ;;
+	drop)
+		[ $# -gt 0 ] || return 0
+		lt_confirm "drop $*?" || return 0
+		# the newest goes last, so the stash@{N} names of the others stay right
+		for s in $(printf '%s\n' "$@" | sort -t'{' -k2 -rn); do git stash drop -q "$s" || pause; done ;;
+	esac
+}
+
+_lens() {   # read|grab|web|clone REPO REF KEY...
+	act=$1 r=$2 ref=$3; shift 3
+	case $act in
+		read)
+			for k; do case $k in */) echo "== $k"; preview_lens "$r" "$ref" "$k" ;; *) fetch "$RAW/$r/$ref/$(urlpath "$k")" ;; esac; done |
+				${PAGER:-less -R} ;;
+		grab)
+			cd "${GH_START_DIR:-.}" || exit 1
+			for k; do case $k in */) "$SELF" grabdir "$r" "${k%/}" "$ref" ;; *) "$SELF" grab "$r" "$k" "$ref" ;; esac; done
+			pause ;;
+		web) for k; do case $k in */) browse "$WEB/$r/tree/$ref/${k%/}" ;; *) browse "$WEB/$r/blob/$ref/$k" ;; esac; done ;;
+		clone) cd "${GH_START_DIR:-.}" && "$SELF" grab "$r"; pause ;;
+		search) q=$(lt_input "search the code of $r for") || exit 0; [ -n "$q" ] && exec "$SELF" lens "$r" --search "$q" ;;
+	esac
+}
+
+browse() { if have xdg-open; then xdg-open "$1" >/dev/null 2>&1 & elif have open; then open "$1"; else echo "$1"; fi; }
+
+# shellcheck disable=SC2154  # name, vis and desc come from the eval'd lt_wizard output
+_new() {
+	eval "$(lt_wizard <<'X'
+name|New repo name
+vis|Who can see it|private,public|private
+desc|Description (empty is fine)
+X
+)" || return 0
+	[ -n "${name:-}" ] || return 0
+	cd "${GH_START_DIR:-.}" || return 1
+	set -- "$name" -d "$desc"
+	[ "$vis" = public ] && set -- "$@" --public
+	"$SELF" create "$@"
+	pause
+}
+
+# ---- the views -----------------------------------------------------------------------------------------------
+start_view() {   # once per session: remember where it began, hand the token down, a cache for previews
+	have fzf || die "the views need fzf (pacman -S fzf); the commands work without it: gh grab, grabdir, create, remove, public, private"
+	[ -n "${GH_CACHE:-}" ] && return 0
+	GH_CACHE=$(mktemp -d "${TMPDIR:-/tmp}/gh-views.XXXXXX") || exit 1
+	GH_START_DIR=$PWD
+	export GH_CACHE GH_START_DIR
+	trap 'rm -rf "$GH_CACHE"' EXIT
+	token
+	if [ -n "$TOKEN" ]; then GH_TOKEN=$TOKEN; export GH_TOKEN; fi
+}
+
+views_line() {   # VIEW -> the key-bar line that switches views; Tab and Shift+Tab go round them
+	echo ---
+	if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		printf '%s\n' "alt-1: >$SELF files # Files" "alt-2: >$SELF log # Log" "alt-3: >$SELF branches # Branches" "alt-4: >$SELF stash # Stash"
+		set -- files log branches stash repos
+	else
+		set -- repos
+	fi
+	printf '%s\n' "alt-5: >$SELF repos # GitHub" "alt-6: >$SELF _ask # Search"
+	origin_repo >/dev/null && printf '%s\n' "alt-7: >$SELF lens # Lens"
+	[ $# -gt 1 ] || return 0
+	_first=$1 _prev= _next= _last= _found=0
+	for v; do
+		[ "$_found" = 1 ] && [ -z "$_next" ] && _next=$v
+		[ "$v" = "$VIEW" ] && { _found=1; _prev=$_last; }
+		_last=$v
+	done
+	[ -n "$_next" ] || _next=$_first
+	[ -n "$_prev" ] || _prev=$_last
+	printf '%s\n' "tab: >$SELF $_next # Next view" "btab: >$SELF $_prev"
+}
+
+keys_for() {
+	case $1 in
+	files) cat <<EOF
+enter:  !$SELF _git stage      # Stage
+alt-a:  !$SELF _git stageall   # Stage all
+alt-c:  !$SELF _git commit     # Commit
+ctrl-p: !$SELF _git push       # Push
+ctrl-l: !$SELF _git pull       # Pull
+ctrl-d: !$SELF _git discard    # Discard
+---
+alt-d:  !$SELF _git diff       # Diff
+ctrl-e: !$SELF _git edit       # Edit
+alt-m:  !$SELF _git amend      # Amend
+alt-s:  !$SELF _git stash      # Stash
+ctrl-f: !$SELF _git fetch      # Fetch
+ctrl-r: refresh                # Refresh
+EOF
+	;;
+	log) cat <<EOF
+enter:  !$SELF _git show       # Show
+alt-c:  !$SELF _git checkout   # Checkout
+alt-b:  !$SELF _git branchat   # Branch here
+alt-p:  !$SELF _git pick       # Cherry-pick
+ctrl-t: !$SELF _git revert     # Revert
+alt-r:  !$SELF _git reset      # Reset to here
+alt-y:  !$SELF _git yank       # Copy hash
+EOF
+	;;
+	branches) cat <<EOF
+enter:  !$SELF _git switch     # Checkout
+alt-n:  !$SELF _git newbranch  # New branch
+alt-m:  !$SELF _git merge      # Merge in
+alt-r:  !$SELF _git rebase     # Rebase onto
+ctrl-p: !$SELF _git pushbranch # Push
+ctrl-d: !$SELF _git delbranch  # Delete
+ctrl-f: !$SELF _git fetch      # Fetch
+EOF
+	;;
+	stash) cat <<EOF
+enter:  !$SELF _git pop        # Pop
+alt-a:  !$SELF _git apply      # Apply
+ctrl-d: !$SELF _git drop       # Drop
+EOF
+	;;
+	repos) cat <<EOF
+enter:  >$SELF _first lens     # Lens
+ctrl-g: !$SELF _grab           # Grab
+ctrl-o: !$SELF _browse         # Browser
+ctrl-r: refresh                # Refresh
+EOF
+	[ -z "${2:-}" ] && cat <<EOF
+---
+alt-n:  !$SELF _new            # New repo
+alt-u:  !$SELF _tui public     # Make public
+alt-i:  !$SELF _tui private    # Make private
+ctrl-d: !$SELF _tui remove     # Delete
+EOF
+	;;
+	search) cat <<EOF
+enter:  >$SELF _first lens     # Lens
+ctrl-g: !$SELF _grab           # Grab
+ctrl-o: !$SELF _browse         # Browser
+alt-s:  >$SELF _ask            # New search
+EOF
+	;;
+	lens) cat <<EOF
+enter:  !$SELF _lens read $2 $3   # Read
+ctrl-g: !$SELF _lens grab $2 $3   # Grab
+ctrl-o: !$SELF _lens web $2 $3    # Browser
+alt-c:  !$SELF _lens clone $2 $3  # Clone
+alt-s:  >$SELF _lens search $2 $3 # Search code
+EOF
+	;;
+	esac
+}
+
+view_local() {   # files|log|branches|stash
+	VIEW=$1
+	top=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repo (gh repos, gh search and gh lens work anywhere)"
+	cd "$top" || exit 1
+	start_view
+	b=$(git branch --show-current 2>/dev/null)
+	[ -n "$b" ] || b="detached at $(git rev-parse --short HEAD 2>/dev/null || echo '(no commits yet)')"
+	LT_KEYS="$(keys_for "$VIEW")$NL$(views_line)"
+	export LT_KEYS
+	lt_select --mode select --refresh "$REFRESH_MS" --header "$(basename -- "$top") · $b · $VIEW" --prompt 'search> ' --nth 2 \
+		--seed "$SELF _rows $VIEW" --preview "$SELF _preview $VIEW" --keys - >/dev/null || true
+}
+
+view_repos() {   # [OWNER]
+	VIEW=repos
+	start_view
+	if [ -n "${1:-}" ]; then hdr="repos of $1"
+	else _m=$(me) || exit 1; GH_ME=$_m; export GH_ME; hdr="your repos ($_m)"; fi
+	LT_KEYS="$(keys_for repos "${1:-}")$NL$(views_line)"
+	export LT_KEYS
+	lt_select --mode select --refresh 0 --header "$hdr   newest push first" --prompt 'search> ' --nth 2 \
+		--seed "$SELF _rows repos ${1:-}" --preview "$SELF _preview repo" --keys - >/dev/null || true
+}
+
+view_search() {   # QUERY...
+	VIEW=search
+	q=$*
+	[ -n "$q" ] || q=$(lt_input "search GitHub for") || exit 0
+	[ -n "$q" ] || exit 0
+	start_view
+	printf '%s' "$q" >"$GH_CACHE/query"
+	LT_KEYS="$(keys_for search)$NL$(views_line)"
+	export LT_KEYS
+	lt_select --mode select --refresh 0 --header "GitHub: $q   most stars first" --prompt 'filter> ' --nth 2 \
+		--seed "$SELF _rows search \"\$(cat $GH_CACHE/query)\"" --preview "$SELF _preview repo" --keys - >/dev/null || true
+}
+
+view_lens() {   # [REPO|URL [PATH [REF]]] [--search QUERY]
+	VIEW=lens
+	sq= n=0 a1= a2= a3=
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--search) [ $# -ge 2 ] || usage "lens REPO --search QUERY"; sq=$2; shift ;;
+			*) n=$((n + 1)); case $n in 1) a1=$1 ;; 2) a2=$1 ;; 3) a3=$1 ;; *) usage "lens [REPO|URL [PATH [REF]]] [--search QUERY]" ;; esac ;;
+		esac
+		shift
+	done
+	path=$a2 ref=$a3
+	case $a1 in
+		'') r=$(origin_repo) || die "not in a git repo with a GitHub origin: gh lens OWNER/NAME"
+		    [ -n "$ref" ] || ref=$(git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null | sed 's|^[^/]*/||') ;;
+		*github.com/*/tree/* | *github.com/*/blob/*)
+			_r=${a1#*github.com/}; r=${_r%%/*}/; _r=${_r#*/}; r=$r${_r%%/*}; _r=${_r#*/*/}
+			ref=${_r%%/*}; path=${_r#*/}; [ "$path" = "$_r" ] && path= ;;
+		*) r=$(full "$a1") || exit 2 ;;
+	esac
+	path=${path#/}; path=${path%/}
+	start_view
+	info=$(api GET "repos/$r") || exit 1
+	desc=$(printf '%s' "$info" | jget description)
+	[ -n "$ref" ] || ref=$(printf '%s' "$info" | jget default_branch)
+	LT_KEYS="$(keys_for lens "$r" "$ref")$NL$(views_line)"
+	export LT_KEYS
+	if [ -n "$sq" ]; then
+		printf '%s' "$sq" >"$GH_CACHE/code"
+		seed="$SELF _rows code $r \"\$(cat $GH_CACHE/code)\"" hdr="$r @ $ref · code matching: $sq"
+	else
+		seed="$SELF _rows lens $r $ref $path" hdr="$r @ $ref${path:+ · $path/}${desc:+ · $desc}"
+	fi
+	lt_select --mode select --refresh 0 --header "$hdr" --prompt 'filter> ' --nth 2 \
+		--seed "$seed" --preview "$SELF _preview lens $r $ref" --keys - >/dev/null || true
+}
+
+# ---- entry points the views' keys call ------------------------------------------------------------------------
+case ${1:-} in
+	_rows)
+		shift
+		case $1 in
+			files | log | branches | stash) "rows_$1" ;;
+			repos) rows_repos "${2:-}" ;;
+			search) rows_search "$2" ;;
+			lens) rows_lens "$2" "$3" "${4:-}" ;;
+			code) rows_code "$2" "$3" ;;
+		esac
+		exit 0 ;;
+	_preview) shift; _preview "$@"; exit 0 ;;
+	_git) shift; _git "$@"; exit 0 ;;
+	_lens) shift; _lens "$@"; exit 0 ;;
+	_tui) shift; "$SELF" "$@"; pause; exit 0 ;;
+	_grab) shift; cd "${GH_START_DIR:-.}" || exit 1; for k; do "$SELF" grab "$k"; done; pause; exit 0 ;;
+	_browse) shift; for k; do browse "$WEB/$k"; done; exit 0 ;;
+	_first) shift; exec "$SELF" "$1" "$2" ;;
+	_ask) q=$(lt_input "search GitHub for") || exit 0; [ -n "$q" ] && exec "$SELF" search "$q"; exit 0 ;;
+	_new) _new; exit 0 ;;
+esac
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+	'')
+		if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then view_local files; else view_repos; fi ;;
+	files | log | branches | stash) view_local "$cmd" ;;
+	repos) view_repos "$@" ;;
+	search)
+		case ${1:-} in repos | code | issues | prs | commits | -*) real search "$@" ;; esac
+		view_search "$@" ;;
+	lens | lense) view_lens "$@" ;;
+	grab) grab "$@" ;;
+	grabdir) grabdir "$@" ;;
+	create) create "$@" ;;
+	remove) remove "$@" ;;
+	public | private) visibility "$cmd" "$@" ;;
+	-h | --help) help ;;
+	*) real "$cmd" "$@" ;;
+esac

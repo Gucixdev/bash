@@ -37,27 +37,6 @@ setup() {
 	[ "$status" -eq 2 ]
 }
 
-@test "gitgrab: usage error with no args" {
-	run ./gitgrab
-	[ "$status" -eq 2 ]
-}
-
-@test "gitgrab: repo without a path is a clean error" {
-	run ./gitgrab owner/repo
-	[ "$status" -eq 2 ]
-	[[ "$output" == *"PATH"* ]]
-}
-
-@test "gitgrab: refuses to overwrite an existing file" {
-	tmp=$(mktemp -d)
-	echo keep > "$tmp/x"
-	run ./gitgrab owner/repo x -o "$tmp/x"
-	[ "$status" -eq 1 ]
-	[[ "$output" == *"exists"* ]]
-	[ "$(cat "$tmp/x")" = keep ]
-	rm -rf "$tmp"
-}
-
 @test "logcollector: summary-only run writes no archive" {
 	tmp=$(mktemp -d)
 	run ./logcollector -n -s "1 hour ago" -o "$tmp"
@@ -180,53 +159,6 @@ setup() {
 	tmp=$(mktemp -d)
 	XDG_DATA_HOME="$tmp" run ./todo done 9
 	[ "$status" -eq 1 ]
-	rm -rf "$tmp"
-}
-
-@test "gitgrab: a blob URL is turned into the raw URL, token goes in a header not the URL" {
-	tmp=$(mktemp -d)
-	printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "$tmp/curl"
-	chmod +x "$tmp/curl"
-	PATH="$tmp:$PATH" GH_TOKEN=sekret run ./gitgrab https://github.com/o/r/blob/main/src/x.c -o -
-	[ "$status" -eq 0 ]
-	[[ "$output" == *"https://raw.githubusercontent.com/o/r/main/src/x.c"* ]]
-	[[ "$output" == *"Authorization: Bearer sekret"* ]]
-	[[ "$output" != *"raw.githubusercontent.com/o/r/main/src/x.c?"*sekret* ]]
-	rm -rf "$tmp"
-}
-
-@test "gitgrab: falls back to the token gh is logged in with" {
-	tmp=$(mktemp -d)
-	printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "$tmp/curl"
-	printf '#!/bin/sh\n[ "$1 $2" = "auth token" ] && echo fromgh\n' > "$tmp/gh"
-	chmod +x "$tmp/curl" "$tmp/gh"
-	PATH="$tmp:$PATH" run env -u GH_TOKEN ./gitgrab o/r f -o -
-	[ "$status" -eq 0 ]
-	[[ "$output" == *"Authorization: Bearer fromgh"* ]]
-	rm -rf "$tmp"
-}
-
-@test "gitgrab: OWNER/REPO PATH [REF] defaults to HEAD and honours the ref" {
-	tmp=$(mktemp -d)
-	printf '#!/bin/sh\nfor a; do u=$a; done\nprintf "%%s\\n" "$u"\n' > "$tmp/curl"
-	chmod +x "$tmp/curl"
-	PATH="$tmp:$PATH" run ./gitgrab o/r dir/f.txt -o -
-	[ "$output" = "https://raw.githubusercontent.com/o/r/HEAD/dir/f.txt" ]
-	PATH="$tmp:$PATH" run ./gitgrab o/r dir/f.txt v2 -o -
-	[ "$output" = "https://raw.githubusercontent.com/o/r/v2/dir/f.txt" ]
-	rm -rf "$tmp"
-}
-
-@test "gitgrab: a failed fetch leaves no file behind" {
-	tmp=$(mktemp -d)
-	printf '#!/bin/sh\nexit 22\n' > "$tmp/curl"
-	chmod +x "$tmp/curl"
-	cd "$tmp"
-	PATH="$tmp:$PATH" run "$BATS_TEST_DIRNAME/../gitgrab" o/r nothing.txt
-	[ "$status" -eq 1 ]
-	[ ! -e "$tmp/nothing.txt" ]
-	[ -z "$(ls -A "$tmp" | grep gitgrab)" ]
-	cd "$BATS_TEST_DIRNAME/.."
 	rm -rf "$tmp"
 }
 

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# ezhf - terminal browser for the Hugging Face Hub and your local cache, built on lib/lazytui. It uses the
-# real `hf` (huggingface-cli) to download; without it, downloads and everything else fall back to curl and the
-# public Hub API, so it works on a bare box too.
+# hf - terminal browser for the Hugging Face Hub and your local cache, built on lib/lazytui, under the same
+# name as the real `hf` (huggingface_hub CLI) and in front of it: the views below are its own, every other
+# command goes to the real hf unchanged (hf download, hf auth login, hf cache ls ...). It finds the real one
+# by skipping itself on PATH. It uses the real hf to download; without it, downloads and everything else fall
+# back to curl and the public Hub API, so it works on a bare box too.
 #
-#   ezhf [cache | search QUERY [--datasets] | files REPO [--dataset] | get REPO [FILE...] [--dataset]]
+#   hf [cache | search QUERY [--datasets] | files REPO [--dataset] | get REPO [FILE...] [--dataset]]
+#   hf ANYTHING ELSE        the real hf (hf cache with more arguments too: hf cache ls)
 #
 #   cache    (default) what is downloaded: models, datasets and spaces with sizes, biggest first.
 #            Enter lists the files, CTRL-X deletes the marked ones, CTRL-O opens the folder, CTRL-S searches.
@@ -11,7 +14,7 @@
 #            Enter lists the files of the repo, CTRL-D downloads the whole repo, CTRL-O opens it in the browser.
 #   files    every file of a repo with its size (the header has the total). Mark files with space, Enter or
 #            CTRL-D downloads the marked ones (or the current one) - into the cache with hf, else into ./NAME/.
-#   get      the same without the UI: ezhf get gpt2 config.json model.safetensors
+#   get      the same without the UI: hf get gpt2 config.json model.safetensors
 #
 # The cache is HF_HUB_CACHE, or HF_HOME/hub, or ~/.cache/huggingface/hub. A token in HF_TOKEN (or
 # HF_HOME/token) is used for private and gated repos. REPO is OWNER/NAME (or just NAME for old repos).
@@ -230,9 +233,14 @@ SELF=$HERE/$(basename -- "$0")
 HF_HOME_DIR=${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}
 CACHE=${HF_HUB_CACHE:-$HF_HOME_DIR/hub}
 HUB=https://huggingface.co
-HF=$(lt_realbin hf 2>/dev/null) || HF=$(lt_realbin huggingface-cli 2>/dev/null) || HF=
+REAL=$(lt_realbin hf 2>/dev/null) || REAL=   # the real hf CLI, never this script
+HF=$REAL; [ -n "$HF" ] || HF=$(lt_realbin huggingface-cli 2>/dev/null) || HF=
 
-die() { echo "ezhf: $*" >&2; exit 1; }
+die() { echo "hf: $*" >&2; exit 1; }
+real() {   # ARGS... -> the real hf
+	[ -n "$REAL" ] || { echo "hf: 'hf $*' is a command of the real hf, which is not installed (pipx install huggingface_hub)" >&2; exit 127; }
+	exec "$REAL" "$@"
+}
 have() { command -v "$1" >/dev/null 2>&1; }
 tok() { if [ -n "${HF_TOKEN:-}" ]; then printf '%s' "$HF_TOKEN"; elif [ -r "$HF_HOME_DIR/token" ]; then cat "$HF_HOME_DIR/token"; fi; }
 api() {   # PATH -> JSON
@@ -312,7 +320,7 @@ cache_files() {   # DIRNAME... -> the files inside the newest snapshot of each
 	done | { if have less; then less; else cat; fi; }
 }
 cache_rm() {   # DIRNAME...
-	for b in "$@"; do case $b in *--*) ;; *) echo "ezhf: refusing $b" >&2; return 1 ;; esac; done
+	for b in "$@"; do case $b in *--*) ;; *) echo "hf: refusing $b" >&2; return 1 ;; esac; done
 	printf 'delete %s from the cache? [y/N] ' "$*" >&2; read -r a </dev/tty
 	case $a in y | Y | yes | t | T | tak) for b in "$@"; do rm -rf -- "${CACHE:?}/$b" && echo "deleted $b"; done ;; *) echo cancelled ;; esac
 	printf 'press Enter ' >&2; read -r _ </dev/tty
@@ -334,6 +342,7 @@ esac
 view=${1:-cache}
 case $view in
 	cache)
+		[ $# -gt 1 ] && real "$@"   # hf cache ls / rm / prune / verify belong to the real hf
 		LT_KEYS="enter:  !$SELF _files          # Files
 ctrl-x: !$SELF _rm             # Delete from cache
 ctrl-o: !$SELF _dir            # Open folder
@@ -343,7 +352,7 @@ ctrl-r: refresh                # Refresh"
 		lt_select --mode select --refresh 0 --header "cache: $CACHE   (biggest first, space marks)" --prompt 'search> ' --nth 2,3,4 \
 			--seed "$SELF _rows cache" --keys - >/dev/null || true ;;
 	search)
-		q=${2:-}; [ -n "$q" ] || die "usage: ezhf search QUERY [--datasets]"
+		q=${2:-}; [ -n "$q" ] || die "usage: hf search QUERY [--datasets]"
 		kind=model; [ "${3:-}" = --datasets ] && kind=dataset
 		LT_KEYS="enter:  >$SELF _repofiles         # Files
 ctrl-d: !$SELF _dlrepo $kind   # Download all
@@ -353,7 +362,7 @@ alt-b:  >$SELF cache           # Cache"
 		lt_select --refresh 0 --header "Hub $kind search: $q   (most downloaded first)" --prompt 'filter> ' --nth 2,3,4,5,6 \
 			--seed "$SELF _rows search '$q' $kind" --keys - >/dev/null || true ;;
 	files)
-		repo=${2:-}; [ -n "$repo" ] || die "usage: ezhf files REPO [--dataset]"
+		repo=${2:-}; [ -n "$repo" ] || die "usage: hf files REPO [--dataset]"
 		kind=model; [ "${3:-}" = --dataset ] && kind=dataset
 		tot=$(total_size "$repo" "$kind" 2>/dev/null)
 		LT_KEYS="enter:  !$SELF _dl $kind $repo   # Download
@@ -363,12 +372,15 @@ alt-b:  >$SELF cache             # Cache"
 		lt_select --mode select --refresh 0 --header "$repo   total ${tot:-?}   (space marks, Enter downloads)" --prompt 'filter> ' --nth 2 \
 			--seed "$SELF _rows files $repo $kind" --keys - >/dev/null || true ;;
 	get)
-		repo=${2:-}; [ -n "$repo" ] || die "usage: ezhf get REPO [FILE...] [--dataset]"; shift 2
+		repo=${2:-}; [ -n "$repo" ] || die "usage: hf get REPO [FILE...] [--dataset]"; shift 2
 		kind=model; args=; for a in "$@"; do if [ "$a" = --dataset ]; then kind=dataset; else args="$args
 $a"; fi; done
 		IFS='
 '; set -- $args; unset IFS
 		dl "$repo" "$kind" "$@" ;;
-	-h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" ;;
-	*) die "usage: ezhf [cache | search QUERY [--datasets] | files REPO [--dataset] | get REPO [FILE...]]" ;;
+	-h | --help)
+		awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+		[ -n "$REAL" ] && { printf '\n--- the real hf (%s) ---\n' "$REAL"; "$REAL" --help; }
+		exit 0 ;;
+	*) real "$@" ;;
 esac
