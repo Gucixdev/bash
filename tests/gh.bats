@@ -122,6 +122,19 @@ git_repo() {   # a repo with one commit, in $tmp/work
 	[ "$output" = "real: [search] [--help]" ]
 }
 
+@test "gh: in a script a bare gh and gh search answer like the real gh, the views need a terminal" {
+	run gh </dev/null
+	[ "$output" = "real:" ]
+	run gh search </dev/null
+	[ "$output" = "real: [search]" ]
+	run gh search fzf </dev/null
+	[ "$output" = "real: [search] [fzf]" ]
+	git_repo
+	run gh files </dev/null
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"need a terminal"* ]]
+}
+
 @test "gh: without the real gh, a command of the real one is a clean error" {
 	min_path gh
 	PATH="$tmp/min" run -127 gh pr list
@@ -447,6 +460,27 @@ git_repo() {   # a repo with one commit, in $tmp/work
 	[ "$output" = "real hf: [download] [gpt2] [config.json]" ]
 	run hf cache ls
 	[ "$output" = "real hf: [cache] [ls]" ]
+}
+
+@test "hf: in a script a bare hf answers like the real hf, the views need a terminal" {
+	printf '#!/bin/sh\nprintf "real hf:"; for a; do printf " [%%s]" "$a"; done; echo\n' > "$tmp/real/hf"
+	chmod +x "$tmp/real/hf"
+	run hf </dev/null
+	[ "$output" = "real hf:" ]
+	run hf cache </dev/null
+	[ "$output" = "real hf: [cache]" ]
+	run hf search gpt2 </dev/null
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"need a terminal"* ]]
+}
+
+@test "hf get: downloads go through the real hf into its cache (hf download ... --repo-type)" {
+	printf '#!/bin/sh\nprintf "real hf:"; for a; do printf " [%%s]" "$a"; done; echo\n' > "$tmp/real/hf"
+	chmod +x "$tmp/real/hf"
+	run hf get gpt2 config.json
+	[ "$output" = "real hf: [download] [gpt2] [config.json] [--repo-type] [model]" ]
+	run hf get wikitext --dataset
+	[ "$output" = "real hf: [download] [wikitext] [--repo-type] [dataset]" ]
 }
 
 @test "hf: without the real hf, its commands are a clean error" {

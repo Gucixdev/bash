@@ -86,8 +86,9 @@ Every tool prints its header with `--help`.
 
 Built on `lib/lazytui`: arrows or Tab to move, space to mark rows
 like nnn, `/` to search, a key bar always showing what is available.
-The views need fzf 0.71 or newer (or the C fzf they were built with): the
-key labels in the bar and `--id-nth` come from there.
+The views need fzf 0.63 or newer. The C fzf they were built with draws the key
+bar itself; with upstream fzf the bar is a footer, and 0.71 or newer also keeps
+the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 
 | Tool | What it does | Needs |
 |---|---|---|

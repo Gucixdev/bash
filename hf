@@ -6,7 +6,8 @@
 # back to curl and the public Hub API, so it works on a bare box too.
 #
 #   hf [cache | search QUERY [--datasets] | files REPO [--dataset] | get REPO [FILE...] [--dataset]]
-#   hf ANYTHING ELSE        the real hf (hf cache with more arguments too: hf cache ls)
+#   hf ANYTHING ELSE        the real hf (hf cache with more arguments too: hf cache ls). The views need a
+#                           terminal: in a script a bare hf and hf cache answer what the real hf answers.
 #
 #   cache    (default) what is downloaded: models, datasets and spaces with sizes, biggest first.
 #            Enter lists the files, CTRL-X deletes the marked ones, CTRL-O opens the folder, CTRL-S searches.
@@ -90,6 +91,18 @@ lt_select() {
 		_lt_fallback; _lt_rc=$?
 		rm -rf "$_lt_tmp"; return $_lt_rc
 	fi
+	# what this fzf can do: the C fzf the menus were built with takes a label on each bind and draws the
+	# key bar itself (--hints); upstream fzf needs 0.63 for the footer bar, 0.71 to keep the cursor on its
+	# row across refreshes. An older one gets the numbered list.
+	_lt_hints= _lt_fzfv=$(fzf --version 2>/dev/null)
+	case $_lt_fzfv in *-c\ * | *-c) _lt_hints=1 ;; esac
+	_lt_minor=$(printf '%s\n' "$_lt_fzfv" | sed -n 's/^0\.\([0-9][0-9]*\).*/\1/p')
+	[ -n "$_lt_minor" ] || _lt_minor=999
+	if [ -z "$_lt_hints" ] && [ "$_lt_minor" -lt 63 ]; then
+		echo "lt_select: fzf ${_lt_fzfv%% *} is too old for these menus (0.63 or newer), here is a numbered list" >&2
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
 
 	TAB=$(printf '\t')
 	_lt_k="{+$_lt_key}"
@@ -128,7 +141,7 @@ while sleep $_lt_secs; do
 done
 EOF
 		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
-		set -- "$@" --track --id-nth="$_lt_key"
+		if [ -n "$_lt_hints" ] || [ "$_lt_minor" -ge 71 ]; then set -- "$@" --track --id-nth="$_lt_key"; fi
 	fi
 	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
 	if [ -n "$_lt_reload" ]; then
@@ -139,11 +152,10 @@ EOF
 	# mode: select = no input line, space marks, / opens search
 	_lt_bar= _lt_ubar=
 	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
-	_lt_hints=
-	case $(fzf --version 2>/dev/null) in *-c\ *) _lt_hints=1 ;; esac
 	if [ "$_lt_mode" = select ]; then
+		if [ -n "$_lt_hints" ]; then _lt_mark=' # mark' _lt_find=' # search'; else _lt_mark= _lt_find=; fi
 		set -- "$@" --multi --no-input \
-			--bind='space:toggle+down # mark,tab:down,btab:up,/:show-input # search' \
+			--bind="space:toggle+down$_lt_mark,tab:down,btab:up,/:show-input$_lt_find" \
 			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
 		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
 	else
@@ -326,6 +338,11 @@ cache_rm() {   # DIRNAME...
 	printf 'press Enter ' >&2; read -r _ </dev/tty
 }
 web() { url=$HUB/$1; if have xdg-open; then xdg-open "$url" >/dev/null 2>&1 & elif have open; then open "$url"; else echo "$url"; fi; }
+interactive() { [ -n "${HF_VIEWS:-}" ] || { [ -t 0 ] && [ -t 1 ]; }; }   # a terminal, or a view switching to the next
+need_tty() {
+	interactive || die "the views need a terminal; hf get REPO [FILE...] works without one"
+	HF_VIEWS=1; export HF_VIEWS
+}
 
 case ${1:-} in
 	_rows)   shift; k=$1; shift; "rows_$k" "$@"; exit 0 ;;
@@ -343,6 +360,9 @@ view=${1:-cache}
 case $view in
 	cache)
 		[ $# -gt 1 ] && real "$@"   # hf cache ls / rm / prune / verify belong to the real hf
+		# a bare hf (or hf cache) opens the view on a terminal; in a script it answers what the real hf answers
+		if ! interactive && [ -n "$REAL" ]; then real "$@"; fi
+		need_tty
 		LT_KEYS="enter:  !$SELF _files          # Files
 ctrl-x: !$SELF _rm             # Delete from cache
 ctrl-o: !$SELF _dir            # Open folder
@@ -353,6 +373,7 @@ ctrl-r: refresh                # Refresh"
 			--seed "$SELF _rows cache" --keys - >/dev/null || true ;;
 	search)
 		q=${2:-}; [ -n "$q" ] || die "usage: hf search QUERY [--datasets]"
+		need_tty
 		kind=model; [ "${3:-}" = --datasets ] && kind=dataset
 		LT_KEYS="enter:  >$SELF _repofiles         # Files
 ctrl-d: !$SELF _dlrepo $kind   # Download all
@@ -363,6 +384,7 @@ alt-b:  >$SELF cache           # Cache"
 			--seed "$SELF _rows search '$q' $kind" --keys - >/dev/null || true ;;
 	files)
 		repo=${2:-}; [ -n "$repo" ] || die "usage: hf files REPO [--dataset]"
+		need_tty
 		kind=model; [ "${3:-}" = --dataset ] && kind=dataset
 		tot=$(total_size "$repo" "$kind" 2>/dev/null)
 		LT_KEYS="enter:  !$SELF _dl $kind $repo   # Download

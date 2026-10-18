@@ -187,6 +187,44 @@ teardown() {
 	[[ "$output" == *"unknown arg"* ]]
 }
 
+fake_fzf() {   # VERSION -> an fzf on PATH that reports VERSION and writes its arguments to $tmp/fzf.args
+	mkdir -p "$tmp/fzfbin"
+	printf '#!/bin/sh\n[ "$1" = --version ] && { echo "%s"; exit 0; }\nfor a; do printf "%%s\\n" "$a"; done > "%s/fzf.args"\nhead -n 1\n' "$1" "$tmp" > "$tmp/fzfbin/fzf"
+	chmod +x "$tmp/fzfbin/fzf"
+}
+
+@test "lazytui: upstream fzf gets no key labels on its binds, the C fzf does" {
+	fake_fzf '0.74.5 (c0a193e0)'
+	PATH="$tmp/fzfbin:$PATH" run sh -c '. ./lib/lazytui; printf "a\tb\n" | LT_KEYS="ctrl-r: refresh # Refresh" lt_select --mode select --keys -'
+	[ "$status" -eq 0 ]
+	! grep -q ' # ' "$tmp/fzf.args"
+	grep -q -- '--footer=' "$tmp/fzf.args"
+	fake_fzf '0.74.4-c (fzf-compatible C implementation)'
+	PATH="$tmp/fzfbin:$PATH" run sh -c '. ./lib/lazytui; printf "a\tb\n" | LT_KEYS="ctrl-r: refresh # Refresh" lt_select --mode select --keys -'
+	[ "$status" -eq 0 ]
+	grep -q -- 'space:toggle+down # mark' "$tmp/fzf.args"
+	grep -q -- 'ctrl-r:reload(.*) # Refresh' "$tmp/fzf.args"
+	grep -qx -- '--hints' "$tmp/fzf.args"
+}
+
+@test "lazytui: --id-nth only for an fzf that knows it (0.71 or newer)" {
+	fake_fzf '0.70.0 (x)'
+	PATH="$tmp/fzfbin:$PATH" run sh -c '. ./lib/lazytui; printf "a\n" | lt_select --refresh 500'
+	! grep -q -- '--id-nth' "$tmp/fzf.args"
+	fake_fzf '0.71.0 (x)'
+	PATH="$tmp/fzfbin:$PATH" run sh -c '. ./lib/lazytui; printf "a\n" | lt_select --refresh 500'
+	grep -q -- '--id-nth=1' "$tmp/fzf.args"
+}
+
+@test "lazytui: an fzf older than 0.63 gets the numbered list instead of an fzf error" {
+	fake_fzf '0.44.1 (debian)'
+	printf 'one\ntwo\n' > "$tmp/list"
+	PATH="$tmp/fzfbin:$PATH" run sh -c '. ./lib/lazytui; echo 2 | lt_select --seed "cat $1" 2>&1' sh "$tmp/list"
+	[[ "$output" == *"too old"* ]]
+	[[ "$output" == *two* ]]
+	[ ! -f "$tmp/fzf.args" ]
+}
+
 @test "lazytui: lt_realbin skips the script itself and finds the real binary" {
 	mkdir "$tmp/bin" "$tmp/real"
 	printf '#!/bin/sh\n. "%s/lib/lazytui"\nlt_realbin mytool\n' "$PWD" > "$tmp/bin/mytool"

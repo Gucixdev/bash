@@ -7,7 +7,8 @@
 #   gh                     the views: this repo's changes inside a git repo, your GitHub repos outside one
 #   gh files | log | branches | stash        a view of the git repo here
 #   gh repos [OWNER]       your repos (or OWNER's): lens, grab, public/private, remove, new, browser
-#   gh search QUERY...     GitHub repos, most stars first (gh search repos|code|issues|prs|commits: the real one)
+#   gh search QUERY...     GitHub repos, most stars first (gh search alone, gh search repos|code|issues|prs|
+#                          commits and the flags: the real one)
 #   gh lens [REPO|URL [PATH [REF]]] [--search QUERY]
 #                          a repo's files without cloning it: read, grab files and folders, search its code;
 #                          no REPO: the GitHub repo behind this one's origin (also spelled lense)
@@ -29,7 +30,8 @@
 # gh's git_protocol, else https.
 #
 # Views: arrows move, space marks, / searches, Tab or Alt+1..7 switch views, the bar at the bottom shows the
-# rest. Commits ask for a Conventional Commits message (type(scope): summary) and check its shape.
+# rest. Commits ask for a Conventional Commits message (type(scope): summary) and check its shape. The views
+# need a terminal: in a script a bare gh (and gh search WORDS) answers what the real gh answers.
 # shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose
 
 # >>> lazytui (copy of lib/lazytui) >>>
@@ -107,6 +109,18 @@ lt_select() {
 		_lt_fallback; _lt_rc=$?
 		rm -rf "$_lt_tmp"; return $_lt_rc
 	fi
+	# what this fzf can do: the C fzf the menus were built with takes a label on each bind and draws the
+	# key bar itself (--hints); upstream fzf needs 0.63 for the footer bar, 0.71 to keep the cursor on its
+	# row across refreshes. An older one gets the numbered list.
+	_lt_hints= _lt_fzfv=$(fzf --version 2>/dev/null)
+	case $_lt_fzfv in *-c\ * | *-c) _lt_hints=1 ;; esac
+	_lt_minor=$(printf '%s\n' "$_lt_fzfv" | sed -n 's/^0\.\([0-9][0-9]*\).*/\1/p')
+	[ -n "$_lt_minor" ] || _lt_minor=999
+	if [ -z "$_lt_hints" ] && [ "$_lt_minor" -lt 63 ]; then
+		echo "lt_select: fzf ${_lt_fzfv%% *} is too old for these menus (0.63 or newer), here is a numbered list" >&2
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
 
 	TAB=$(printf '\t')
 	_lt_k="{+$_lt_key}"
@@ -145,7 +159,7 @@ while sleep $_lt_secs; do
 done
 EOF
 		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
-		set -- "$@" --track --id-nth="$_lt_key"
+		if [ -n "$_lt_hints" ] || [ "$_lt_minor" -ge 71 ]; then set -- "$@" --track --id-nth="$_lt_key"; fi
 	fi
 	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
 	if [ -n "$_lt_reload" ]; then
@@ -156,11 +170,10 @@ EOF
 	# mode: select = no input line, space marks, / opens search
 	_lt_bar= _lt_ubar=
 	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
-	_lt_hints=
-	case $(fzf --version 2>/dev/null) in *-c\ *) _lt_hints=1 ;; esac
 	if [ "$_lt_mode" = select ]; then
+		if [ -n "$_lt_hints" ]; then _lt_mark=' # mark' _lt_find=' # search'; else _lt_mark= _lt_find=; fi
 		set -- "$@" --multi --no-input \
-			--bind='space:toggle+down # mark,tab:down,btab:up,/:show-input # search' \
+			--bind="space:toggle+down$_lt_mark,tab:down,btab:up,/:show-input$_lt_find" \
 			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
 		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
 	else
@@ -909,7 +922,9 @@ X
 }
 
 # ---- the views -----------------------------------------------------------------------------------------------
+interactive() { [ -n "${GH_CACHE:-}" ] || { [ -t 0 ] && [ -t 1 ]; }; }   # a terminal, or a view switching to the next
 start_view() {   # once per session: remember where it began, hand the token down, a cache for previews
+	interactive || die "the views need a terminal; the commands work without one: gh grab, grabdir, create, remove, public, private"
 	have fzf || die "the views need fzf (pacman -S fzf); the commands work without it: gh grab, grabdir, create, remove, public, private"
 	[ -n "${GH_CACHE:-}" ] && return 0
 	GH_CACHE=$(mktemp -d "${TMPDIR:-/tmp}/gh-views.XXXXXX") || exit 1
@@ -1118,11 +1133,15 @@ cmd=${1:-}
 [ $# -gt 0 ] && shift
 case $cmd in
 	'')
+		# a bare gh opens the views on a terminal; in a script it answers what the real gh answers (its help)
+		if ! interactive; then if [ -n "$REAL" ]; then real; else help; fi; fi
 		if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then view_local files; else view_repos; fi ;;
 	files | log | branches | stash) view_local "$cmd" ;;
 	repos) view_repos "$@" ;;
 	search)
-		case ${1:-} in repos | code | issues | prs | commits | -*) real search "$@" ;; esac
+		# gh search alone, its subcommands and flags are the real gh's; gh search WORDS is the view (on a terminal)
+		case ${1:-} in '' | repos | code | issues | prs | commits | -*) real search "$@" ;; esac
+		interactive || real search "$@"
 		view_search "$@" ;;
 	lens | lense) view_lens "$@" ;;
 	grab) grab "$@" ;;
