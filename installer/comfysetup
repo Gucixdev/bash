@@ -78,10 +78,10 @@ if [ -z "$BASE" ]; then
 fi
 [ "$TORCH_PIP" = __unset__ ] && TORCH_PIP=
 
-_common='--use-split-cross-attention --disable-smart-memory --preview-method none'
+_common='--use-pytorch-cross-attention --disable-smart-memory --preview-method auto'
 if   [ -n "${COMFY_FLAGS:-}" ];              then read -ra FLAGS <<< "$COMFY_FLAGS"
 elif [ "$ACCEL" = cpu ];                     then read -ra FLAGS <<< "--cpu $_common"
-elif [ -z "$VRAM" ] || [ "$VRAM" -lt 6500 ]; then read -ra FLAGS <<< "--lowvram $_common"
+elif [ -z "$VRAM" ] || [ "$VRAM" -lt 6500 ]; then read -ra FLAGS <<< "--lowvram ${COMFY_FP32:+--force-fp32} $_common"   # COMFY_FP32=1: needed by IP-Adapter on Pascal (fp16 weights, fp32 maths); about 10x slower per image
 elif [ "$VRAM" -lt 12000 ];                  then read -ra FLAGS <<< "$_common"
 else                                              read -ra FLAGS <<< "--highvram $_common"
 fi
@@ -238,6 +238,7 @@ say "starting $NAME  (accel=$ACCEL  flags=${FLAGS[*]})"
 # shellcheck disable=SC2046
 pm run -d --replace --name "$NAME" \
     $(gpu_flag) \
+    --memory="${COMFY_MEM:-5g}" --memory-swap="${COMFY_MEM:-5g}" \
     -p "127.0.0.1:$PORT:8188" \
     -v "$SRC:/opt/ComfyUI${Z}" \
     -v "$DATA_HOME/nodes:/opt/ComfyUI/custom_nodes${Z}" \

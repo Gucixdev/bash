@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""cardblank - an empty card, front and back, drawn in the 001_house style: thick wobbly black outline, black/white/red, hand-made look.
+
+  cardblank outdir            # -> outdir/card_front.png, outdir/card_back.png (750x1050, 5:7, transparent outside the card)
+  cardblank outdir --seed 3   # another wobble
+
+Drawn by code, not by the diffusion model: a model cannot make an *empty* card with exact proportions. The front has an empty
+frame for art, a name bar and a text box (all blank); the back is a pattern. Needs PIL.
+"""
+import argparse, math, os, random
+from PIL import Image, ImageDraw
+
+W, H = 750, 1050
+BLACK, WHITE, RED, GREY = (20, 18, 18), (245, 242, 235), (170, 20, 24), (60, 58, 58)
+
+
+def wobble_rect(x0, y0, x1, y1, r, rnd, amp=3.5, step=14):
+    """rounded rectangle as a slightly shaky polyline"""
+    pts = []
+    def arc(cx, cy, a0, a1):
+        for i in range(7):
+            a = math.radians(a0 + (a1 - a0) * i / 6)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    def edge(ax, ay, bx, by):
+        n = max(2, int(math.hypot(bx - ax, by - ay) / step))
+        for i in range(1, n):
+            t = i / n
+            pts.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+    arc(x1 - r, y0 + r, -90, 0); edge(x1, y0 + r, x1, y1 - r)
+    arc(x1 - r, y1 - r, 0, 90); edge(x1 - r, y1, x0 + r, y1)
+    arc(x0 + r, y1 - r, 90, 180); edge(x0, y1 - r, x0, y0 + r)
+    arc(x0 + r, y0 + r, 180, 270); edge(x0 + r, y0, x1 - r, y0)
+    return [(x + rnd.uniform(-amp, amp), y + rnd.uniform(-amp, amp)) for x, y in pts]
+
+
+def stroke(d, pts, w, col):
+    d.line(pts + [pts[0]], fill=col, width=w, joint="curve")
+    for x, y in pts:   # round the joints so the line looks like one marker stroke
+        d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=col)
+
+
+def card(seed, back):
+    rnd = random.Random(seed)
+    im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    body = wobble_rect(12, 12, W - 12, H - 12, 46, rnd)
+    d.polygon(body, fill=RED if back else WHITE)
+    stroke(d, body, 12, BLACK)
+    if back:
+        inner = wobble_rect(52, 52, W - 52, H - 52, 30, rnd)
+        d.polygon(inner, fill=BLACK)
+        stroke(d, inner, 8, WHITE)
+        cx, cy = W // 2, H // 2
+        for k, rr in enumerate((250, 190, 130, 70)):   # wobbly concentric diamonds
+            q = [(cx, cy - rr * 1.3), (cx + rr, cy), (cx, cy + rr * 1.3), (cx - rr, cy)]
+            q = [(x + rnd.uniform(-4, 4), y + rnd.uniform(-4, 4)) for x, y in q]
+            d.polygon(q, fill=RED if k % 2 == 0 else BLACK)
+            stroke(d, q, 7, WHITE)
+    else:
+        for box, r in (((54, 54, W - 54, 130), 14), ((54, 160, W - 54, 640), 18), ((54, 670, W - 54, H - 54), 18)):
+            p = wobble_rect(*box, r, rnd, amp=2.5, step=12)
+            d.polygon(p, fill=WHITE)
+            stroke(d, p, 8, BLACK)
+    return im
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("outdir"); ap.add_argument("--seed", type=int, default=1)
+    o = ap.parse_args()
+    os.makedirs(o.outdir, exist_ok=True)
+    for name, back in (("card_front.png", False), ("card_back.png", True)):
+        p = os.path.join(o.outdir, name)
+        card(o.seed, back).save(p)
+        print(p)
+
+
+main()

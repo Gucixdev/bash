@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""comfyflow - turn an API-format workflow (what comfygen sends) into a graph the ComfyUI UI can open.
+
+  comfygen --dump-workflow /tmp/w.json "a house" x.png
+  comfyflow /tmp/w.json asset-painted          # -> .comfy/user/default/workflows/asset-painted.json (Workflows sidebar, key w)
+
+API JSON has no positions, so the UI shows an empty canvas for anything queued from a script. This lays the nodes
+out in columns (by depth) and fills links from /object_info of the running ComfyUI. Needs ComfyUI up.
+"""
+import json, os, sys, urllib.request
+
+URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, ".comfy/user/default/workflows")
+SIZES = {"CLIPTextEncode": [400, 200], "KSampler": [315, 262], "SaveImage": [315, 270], "CheckpointLoaderSimple": [315, 98],
+         "EmptyLatentImage": [315, 106], "VAEDecode": [210, 46]}
+
+
+def info(cls):
+    with urllib.request.urlopen(f"{URL}/object_info/{cls}", timeout=30) as r:
+        return json.loads(r.read())[cls]
+
+
+def is_widget(spec):
+    t = spec[0]
+    return isinstance(t, list) or t in ("INT", "FLOAT", "STRING", "BOOLEAN", "COMBO")
+
+
+def convert(api):
+    oi = {c: info(c) for c in {n["class_type"] for n in api.values()}}
+    depth = {}
+
+    def d(i):
+        if i not in depth:
+            ups = [v[0] for v in api[i]["inputs"].values() if isinstance(v, list)]
+            depth[i] = 1 + max([d(u) for u in ups], default=-1)
+        return depth[i]
+
+    for i in api:
+        d(i)
+    rows, nodes, links, lid = {}, [], [], 0
+    outlinks = {i: {} for i in api}   # node -> slot -> [link ids]
+    for i, n in api.items():
+        inp = {**oi[n["class_type"]]["input"].get("required", {}), **oi[n["class_type"]]["input"].get("optional", {})}
+        for name, v in n["inputs"].items():
+            if isinstance(v, list):
+                lid += 1
+                outlinks[v[0]].setdefault(v[1], []).append(lid)
+                links.append([lid, int(v[0]), v[1], int(i), None, inp[name][0]])
+    lidx = {}   # link id -> index in links (fill target slot below)
+    for k, l in enumerate(links):
+        lidx[l[0]] = k
+    for i, n in api.items():
+        spec = oi[n["class_type"]]
+        inp = {**spec["input"].get("required", {}), **spec["input"].get("optional", {})}
+        ins, wv = [], []
+        for slot, (name, s) in enumerate(inp.items()):
+            v = n["inputs"].get(name)
+            if is_widget(s):
+                if v is not None:
+                    wv.append(v)
+                    if s[1:] and s[1].get("control_after_generate"):
+                        wv.append("fixed")
+            else:
+                lk = None
+                if isinstance(v, list):
+                    lk = next(l[0] for l in links if l[3] == int(i) and l[1] == int(v[0]) and l[2] == v[1] and l[4] is None)
+                    links[lidx[lk]][4] = len(ins)
+                ins.append({"name": name, "type": s[0], "link": lk})
+        outs = [{"name": nm, "type": t, "links": outlinks[i].get(k, []) or None, "slot_index": k}
+                for k, (nm, t) in enumerate(zip(spec["output_name"], spec["output"]))]
+        col = depth[i]
+        y = rows.get(col, 0)
+        sz = SIZES.get(n["class_type"], [315, 130])
+        rows[col] = y + sz[1] + 40
+        nodes.append({"id": int(i), "type": n["class_type"], "pos": [40 + col * 450, 40 + y], "size": sz, "flags": {}, "order": col,
+                      "mode": 0, "inputs": ins, "outputs": outs, "properties": {"Node name for S&R": n["class_type"]}, "widgets_values": wv})
+    return {"last_node_id": max(int(i) for i in api), "last_link_id": lid, "nodes": nodes, "links": links,
+            "groups": [], "config": {}, "extra": {}, "version": 0.4}
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    api = json.load(open(sys.argv[1]))
+    os.makedirs(OUT, exist_ok=True)
+    out = os.path.join(OUT, sys.argv[2] + ".json")
+    json.dump(convert(api), open(out, "w"), indent=1)
+    print(out)
+
+
+main()

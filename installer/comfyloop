@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""comfyloop - generate a list of assets, judge every one, retry the bad ones, keep going.
+
+  comfyloop prompts.txt outdir                 # one prompt per line: "name | prompt" or just "prompt"
+  comfyloop prompts.txt outdir -k 2 -r 3       # vision model every 2nd image, up to 3 tries per asset
+  comfyloop prompts.txt outdir --style pixel -s 64
+
+Per asset: comfygen (keeps the untouched 512 px as name.raw.png) -> comfyqa on the raw.
+Pixel checks run on every image; the vision model (moondream, CPU) runs on every K-th image and always
+on the last try, so a pass-by-pixels asset still gets a description every few images.
+A failed asset is regenerated with a new seed; the failed file is kept as name.failN.png for the report.
+Writes outdir/REPORT.tsv (name, tries, verdict, seed, fails, description) - append-only, resumable:
+names already PASSed in REPORT.tsv are skipped. Ctrl-C is safe.
+"""
+import argparse, json, os, re, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def sh(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")[:40] or "asset"
+
+
+CHAR = re.compile(r"\b(worker|man|woman|person|character|knight|peasant|villager|citizen|soldier|boy|girl)\b", re.I)
+CHAR_NEG = "weapon, sword, hammer, tool, shield, staff, bag, backpack, hat, accessories, holding anything, props, cape, jewellery"
+
+
+def neg_for(prompt):
+    """characters: no weapon, no accessories, arms out (the positive T-pose is in the prompt text)"""
+    return CHAR_NEG if CHAR.search(prompt) else ""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("prompts"); ap.add_argument("outdir")
+    ap.add_argument("-k", "--vision-every", type=int, default=3, help="vision model on every K-th image (0 = never)")
+    ap.add_argument("-r", "--tries", type=int, default=3)
+    ap.add_argument("--style", default="painted"); ap.add_argument("-s", "--size", type=int, default=None)
+    ap.add_argument("--steps", type=int, default=28)
+    ap.add_argument("--ref", help="style reference picture for every asset (IP-Adapter; ComfyUI must run with COMFY_FP32=1)")
+    o = ap.parse_args()
+    os.makedirs(o.outdir, exist_ok=True)
+    rep = os.path.join(o.outdir, "REPORT.tsv")
+    done = set()
+    if os.path.exists(rep):
+        for ln in open(rep):
+            f = ln.rstrip("\n").split("\t")
+            if len(f) > 2:
+                (done.add if f[2] == "PASS" else done.discard)(f[0])
+    else:
+        open(rep, "w").write("name\ttries\tverdict\tseed\tfails\tdescription\n")
+    items = []
+    for ln in open(o.prompts):
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        n, _, p = ln.partition("|")
+        items.append((slug(n), p.strip()) if p else (slug(ln), ln))
+    n_img = 0
+    for name, prompt in items:
+        if name in done:
+            print(f"skip {name} (already PASS)"); continue
+        verdict, seed, fails, desc = "FAIL", "", [], ""
+        for t in range(1, o.tries + 1):
+            out = os.path.join(o.outdir, name + ".png")
+            raw = os.path.join(o.outdir, name + ".raw.png")
+            seed = str(int(time.time() * 1000) % 2**31)
+            c = [os.path.join(HERE, "comfygen"), "--style", o.style, "--steps", str(o.steps), "--seed", seed, "--raw", "--neg", neg_for(prompt)] + (["--ref", o.ref] if o.ref else []) + [prompt, out]
+            if o.size:
+                c[1:1] = ["-s", str(o.size)]
+            r = sh(c)
+            if r.returncode:
+                print(f"{name} try {t}: comfygen failed: {r.stderr.strip()[-200:]}"); fails = ["comfygen"]; time.sleep(5); continue
+            n_img += 1
+            use_v = o.vision_every > 0 and (n_img % o.vision_every == 0 or t == o.tries)
+            q = [os.path.join(HERE, "comfyqa"), raw, "-p", prompt, "-s", name.split("_")[-1]] + (["-v"] if use_v else [])
+            r = sh(q)
+            try:
+                j = json.loads(r.stdout.strip().splitlines()[-1])
+            except Exception:
+                j = {"fails": ["qa_crash"], "pass": False}
+            fails = j.get("fails", [])
+            desc = (j.get("vision") or {}).get("describes", "")
+            tag = "PASS" if j.get("pass") else "fail " + ",".join(fails)
+            print(f"{name} try {t}/{o.tries} seed={seed} vision={'y' if use_v else 'n'} -> {tag}" + (f"  | {desc}" if desc else ""))
+            if j.get("pass"):
+                verdict = "PASS"; break
+            os.replace(raw, os.path.join(o.outdir, f"{name}.fail{t}.png"))
+        if verdict != "PASS" and os.path.exists(os.path.join(o.outdir, name + ".png")):
+            os.replace(os.path.join(o.outdir, name + ".png"), os.path.join(o.outdir, name + ".lastfail.png"))
+        with open(rep, "a") as f:
+            f.write("\t".join([name, str(t), verdict, seed, ",".join(fails), desc.replace("\t", " ").replace("\n", " ")]) + "\n")
+    ok = [os.path.join(o.outdir, n + ".raw.png") for n, _ in items if os.path.exists(os.path.join(o.outdir, n + ".raw.png"))]
+    if ok:   # one picture to look at: the QA is a filter, your eyes (or mine) are the judge
+        sheet = os.path.join(o.outdir, "SHEET.png")
+        sh(["magick", "montage", *ok, "-tile", "6x", "-geometry", "256x256+4+4", "-label", "%t", sheet])
+        print("sheet ->", sheet)
+    print(f"done -> {rep}")
+
+
+main()

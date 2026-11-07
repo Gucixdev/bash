@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""comfyqa - judge a generated asset: cheap pixel checks always, a vision model on request.
+
+  comfyqa raw.png                         # pixel checks only (fast, every image)
+  comfyqa raw.png -v -p "blue worker"     # + moondream (ollama, CPU) describes it and lists defects
+  exit 0 = pass, 1 = fail; one JSON line on stdout, human summary on stderr.
+
+Pixel checks (on the untouched 512 px image, plain white background expected):
+  empty / flat      almost nothing but background, or no tonal range
+  bg_not_plain      the border is not near-white (scene, gradient, frame)
+  cut_off           the object touches the image edge (cropped)
+  blurry            low Laplacian variance on the object
+  multi_object      pixels outside the biggest blob (stray objects, floating bits)
+Vision (advisory but it can fail an image): description must mention the subject word, and the
+defect question must not name distortion words. moondream is small: it catches "this is a landscape
+not a worker", it does NOT catch a slightly wrong hand. Say so in the report, never pretend more.
+Needs PIL + numpy. Vision needs ollama with `ollama pull moondream`.
+"""
+import argparse, base64, io, json, os, re, sys, urllib.request
+import numpy as np
+from PIL import Image
+
+OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+VISION_MODEL = os.environ.get("COMFYQA_VISION", "moondream")
+BAD_WORDS = re.compile(r"\b(distort\w*|deform\w*|extra (limb|arm|leg|finger|hand|head)s?|missing (limb|arm|leg|finger|hand|head)s?|"
+                       r"blurr?y|cut off|cropped|text|watermark|artifact\w*|mutat\w*|fused|melted|asymmetr\w*|disfigur\w*)\b", re.I)
+NO_DEFECT = re.compile(r"\b(no|none|nothing|not any|without)\b", re.I)
+
+
+def pixel_checks(path):
+    im = Image.open(path).convert("RGB")
+    a = np.asarray(im).astype(np.float32)
+    h, w, _ = a.shape
+    lum = a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    fails, m = [], {}
+
+    # background = distance from white; object = clearly not white
+    dist = np.abs(255.0 - a).max(axis=2)
+    obj = dist > 40
+    cov = float(obj.mean())
+    m["coverage"] = round(cov, 3)
+    if cov < 0.03:
+        fails.append("empty")
+    if cov > 0.90:
+        fails.append("bg_not_plain")
+
+    # border band 6 px: should be white; object pixels there = cut off, other junk = scene
+    band = np.zeros_like(obj)
+    band[:6, :] = band[-6:, :] = band[:, :6] = band[:, -6:] = True
+    border_obj = float(obj[band].mean())
+    m["border_obj"] = round(border_obj, 3)
+    if border_obj > 0.30:
+        fails.append("bg_not_plain")
+    elif border_obj > 0.02:
+        fails.append("cut_off")
+
+    # tone range on the object
+    if obj.sum() > 50:
+        m["tone_std"] = round(float(lum[obj].std()), 1)
+        if m["tone_std"] < 18:
+            fails.append("flat")
+        # sharpness: Laplacian variance on the object bounding box
+        ys, xs = np.where(obj)
+        crop = lum[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        if crop.shape[0] > 8 and crop.shape[1] > 8:
+            lap = (-4 * crop[1:-1, 1:-1] + crop[:-2, 1:-1] + crop[2:, 1:-1] + crop[1:-1, :-2] + crop[1:-1, 2:])
+            m["sharp"] = round(float(lap.var()), 1)
+            if m["sharp"] < 25:
+                fails.append("blurry")
+        # blobs on a 64 px grid: stray objects
+        g = obj.reshape(64, h // 64, 64, w // 64).mean(axis=(1, 3)) > 0.15
+        m["blobs"], m["main_blob"] = blobs(g)
+        if m["blobs"] > 1 and m["main_blob"] < 0.80:
+            fails.append("multi_object")
+    return fails, m
+
+
+def blobs(g):
+    """count 8-connected blobs in a boolean grid; return (count, share of the biggest)"""
+    seen = np.zeros_like(g, dtype=bool)
+    sizes = []
+    H, W = g.shape
+    for y in range(H):
+        for x in range(W):
+            if g[y, x] and not seen[y, x]:
+                st, n = [(y, x)], 0
+                seen[y, x] = True
+                while st:
+                    cy, cx = st.pop()
+                    n += 1
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            ny, nx = cy + dy, cx + dx
+                            if 0 <= ny < H and 0 <= nx < W and g[ny, nx] and not seen[ny, nx]:
+                                seen[ny, nx] = True
+                                st.append((ny, nx))
+                sizes.append(n)
+    return len(sizes), (max(sizes) / sum(sizes) if sizes else 0.0)
+
+
+def ask(img_b64, prompt, timeout=300):
+    body = {"model": VISION_MODEL, "stream": False, "keep_alive": 0,
+            "options": {"num_gpu": 0, "temperature": 0},   # CPU: ComfyUI owns the 4 GB of VRAM
+            "messages": [{"role": "user", "content": prompt, "images": [img_b64]}]}
+    req = urllib.request.Request(OLLAMA + "/api/chat", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())["message"]["content"].strip()
+
+
+SYN = {"dwarf": "dwarf man person character gnome bearded figure", "worker": "man person character boy girl figure builder warrior knight human", "house": "house home cottage hut building cabin",
+       "tree": "tree oak", "crate": "crate box chest", "sword": "sword blade", "barrel": "barrel keg cask"}
+
+
+def subject_ok(desc, subject):
+    d = desc.lower()
+    keys = [subject.lower()] + SYN.get(subject.lower(), "").split()
+    return any(k in d for k in keys)
+
+
+def vision(path, prompt, subject=""):
+    im = Image.open(path).convert("RGB")
+    im.thumbnail((378, 378))   # moondream's native size; smaller = faster, no quality lost
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    b = base64.b64encode(buf.getvalue()).decode()
+    desc = ask(b, "Describe this image in one or two sentences.")
+    defects = ask(b, "List any visual defects in this image: distorted or extra limbs, deformed shapes, blur, "
+                     "text or watermark, cut-off parts, messy background. If there are none, answer: none.")
+    fails = []
+    if subject and not subject_ok(desc, subject):
+        fails.append("off_subject")
+    elif prompt and not subject:
+        words = [w for w in re.findall(r"[a-z]{4,}", prompt.lower())]
+        # a prompt word, or its stem, must show up in the description; most prompts name the subject first
+        stems = {w[:5] for w in words[:6]}
+        if stems and not any(s in desc.lower() for s in stems):
+            fails.append("off_subject")
+    if BAD_WORDS.search(defects) and not NO_DEFECT.match(defects):
+        fails.append("vision_defects")
+    return fails, {"describes": desc, "defects": defects}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("image")
+    ap.add_argument("-v", "--vision", action="store_true", help="also ask the vision model (slow on CPU, ~10-40 s)")
+    ap.add_argument("-p", "--prompt", default="", help="the generation prompt, to check the subject appears")
+    ap.add_argument("-s", "--subject", default="", help="one word the description must contain (or a synonym), e.g. worker")
+    o = ap.parse_args()
+    fails, m = pixel_checks(o.image)
+    out = {"image": o.image, "metrics": m}
+    if o.vision:
+        try:
+            vf, vi = vision(o.image, o.prompt, o.subject)
+            fails += vf
+            out["vision"] = vi
+        except Exception as e:
+            out["vision_error"] = str(e)
+    out["fails"] = sorted(set(fails))
+    out["pass"] = not out["fails"]
+    print(json.dumps(out, ensure_ascii=False))
+    print(f"comfyqa: {'PASS' if out['pass'] else 'FAIL ' + ','.join(out['fails'])}  {m}", file=sys.stderr)
+    if "vision" in out:
+        print(f"  sees:    {out['vision']['describes']}\n  defects: {out['vision']['defects']}", file=sys.stderr)
+    sys.exit(0 if out["pass"] else 1)
+
+
+main()
