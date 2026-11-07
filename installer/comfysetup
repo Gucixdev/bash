@@ -256,7 +256,12 @@ for _ in $(seq 1 600); do
     if curl -sf -o /dev/null "http://127.0.0.1:$PORT/"; then
         url="http://127.0.0.1:$PORT/"
         echo " -> $url"
-        command -v flatpak >/dev/null 2>&1 && flatpak run org.mozilla.firefox "$url" >/dev/null 2>&1 &
+        # one native window (comfywin, WebKitGTK) - a second call focuses it; Firefox only as fallback
+        if python3 -c "import gi; gi.require_version('WebKit2','4.1')" 2>/dev/null; then
+            "$(dirname "$(readlink -f "$0")")/comfywin" "$url" >/dev/null 2>&1 &
+        elif command -v flatpak >/dev/null 2>&1; then
+            flatpak run org.mozilla.firefox "$url" >/dev/null 2>&1 &
+        fi
         exit 0
     fi
     [ "$(pm inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = true ] \
