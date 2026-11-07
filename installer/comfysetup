@@ -137,6 +137,14 @@ install_nodes() {
     done
 }
 
+# MODELS.md in the data dir: every model that was downloaded - what, where from, size, date - so it is never lost.
+# Licence and "used by" are filled by hand (the script cannot know them).
+record_model() {
+    m=$DATA_HOME/MODELS.md
+    [ -f "$m" ] || printf '# Models\n\nWritten by comfysetup models. Fill licence and used-by by hand.\n\n| file | folder | source | MiB | date | licence | used by |\n|---|---|---|---|---|---|---|\n' > "$m"
+    grep -qF "| $2 |" "$m" || printf '| %s | %s | %s | %s | %s |  |  |\n' "$2" "$1" "$3" "$4" "$(date +%F)" >> "$m"
+}
+
 # --- models: an explicit, size-checked download, never part of the normal start -------------------------------
 install_models() {
     list=$(if [ -n "$MODELS_LIST" ]; then cat "$MODELS_LIST"; else models_default; fi)
@@ -167,6 +175,7 @@ EOF
         mkdir -p "$DATA_HOME/models/$sub"
         say "download $file"
         curl -fL --retry 3 -C - -o "$dst.part" "$url" && mv "$dst.part" "$dst" || { echo "comfysetup: failed: $file (run again to resume)" >&2; exit 1; }
+        record_model "$sub" "$file" "$url" "$mb"
     done
     say "models are in $DATA_HOME/models"
 }

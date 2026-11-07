@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""comfygen - prompt in, pixel-art asset out, through a running ComfyUI (comfysetup starts it).
+
+  comfygen "a small wooden house, side view" assets/house.png        # 64 px, 16 colours, transparent background
+  comfygen -s 96 -c 24 -n 4 --seed 7 "blue worker with a hammer" out/worker.png
+
+Pipeline: SD1.5 txt2img 512x512 (checkpoint from .comfy/models) -> corner colour made transparent -> nearest-neighbour
+downscale to --size -> palette cut to --colors. Needs ImageMagick (magick or convert). Plain SD1.5 is weak at pixel art;
+a pixel-art LoRA is the real fix (add it to MODELS.md when you get one). Stdlib only. Exit 0 = file written.
+"""
+import argparse, json, os, shutil, subprocess, sys, time, urllib.request, urllib.parse, tempfile
+
+CKPT = "v1-5-pruned-emaonly-fp16.safetensors"
+STYLE = "pixel art, 16-bit sprite, side view, flat colours, clean outline, single object centered, plain solid green background"
+NEG = "blurry, photo, realistic, 3d render, gradient, text, watermark, multiple objects, cropped, shadow on background"
+
+def workflow(prompt, seed, steps, ckpt):
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": f"{prompt}, {STYLE}", "clip": ["1", 1]}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": NEG, "clip": ["1", 1]}},
+        "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+        "5": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0],
+              "seed": seed, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "comfygen"}},
+    }
+
+def call(url, data=None):
+    req = urllib.request.Request(url, data=None if data is None else json.dumps(data).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+def magick():
+    for n in ("magick", "convert"):
+        if shutil.which(n):
+            return n
+    sys.exit("comfygen: ImageMagick (magick or convert) not found")
+
+def main():
+    a = argparse.ArgumentParser()
+    a.add_argument("prompt"); a.add_argument("out")
+    a.add_argument("-s", "--size", type=int, default=64); a.add_argument("-c", "--colors", type=int, default=16)
+    a.add_argument("--seed", type=int, default=None); a.add_argument("--steps", type=int, default=20)
+    a.add_argument("--url", default=os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")); a.add_argument("--ckpt", default=CKPT)
+    a.add_argument("--raw", action="store_true", help="also keep the untouched 512 px image next to the output (.raw.png)")
+    o = a.parse_args()
+    seed = o.seed if o.seed is not None else int(time.time()) % 2**31
+    try:
+        pid = json.loads(call(o.url + "/prompt", {"prompt": workflow(o.prompt, seed, o.steps, o.ckpt)}))["prompt_id"]
+    except Exception as e:
+        sys.exit(f"comfygen: cannot queue on {o.url}: {e}")
+    t0 = time.time()
+    while True:
+        h = json.loads(call(f"{o.url}/history/{pid}"))
+        if pid in h and h[pid].get("outputs"):
+            break
+        if time.time() - t0 > 900:
+            sys.exit("comfygen: timed out after 15 min")
+        time.sleep(1.5)
+    img = h[pid]["outputs"]["7"]["images"][0]
+    raw = call(o.url + "/view?" + urllib.parse.urlencode({"filename": img["filename"], "subfolder": img["subfolder"], "type": img["type"]}))
+    os.makedirs(os.path.dirname(os.path.abspath(o.out)), exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False); tmp.write(raw); tmp.close()
+    if o.raw:
+        shutil.copy(tmp.name, o.out.rsplit(".", 1)[0] + ".raw.png")
+    m = magick()
+    cmd = [m, tmp.name, "-fuzz", "18%", "-fill", "none", "-draw", "color 0,0 floodfill", "-trim", "+repage",
+           "-filter", "point", "-resize", f"{o.size}x{o.size}", "-colors", str(o.colors), o.out]
+    if m == "convert" or True:
+        subprocess.run(cmd, check=True)
+    os.unlink(tmp.name)
+    print(f"{o.out}  seed={seed}  {time.time()-t0:.0f}s")
+
+main()
