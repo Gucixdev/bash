@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# setup - install what the project needs, show the list first, ask once. 0 arguments (-y answers yes).
+# Template: copy to the project root as `setup`. Works on pacman, apt, dnf and xbps; unknown systems get the list to install by hand.
+set -u
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+# EDIT: one line per dependency: command|package on pacman|apt|dnf|xbps (use - when the package has the same name everywhere)
+DEPS='git|git
+make|make
+cc|gcc
+shellcheck|shellcheck'
+
+yes_all=0; [ "${1:-}" = -y ] && yes_all=1
+
+missing=''
+while IFS='|' read -r cmd pkg; do
+	command -v "$cmd" >/dev/null 2>&1 || missing="$missing $pkg"
+done <<EOT
+$DEPS
+EOT
+missing=${missing# }
+[ -n "$missing" ] || { echo "setup: everything is installed"; exit 0; }
+
+if   command -v pacman    >/dev/null; then inst='sudo pacman -S --needed'
+elif command -v apt-get   >/dev/null; then inst='sudo apt-get install'
+elif command -v dnf       >/dev/null; then inst='sudo dnf install'
+elif command -v xbps-install >/dev/null; then inst='sudo xbps-install -S'
+else echo "setup: unknown package manager; install by hand: $missing"; exit 1; fi
+
+echo "setup: will run: $inst $missing"
+if [ "$yes_all" -eq 0 ]; then
+	printf 'continue? [y/N] '; read -r a || exit 1
+	case $a in y | Y) ;; *) echo "setup: nothing done"; exit 1 ;; esac
+fi
+# shellcheck disable=SC2086   # $inst and $missing are word lists on purpose
+$inst $missing
