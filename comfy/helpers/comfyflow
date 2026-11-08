@@ -2,7 +2,7 @@
 """comfyflow - turn an API-format workflow (what comfygen sends) into a graph the ComfyUI UI can open.
 
   comfygen --dump-workflow /tmp/w.json "a house" x.png
-  comfyflow /tmp/w.json asset-painted          # -> .comfy/user/default/workflows/asset-painted.json (Workflows sidebar, key w)
+  comfyflow /tmp/w.json asset-painted          # -> comfy/data/user/default/workflows/asset-painted.json (Workflows sidebar, key w)
 
 API JSON has no positions, so the UI shows an empty canvas for anything queued from a script. This lays the nodes
 out in columns (by depth) and fills links from /object_info of the running ComfyUI. Needs ComfyUI up.
@@ -11,7 +11,7 @@ import json, os, sys, urllib.request
 
 URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, ".comfy/user/default/workflows")
+OUT = os.path.join(os.path.dirname(HERE), "data/user/default/workflows")
 SIZES = {"CLIPTextEncode": [400, 200], "KSampler": [315, 262], "SaveImage": [315, 270], "CheckpointLoaderSimple": [315, 98],
          "EmptyLatentImage": [315, 106], "VAEDecode": [210, 46]}
 

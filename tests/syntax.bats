@@ -24,9 +24,13 @@ setup() {
 	done
 }
 
+@test "comfy/comfylauncher parses" {
+	bash -n comfy/comfylauncher
+}
+
 @test "every top-level tool answers --help from its header" {
 	for f in btth cleaner ezcontainers flatseal metadata_cleaner nmap scenario sniff todo trash wifi \
-		hf gh screenshot logcollector manwriter findfat morph fixmedia; do
+		hf gh screenshot logcollector manwriter findfat morph fixmedia protonlauncher; do
 		run ./"$f" --help
 		[ "$status" -eq 0 ]
 		[ -n "$output" ]
@@ -36,7 +40,7 @@ setup() {
 @test "shellcheck: no warnings or errors" {
 	command -v shellcheck >/dev/null || skip "shellcheck not installed"
 	run shellcheck -S warning btth cleaner ezcontainers findfat fixmedia flatseal gh hf logcollector \
-		manwriter metadata_cleaner morph nmap scenario screenshot sniff todo trash wifi \
-		lib/lazytui lib/dspq lib/evq lib/settings lib/wizard installer/blenderlauncher installer/comfysetup installer/tos
+		manwriter metadata_cleaner morph nmap protonlauncher scenario screenshot sniff todo trash wifi \
+		lib/lazytui lib/dspq lib/evq lib/settings lib/wizard installer/blenderlauncher comfy/comfylauncher templates/*
 	[ "$status" -eq 0 ]
 }

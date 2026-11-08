@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""comfygen - prompt in, pixel-art asset out, through a running ComfyUI (comfysetup starts it).
+"""comfygen - prompt in, pixel-art asset out, through a running ComfyUI (comfylauncher start runs it).
 
   comfygen "a small wooden house" assets/house.png                  # painted side-view asset, 256 px, transparent background
   comfygen --style pixel -s 64 -c 16 "blue worker with a hammer" out/worker.png

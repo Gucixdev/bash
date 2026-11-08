@@ -1,0 +1,623 @@
+#!/usr/bin/env bash
+# comfylauncher - ComfyUI in one folder: install, update, start, stop, status, models, nodes, logs, doctor.
+# ComfyUI runs from a python venv (comfy/venv) cloned into comfy/ComfyUI; everything you make or download
+# (models, nodes, output, user workflows) lives in comfy/data, so the program can be rebuilt at any time.
+# Without a GPU it falls back to --cpu; with under 6 GB of VRAM (nvidia-smi) it starts with --lowvram.
+#
+#   comfylauncher                 no arguments: a menu (or the status, when not on a terminal)
+#   comfylauncher install         clone ComfyUI, make the venv, install torch + requirements (shows the plan, asks)
+#   comfylauncher update          git pull, reinstall requirements if they changed, update nodes
+#   comfylauncher start           start in the background and open the window; stop, status, logs as named
+#   comfylauncher models          list models (also those from linked dirs); get = starter set (asks, resumes);
+#                                 link DIR / unlink DIR = also read models from DIR (e.g. another UI's folder)
+#   comfylauncher nodes           list custom nodes; add OWNER/REPO, update, remove NAME
+#   comfylauncher doctor          check every requirement, say how to fix what is missing
+#   comfylauncher gen|flow|loop|qa|card|window ARGS   the asset helpers in helpers/ (comfygen, comfyflow, ...)
+#
+# Environment: COMFY_PORT (8188)  COMFY_HOME (data dir)  COMFY_PYTHON  COMFY_FLAGS (replace the detected flags)
+#   COMFY_TORCH_INDEX (pip index url for torch)  COMFY_FP32=1 (--force-fp32, IP-Adapter on Pascal)  COMFY_YES=1 (no questions)
+#   COMFY_NODES (owner/repo list installed with `install`)  COMFY_MODEL_BUDGET_MB (10240)
+
+# shellcheck disable=SC1007  # a= b= sets several variables to empty on purpose (lazytui block)
+set -u
+case ${1:-} in -h | --help | help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+ROOT=$(dirname "$(readlink -f "$0")")
+DATA=${COMFY_HOME:-$ROOT/data}
+SRC=${COMFY_SRC:-$ROOT/ComfyUI}
+VENV=${COMFY_VENV:-$ROOT/venv}
+PORT=${COMFY_PORT:-8188}
+REPO=${COMFY_REPO:-https://github.com/comfyanonymous/ComfyUI}
+NODES=${COMFY_NODES-pydn/ComfyUI-to-Python-Extension}
+NODE_PIP=${COMFY_NODE_PIP-black}
+BUDGET=${COMFY_MODEL_BUDGET_MB:-10240}
+PIDF=$DATA/comfy.pid
+LOG=$DATA/comfy.log
+URL=http://127.0.0.1:$PORT/
+
+say() { printf '\033[36m>>\033[0m %s\n' "$*"; }
+die() { printf 'comfylauncher: %s\n' "$*" >&2; exit 1; }
+ask() { # ask "question" -> 0 on yes; COMFY_YES=1 answers yes
+	[ -n "${COMFY_YES:-}" ] && { echo "$1 yes"; return 0; }
+	lt_confirm "$1"
+}
+have() { command -v "$1" > /dev/null 2>&1; }
+
+# >>> lazytui (copy of lib/lazytui) >>>
+# _lt_hint KEYNAME LABEL -> key caps then LABEL (the nnn hint-bar look). KEYNAME is an fzf key
+# (ctrl-r, alt-enter, ctrl-alt-x, shift-up, f5, space...). Every modifier gets its own coloured cap
+# (Ctrl blue, Alt yellow, Shift green), the key itself is a reverse-video cap.
+_lt_hint() {
+	_lt_h=$1
+	while :; do
+		case $_lt_h in
+			ctrl-?*)  printf '\033[30;44m Ctrl \033[0m'; _lt_h=${_lt_h#ctrl-} ;;
+			alt-?*)   printf '\033[30;43m Alt \033[0m'; _lt_h=${_lt_h#alt-} ;;
+			shift-?*) printf '\033[30;42m Shift \033[0m'; _lt_h=${_lt_h#shift-} ;;
+			*) break ;;
+		esac
+	done
+	case $_lt_h in
+		?) _lt_h=$(printf %s "$_lt_h" | tr '[:lower:]' '[:upper:]') ;;
+		enter) _lt_h=Enter ;; esc) _lt_h=Esc ;; tab) _lt_h=Tab ;; btab) _lt_h='Shift+Tab' ;; space) _lt_h=Space ;;
+		bspace) _lt_h=Backspace ;; pgup) _lt_h=PgUp ;; pgdn) _lt_h=PgDn ;; del) _lt_h=Del ;;
+		up) _lt_h='↑' ;; down) _lt_h='↓' ;; left) _lt_h='←' ;; right) _lt_h='→' ;;
+	esac
+	printf '\033[7m %s \033[0m %s   ' "$_lt_h" "$2"
+}
+
+# _lt_trim STR -> STR without leading/trailing blanks
+_lt_trim() { printf %s "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# _lt_script FILE CMD -> FILE runs CMD "$@" (keeps quoting out of fzf binds)
+_lt_script() { printf '%s "$@"\n' "$2" >"$1"; }
+
+lt_confirm() {   # lt_confirm "question" -> 0 on y
+	printf '%s [y/N] ' "$1" >&2
+	read -r _lt_a || return 1
+	case $_lt_a in y | Y | yes | YES | t | T | tak) return 0 ;; *) return 1 ;; esac
+}
+
+lt_input() {   # lt_input "prompt" [default] -> stdout
+	printf '%s%s: ' "$1" "${2:+ [$2]}" >&2
+	read -r _lt_a || return 1
+	printf '%s\n' "${_lt_a:-${2:-}}"
+}
+
+lt_select() {
+	_lt_mode=raw _lt_refresh=${LT_REFRESH:-0} _lt_seed= _lt_more= _lt_reload= _lt_preview= _lt_keys= \
+	_lt_key=1 _lt_nth= _lt_header= _lt_prompt='> '
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--mode)    _lt_mode=$2;    shift 2 ;;
+			--seed)    _lt_seed=$2;    shift 2 ;;
+			--more)    _lt_more=$2;    shift 2 ;;
+			--refresh) _lt_refresh=$2; shift 2 ;;
+			--reload)  _lt_reload=$2;  shift 2 ;;
+			--preview) _lt_preview=$2; shift 2 ;;
+			--keys)    _lt_keys=$2;    shift 2 ;;
+			--key)     _lt_key=$2;     shift 2 ;;
+			--nth)     _lt_nth=$2;     shift 2 ;;
+			--header)  _lt_header=$2;  shift 2 ;;
+			--prompt)  _lt_prompt=$2;  shift 2 ;;
+			*) echo "lt_select: unknown arg $1" >&2; return 2 ;;
+		esac
+	done
+	case $_lt_refresh in '' | *[!0-9]*) echo "lt_select: --refresh wants milliseconds, got '$_lt_refresh'" >&2; return 2 ;; esac
+	case $_lt_mode in raw | select) ;; *) echo "lt_select: --mode must be raw or select" >&2; return 2 ;; esac
+
+	_lt_tmp=$(mktemp -d) || return 1
+	if [ -n "$_lt_seed" ]; then
+		_lt_script "$_lt_tmp/seed.sh" "$_lt_seed"
+	else
+		cat >"$_lt_tmp/list"
+		printf 'cat "%s/list"\n' "$_lt_tmp" >"$_lt_tmp/seed.sh"
+	fi
+
+	if ! command -v fzf >/dev/null 2>&1; then
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
+	# what this fzf can do: the C fzf the menus were built with takes a label on each bind and draws the
+	# key bar itself (--hints); upstream fzf needs 0.63 for the footer bar, 0.71 to keep the cursor on its
+	# row across refreshes. An older one gets the numbered list.
+	_lt_hints= _lt_fzfv=$(fzf --version 2>/dev/null)
+	case $_lt_fzfv in *-c\ * | *-c) _lt_hints=1 ;; esac
+	_lt_minor=$(printf '%s\n' "$_lt_fzfv" | sed -n 's/^0\.\([0-9][0-9]*\).*/\1/p')
+	[ -n "$_lt_minor" ] || _lt_minor=999
+	if [ -z "$_lt_hints" ] && [ "$_lt_minor" -lt 63 ]; then
+		echo "lt_select: fzf ${_lt_fzfv%% *} is too old for these menus (0.63 or newer), here is a numbered list" >&2
+		_lt_fallback; _lt_rc=$?
+		rm -rf "$_lt_tmp"; return $_lt_rc
+	fi
+
+	TAB=$(printf '\t')
+	_lt_k="{+$_lt_key}"
+	set -- --delimiter="$TAB" --ansi --prompt="$_lt_prompt" --footer-border=none --layout=reverse-list
+	[ -n "$_lt_header" ] && set -- "$@" --header="$_lt_header"
+	[ -n "$_lt_nth" ] && set -- "$@" --with-nth="$_lt_nth"
+	if [ -n "$_lt_preview" ]; then
+		_lt_script "$_lt_tmp/preview.sh" "$_lt_preview"
+		set -- "$@" --preview="sh $_lt_tmp/preview.sh {$_lt_key}" \
+			--preview-window="${LT_PREVIEW_WINDOW:-down,60%,wrap}"
+	fi
+	_lt_start=
+	if [ -n "$_lt_more" ]; then
+		cat >"$_lt_tmp/more.sh" <<EOF
+out=\$(mktemp)
+$_lt_more > "\$out" 2>/dev/null || true
+if [ -s "\$out" ]; then
+	curl -s -XPOST "127.0.0.1:\$1" --data "reload(cat \$out; rm -f \$out)" >/dev/null 2>&1 || rm -f "\$out"
+else rm -f "\$out"; fi
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/more.sh \$FZF_PORT &"
+	fi
+	if [ "$_lt_refresh" -gt 0 ] && [ -z "$_lt_reload" ] && command -v curl >/dev/null 2>&1; then
+		# background loop: run the seed, post it to fzf only when it changed;
+		# it ends by itself once fzf's port stops answering
+		_lt_secs=$(awk -v ms="$_lt_refresh" 'BEGIN { if (ms < 50) ms = 50; printf "%.3f", ms / 1000 }')
+		cat >"$_lt_tmp/refresh.sh" <<EOF
+port=\$1; last=$_lt_tmp/last; new=$_lt_tmp/new
+sh $_lt_tmp/seed.sh >"\$last" 2>/dev/null
+while sleep $_lt_secs; do
+	[ -d $_lt_tmp ] || exit 0
+	sh $_lt_tmp/seed.sh >"\$new" 2>/dev/null || continue
+	cmp -s "\$last" "\$new" && continue
+	cp "\$new" "\$last"
+	curl -s -m 2 -XPOST "127.0.0.1:\$port" --data "reload-sync(cat $_lt_tmp/last)" >/dev/null 2>&1 || exit 0
+done
+EOF
+		_lt_start="$_lt_start sh $_lt_tmp/refresh.sh \$FZF_PORT &"
+		if [ -n "$_lt_hints" ] || [ "$_lt_minor" -ge 71 ]; then set -- "$@" --track --id-nth="$_lt_key"; fi
+	fi
+	[ -n "$_lt_start" ] && set -- "$@" --listen --bind="start:execute-silent($_lt_start)"
+	if [ -n "$_lt_reload" ]; then
+		printf '%s\n' "$_lt_reload" | sed 's/{q}/"$1"/g' >"$_lt_tmp/reload.sh"
+		set -- "$@" --bind="change:reload(sh $_lt_tmp/reload.sh {q})"
+	fi
+
+	# mode: select = no input line, space marks, / opens search
+	_lt_bar= _lt_ubar=
+	# our own fzf draws the key hint bar itself (--hints, held modifiers, clickable); others get a footer
+	if [ "$_lt_mode" = select ]; then
+		if [ -n "$_lt_hints" ]; then _lt_mark=' # mark' _lt_find=' # search'; else _lt_mark= _lt_find=; fi
+		set -- "$@" --multi --no-input \
+			--bind="space:toggle+down$_lt_mark,tab:down,btab:up,/:show-input$_lt_find" \
+			--bind='esc:transform:[ "$FZF_INPUT_STATE" = hidden ] && echo abort || echo "clear-query+hide-input"'
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint space mark)$(_lt_hint / search)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	else
+		_lt_bar="$(_lt_hint '↑↓' move)$(_lt_hint type filter)$(_lt_hint enter accept)$(_lt_hint esc quit)"
+	fi
+
+	# yaml key map -> binds + key bar
+	_lt_n=0
+	if [ -n "$_lt_keys" ]; then
+		[ "$_lt_keys" = - ] && printf '%s\n' "${LT_KEYS:-}" >"$_lt_tmp/keys" || cat "$_lt_keys" >"$_lt_tmp/keys"
+		while IFS= read -r _lt_line || [ -n "$_lt_line" ]; do
+			_lt_line=$(_lt_trim "$_lt_line")
+			case $_lt_line in '' | '#'*) continue ;; esac
+			# a line of just --- starts a new line in the key bar
+			[ "$_lt_line" = --- ] && { _lt_ubar="$_lt_ubar
+"; _lt_fresh=1; continue; }
+			_lt_kn=$(_lt_trim "${_lt_line%%:*}")
+			_lt_rest=${_lt_line#*:}
+			case $_lt_rest in
+				*' # '*) _lt_label=$(_lt_trim "${_lt_rest##* # }"); _lt_act=$(_lt_trim "${_lt_rest% # *}") ;;
+				*)       _lt_label=; _lt_act=$(_lt_trim "$_lt_rest") ;;
+			esac
+			_lt_n=$((_lt_n + 1))
+			_lt_reloadact="+reload(sh $_lt_tmp/seed.sh)"
+			case $_lt_act in
+				refresh)  _lt_bind="reload(sh $_lt_tmp/seed.sh)" ;;
+				quit)     _lt_bind=abort ;;
+				'!'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#!}"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)$_lt_reloadact" ;;
+				'>'*)     _lt_script "$_lt_tmp/a$_lt_n.sh" "${_lt_act#>}"
+				          _lt_bind="become(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+				accept | select-all | deselect-all | toggle | toggle-all | first | last | up | down | page-up | page-down | abort | clear-query | show-input | hide-input)
+				          _lt_bind=$_lt_act ;;
+				*)        _lt_script "$_lt_tmp/a$_lt_n.sh" "$_lt_act"
+				          _lt_bind="execute(sh $_lt_tmp/a$_lt_n.sh $_lt_k)" ;;
+			esac
+			if [ -n "$_lt_hints" ] && [ -n "$_lt_label" ]; then set -- "$@" --bind="$_lt_kn:$_lt_bind # $_lt_label"
+			else set -- "$@" --bind="$_lt_kn:$_lt_bind"; fi
+			if [ -n "$_lt_label" ]; then
+				_lt_ubar="$_lt_ubar$(_lt_hint "$_lt_kn" "$_lt_label")"
+				_lt_fresh=
+			fi
+		done <"$_lt_tmp/keys"
+	fi
+	# defaults on line one, the key map's labels on line two
+	if [ -n "$_lt_hints" ]; then set -- "$@" --hints
+	else set -- "$@" --footer="$_lt_bar${_lt_ubar:+
+$_lt_ubar}"; fi
+
+	_lt_sel=$(sh "$_lt_tmp/seed.sh" | fzf "$@"); _lt_rc=$?
+	rm -rf "$_lt_tmp"
+	[ $_lt_rc -eq 0 ] || return 1
+	[ -n "$_lt_sel" ] && printf '%s\n' "$_lt_sel" | cut -f"$_lt_key"
+	return 0
+}
+
+# numbered prompt when fzf is missing
+_lt_fallback() {
+	sh "$_lt_tmp/seed.sh" >"$_lt_tmp/fb"
+	[ -s "$_lt_tmp/fb" ] || return 1
+	awk -F'\t' '{ printf "%3d) %s\n", NR, ($1 == "" ? $0 : $0) }' "$_lt_tmp/fb" | tr '\t' ' ' >&2
+	printf 'pick number%s, q to cancel: ' "$([ "$_lt_mode" = select ] && echo 's (space separated)')" >&2
+	read -r _lt_ans || return 1
+	case $_lt_ans in '' | q) return 1 ;; esac
+	for _lt_i in $_lt_ans; do sed -n "${_lt_i}p" "$_lt_tmp/fb"; done | cut -f"$_lt_key"
+}
+
+# lt_realbin NAME -> path of the real NAME in PATH, skipping this script
+# itself. For tools that wrap a program of the same name (a script called
+# docker or flatpak) so they never call themselves.
+lt_realbin() {
+	_lt_old=$IFS; IFS=:
+	for _lt_d in $PATH; do
+		IFS=$_lt_old
+		_lt_c=$_lt_d/$1
+		if [ -x "$_lt_c" ] && [ ! -d "$_lt_c" ] && [ "$(readlink -f -- "$_lt_c" 2>/dev/null || echo "$_lt_c")" != "$(readlink -f -- "$0" 2>/dev/null || echo "$0")" ]; then printf '%s\n' "$_lt_c"; return 0; fi
+		IFS=:
+	done
+	IFS=$_lt_old
+	return 1
+}
+
+# <<< lazytui <<<
+
+# ---- hardware -------------------------------------------------------------
+vram_mib() { have nvidia-smi && nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2> /dev/null | head -1 | tr -dc 0-9; }
+accel() {
+	if [ -n "${COMFY_ACCEL:-}" ]; then echo "$COMFY_ACCEL"
+	elif have nvidia-smi && nvidia-smi -L > /dev/null 2>&1; then echo nvidia
+	elif [ -e /dev/kfd ] && [ -e /dev/dri/renderD128 ]; then echo rocm
+	else echo cpu; fi
+}
+torch_index() {
+	[ -n "${COMFY_TORCH_INDEX:-}" ] && { echo "$COMFY_TORCH_INDEX"; return; }
+	case $(accel) in
+		nvidia) echo https://download.pytorch.org/whl/cu126 ;;   # 2.7.x wheels still carry Pascal (sm_61, GTX 1050 Ti)
+		rocm) echo https://download.pytorch.org/whl/rocm6.3 ;;
+		*) echo https://download.pytorch.org/whl/cpu ;;
+	esac
+}
+# flags for main.py, one per line: the VRAM tiers decide how hard ComfyUI must save memory
+comfy_flags() {
+	if [ -n "${COMFY_FLAGS:-}" ]; then printf '%s\n' $COMFY_FLAGS; return; fi
+	_v=$(vram_mib)
+	_common='--use-pytorch-cross-attention --disable-smart-memory --preview-method auto'
+	if [ "$(accel)" = cpu ]; then printf '%s\n' --cpu $_common
+	elif [ -z "${_v:-}" ] || [ "$_v" -lt 6144 ]; then printf '%s\n' --lowvram ${COMFY_FP32:+--force-fp32} $_common
+	elif [ "$_v" -lt 12288 ]; then printf '%s\n' $_common
+	else printf '%s\n' --highvram $_common; fi
+}
+pick_python() {
+	for p in "${COMFY_PYTHON:-}" python3.12 python3.13 python3.11 python3; do
+		[ -n "$p" ] && have "$p" && { command -v "$p"; return 0; }
+	done
+	return 1
+}
+
+# ---- state ----------------------------------------------------------------
+installed() { [ -f "$SRC/main.py" ] && [ -x "$VENV/bin/python" ]; }
+need_installed() { installed || { echo "comfylauncher: ComfyUI is not installed here (nothing in $SRC / $VENV)." >&2; echo "  run: comfylauncher install" >&2; exit 1; }; }
+running_pid() { # pid of OUR comfy, empty if none: pid file + /proc cmdline must name main.py
+	[ -f "$PIDF" ] || return 0
+	_p=$(cat "$PIDF" 2> /dev/null)
+	case $_p in '' | *[!0-9]*) return 0 ;; esac
+	[ -r "/proc/$_p/cmdline" ] && tr '\0' ' ' < "/proc/$_p/cmdline" | grep -q 'main\.py' && printf '%s\n' "$_p"
+	return 0
+}
+answers() { have curl && curl -sf -o /dev/null --max-time 2 "$URL"; }
+lock() { # lock NAME -> holds an flock until this shell exits; a second run waits at most 5 s then gives up
+	mkdir -p "$DATA"
+	exec 9> "$DATA/.lock"
+	have flock || return 0
+	flock -w 5 9 || die "another comfylauncher is running (lock $DATA/.lock)"
+}
+
+write_model_paths() { # data/extra_model_paths.yaml: the data dir plus every linked dir
+	mkdir -p "$DATA/models"
+	_y=$(mktemp "$DATA/.yaml.XXXXXX")
+	{
+		printf 'comfy_data:\n    base_path: %s\n    custom_nodes: nodes/\n' "$DATA"
+		for d in checkpoints vae loras controlnet upscale_models embeddings clip clip_vision ipadapter unet diffusers; do
+			printf '    %s: models/%s/\n' "$d" "$d"
+		done
+		_n=0
+		[ -f "$DATA/model-dirs" ] && while IFS= read -r l; do
+			[ -d "$l" ] || continue
+			_n=$((_n + 1))
+			printf 'linked_%s:\n    base_path: %s\n' "$_n" "$l"
+			for d in checkpoints vae loras controlnet upscale_models embeddings clip clip_vision ipadapter unet; do
+				printf '    %s: %s/\n' "$d" "$d"
+			done
+		done < "$DATA/model-dirs"
+	} > "$_y"
+	mv "$_y" "$DATA/extra_model_paths.yaml"
+}
+
+# ---- install / update -----------------------------------------------------
+reqhash() { cat "$SRC/requirements.txt" "$SRC/manager_requirements.txt" 2> /dev/null | sha1sum | cut -c1-12; }
+pip_requirements() {
+	"$VENV/bin/python" -m pip install -q -r "$SRC/requirements.txt" || return 1
+	[ -f "$SRC/manager_requirements.txt" ] && { "$VENV/bin/python" -m pip install -q -r "$SRC/manager_requirements.txt" || return 1; }
+	# shellcheck disable=SC2086   # a word list on purpose
+	[ -n "$NODE_PIP" ] && "$VENV/bin/python" -m pip install -q $NODE_PIP
+	reqhash > "$VENV/.reqhash"
+}
+cmd_install() {
+	py=$(pick_python) || die "python3 is missing (install python 3.12: pacman -S python / apt install python3-venv)"
+	have git || die "git is missing"
+	echo "will do:"
+	echo "  ComfyUI  : $([ -d "$SRC/.git" ] && echo "present, kept" || echo "git clone $REPO -> $SRC")"
+	echo "  venv     : $([ -x "$VENV/bin/python" ] && echo "present, kept" || echo "$py -m venv $VENV")"
+	echo "  torch    : pip install torch torchvision from $(torch_index)   [$(accel)]"
+	echo "  data     : $DATA (models, nodes, output, user)"
+	echo "  nodes    : ${NODES:-none}"
+	echo "  flags    : $(comfy_flags | tr '\n' ' ')"
+	ask "install?" || { echo "nothing done"; exit 0; }
+	lock
+	mkdir -p "$DATA"/{models,output,assets,user,nodes}
+	if [ -d "$SRC/.git" ]; then :; else
+		say "clone ComfyUI"
+		git clone --depth 1 "$REPO" "$SRC" || die "clone failed (offline? run again)"
+	fi
+	if [ ! -x "$VENV/bin/python" ]; then
+		say "venv"
+		"$py" -m venv "$VENV" || die "venv failed (Debian: apt install python3-venv)"
+	fi
+	say "torch (a few GB, once)"
+	# shellcheck disable=SC2046   # torch pins come as a word list
+	"$VENV/bin/python" -m pip install -q torch torchvision --index-url "$(torch_index)" || die "torch install failed - rerun, or set COMFY_TORCH_INDEX"
+	say "requirements"
+	pip_requirements || die "pip install failed - rerun: comfylauncher install"
+	write_model_paths
+	nodes_install_defaults
+	say "done: comfylauncher start"
+}
+cmd_update() {
+	need_installed
+	lock
+	if [ -d "$SRC/.git" ]; then
+		say "git pull ComfyUI"
+		git -C "$SRC" pull --ff-only --quiet 2> /dev/null || say "  (not updated - offline or local changes)"
+	fi
+	if [ "$(cat "$VENV/.reqhash" 2> /dev/null)" != "$(reqhash)" ]; then
+		say "requirements changed, reinstalling"
+		pip_requirements || die "pip install failed"
+	else say "requirements unchanged"; fi
+	nodes_update
+	if [ -n "$(running_pid)" ]; then say "ComfyUI is running - restart to use the update: comfylauncher stop; comfylauncher start"; fi
+}
+
+# ---- start / stop / status / logs -----------------------------------------
+cmd_start() {
+	need_installed
+	lock
+	_pid=$(running_pid)
+	if [ -n "$_pid" ]; then say "already running (pid $_pid) at $URL"; open_window; return 0; fi
+	answers && die "port $PORT already answers - not our ComfyUI; set COMFY_PORT=other"
+	write_model_paths
+	mkdir -p "$DATA"/{output,assets,user}
+	mapfile -t fl < <(comfy_flags)
+	say "starting: main.py ${fl[*]}"
+	(cd "$SRC" || exit 1
+		setsid nohup "$VENV/bin/python" main.py --listen 127.0.0.1 --port "$PORT" \
+		--output-directory "$DATA/output" --input-directory "$DATA/assets" --user-directory "$DATA/user" \
+		--extra-model-paths-config "$DATA/extra_model_paths.yaml" "${fl[@]}" > "$LOG" 2>&1 < /dev/null &
+		echo $! > "$PIDF")
+	printf 'waiting (first boot can take minutes)'
+	for _ in $(seq 1 "${COMFY_WAIT:-300}"); do
+		if answers; then echo " up: $URL"; open_window; return 0; fi
+		[ -n "$(running_pid)" ] || { echo; die "ComfyUI exited during boot - comfylauncher logs"; }
+		printf .; sleep 1
+	done
+	echo; say "not answering yet - still booting? comfylauncher logs"
+}
+open_window() {
+	[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+	[ -n "${COMFY_NO_WINDOW:-}" ] && return 0
+	if python3 -c "import gi; gi.require_version('WebKit2','4.1')" 2> /dev/null; then
+		python3 "$ROOT/helpers/comfywin" "$URL" > /dev/null 2>&1 &
+	elif have xdg-open; then xdg-open "$URL" > /dev/null 2>&1 & fi
+}
+cmd_stop() {
+	_pid=$(running_pid)
+	[ -n "$_pid" ] || { say "not running"; rm -f "$PIDF"; return 0; }
+	kill "$_pid" 2> /dev/null
+	for _ in $(seq 1 20); do [ -d "/proc/$_pid" ] || break; sleep 1; done
+	[ -d "/proc/$_pid" ] && { kill -9 "$_pid" 2> /dev/null; say "had to kill -9 $_pid"; }
+	rm -f "$PIDF"; say "stopped"
+}
+cmd_status() {
+	_pid=$(running_pid)
+	printf 'installed : %s\n' "$(installed && echo yes || echo 'no (comfylauncher install)')"
+	printf 'running   : %s\n' "$([ -n "$_pid" ] && echo "yes, pid $_pid" || echo no)"
+	printf 'answers   : %s\n' "$(answers && echo "yes $URL" || echo no)"
+	printf 'accel     : %s %s\n' "$(accel)" "$(vram_mib | sed '/./s/$/ MiB VRAM/')"
+	printf 'flags     : %s\n' "$(comfy_flags | tr '\n' ' ')"
+	printf 'data      : %s\n' "$DATA"
+}
+cmd_logs() {
+	[ -f "$LOG" ] || die "no log yet ($LOG) - comfylauncher start"
+	if [ -t 1 ]; then exec tail -n 40 -f "$LOG"; else exec tail -n 100 "$LOG"; fi
+}
+
+# ---- models ---------------------------------------------------------------
+models_default() {   # subdir TAB file TAB url TAB MiB  (a low-VRAM friendly starter set)
+	cat << 'EOF'
+checkpoints	v1-5-pruned-emaonly-fp16.safetensors	https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors	2034
+vae	vae-ft-mse-840000-ema-pruned.safetensors	https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors	320
+upscale_models	RealESRGAN_x4plus.pth	https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth	64
+EOF
+}
+record_model() {
+	m=$DATA/MODELS.md
+	[ -f "$m" ] || printf '# Models\n\nWritten by comfylauncher models get. Fill licence and used-by by hand.\n\n| file | folder | source | MiB | date | licence | used by |\n|---|---|---|---|---|---|---|\n' > "$m"
+	grep -qF "| $2 |" "$m" || printf '| %s | %s | %s | %s | %s |  |  |\n' "$2" "$1" "$3" "$4" "$(date +%F)" >> "$m"
+}
+models_list() { # TSV: folder, file, MiB, where
+	for base in "$DATA/models" $(cat "$DATA/model-dirs" 2> /dev/null); do
+		[ -d "$base" ] || continue
+		find -L "$base" -mindepth 2 -type f \( -name '*.safetensors' -o -name '*.ckpt' -o -name '*.pth' -o -name '*.pt' -o -name '*.gguf' -o -name '*.bin' \) -printf '%P\t%s\n' 2> /dev/null |
+			awk -F '\t' -v w="$base" '{ n = split($1, a, "/"); printf "%s\t%s\t%d\t%s\n", a[1], a[n], $2 / 1048576, w }'
+	done | sort
+}
+models_get() {
+	list=$(models_default)
+	total=0 todo=0
+	while IFS='	' read -r sub file _ mb; do
+		total=$((total + mb)); [ -f "$DATA/models/$sub/$file" ] || todo=$((todo + mb))
+	done << EOF
+$list
+EOF
+	[ "$total" -le "$BUDGET" ] || die "starter list is $total MiB, over the $BUDGET MiB budget"
+	[ "$todo" -gt 0 ] || { say "starter models are already in $DATA/models"; return 0; }
+	printf '%s\n' "$list" | while IFS='	' read -r sub file _ mb; do
+		printf '  %s  %-15s %-44s %5d MiB\n' "$([ -f "$DATA/models/$sub/$file" ] && echo have || echo get)" "$sub" "$file" "$mb"
+	done
+	have curl || die "curl is missing"
+	ask "download $todo MiB?" || { echo cancelled; return 0; }
+	lock
+	printf '%s\n' "$list" | while IFS='	' read -r sub file url mb; do
+		dst=$DATA/models/$sub/$file
+		[ -f "$dst" ] && continue
+		mkdir -p "$DATA/models/$sub"
+		say "download $file"
+		curl -fL --retry 3 -C - -o "$dst.part" "$url" && mv "$dst.part" "$dst" || { echo "failed: $file (run again to resume)" >&2; exit 1; }
+		record_model "$sub" "$file" "$url" "$mb"
+	done
+}
+cmd_models() {
+	case ${1:-list} in
+		list) printf 'folder\tfile\tMiB\tfrom\n'; models_list ;;
+		get) models_get ;;
+		link)
+			[ -d "${2:-}" ] || die "usage: comfylauncher models link DIR (DIR must exist)"
+			d=$(readlink -f "$2"); mkdir -p "$DATA"
+			grep -qxF "$d" "$DATA/model-dirs" 2> /dev/null || printf '%s\n' "$d" >> "$DATA/model-dirs"
+			write_model_paths; say "linked $d (restart ComfyUI to see it)" ;;
+		unlink)
+			[ -n "${2:-}" ] || die "usage: comfylauncher models unlink DIR"
+			d=$(readlink -f "$2"); [ -f "$DATA/model-dirs" ] || die "nothing linked"
+			grep -vxF "$d" "$DATA/model-dirs" > "$DATA/model-dirs.new"; mv "$DATA/model-dirs.new" "$DATA/model-dirs"
+			write_model_paths; say "unlinked $d" ;;
+		*) die "models: list | get | link DIR | unlink DIR" ;;
+	esac
+}
+
+# ---- nodes ----------------------------------------------------------------
+node_pip() { # node_pip DIR: its requirements go into the venv
+	[ -f "$1/requirements.txt" ] && [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -m pip install -q -r "$1/requirements.txt" || true
+}
+node_clone() {
+	d=$DATA/nodes/${1##*/}
+	mkdir -p "$DATA/nodes"
+	if [ -d "$d/.git" ]; then say "node ${1##*/} present"; return 0; fi
+	say "node clone $1"
+	git clone --depth 1 --quiet "https://github.com/$1" "$d" || { say "  (clone failed)"; return 1; }
+	node_pip "$d"
+}
+nodes_install_defaults() { for r in $NODES; do node_clone "$r" || true; done; }
+nodes_update() {
+	for d in "$DATA"/nodes/*/; do
+		[ -d "$d/.git" ] || continue
+		git -C "$d" pull --ff-only --quiet 2> /dev/null && say "node $(basename "$d") up to date" || say "node $(basename "$d") (not updated)"
+		node_pip "$d"
+	done
+}
+cmd_nodes() {
+	case ${1:-list} in
+		list)
+			printf 'node\tsource\n'
+			for d in "$DATA"/nodes/*/; do
+				[ -d "$d" ] || continue
+				printf '%s\t%s\n' "$(basename "$d")" "$(git -C "$d" remote get-url origin 2> /dev/null || echo local)"
+			done ;;
+		add)
+			case ${2:-} in */*) ;; *) die "usage: comfylauncher nodes add OWNER/REPO" ;; esac
+			echo "will clone https://github.com/$2 into $DATA/nodes and pip install its requirements into the venv"
+			ask "add?" || { echo cancelled; return 0; }
+			lock; node_clone "$2" ;;
+		update) lock; nodes_update ;;
+		remove)
+			[ -d "$DATA/nodes/${2:-/}" ] || die "no such node: ${2:-}"
+			echo "will move $DATA/nodes/$2 to the trash"
+			ask "remove?" || { echo cancelled; return 0; }
+			if have trash-put; then trash-put -- "$DATA/nodes/$2"; else
+				mkdir -p "$DATA/.trash"; mv -- "$DATA/nodes/$2" "$DATA/.trash/$2.$(date +%s)"
+			fi ;;
+		*) die "nodes: list | add OWNER/REPO | update | remove NAME" ;;
+	esac
+}
+
+# ---- doctor ---------------------------------------------------------------
+cmd_doctor() {
+	bad=0
+	chk() { # chk required|optional NAME OK-DETAIL FIX
+		if [ "$1" = ok ]; then printf '  ok    %-12s %s\n' "$2" "$3"
+		elif [ "$1" = warn ]; then printf '  warn  %-12s %s\n' "$2" "$3"
+		else printf '  FAIL  %-12s %s\n' "$2" "$3"; bad=1; fi
+	}
+	have git && chk ok git "$(git --version)" || chk fail git "missing - pacman -S git / apt install git"
+	have curl && chk ok curl "$(curl --version | head -1 | cut -d' ' -f1-2)" || chk fail curl "missing - needed for models get and the start check"
+	if py=$(pick_python); then chk ok python "$("$py" --version) ($py)"; else chk fail python "missing - install python 3.12"; fi
+	have flock && chk ok flock "" || chk warn flock "missing (util-linux) - runs are not serialised"
+	if installed; then chk ok comfyui "$SRC, venv $VENV"; else chk warn comfyui "not installed - comfylauncher install"; fi
+	case $(accel) in
+		nvidia) v=$(vram_mib); chk ok gpu "nvidia ${v:-?} MiB"; [ "${v:-0}" -lt 6144 ] && chk warn vram "under 6 GB: --lowvram is added automatically" ;;
+		rocm) chk ok gpu "rocm (/dev/kfd)" ;;
+		*) chk warn gpu "none detected - CPU mode (slow)" ;;
+	esac
+	if [ -x "$VENV/bin/python" ]; then
+		t=$("$VENV/bin/python" -c 'import torch;print(torch.__version__, "cuda" if torch.cuda.is_available() else "no-cuda")' 2> /dev/null) &&
+			chk ok torch "$t" || chk warn torch "not importable in the venv - comfylauncher install"
+	fi
+	if answers; then chk ok port "$PORT answers (ComfyUI up)"; else
+		(exec 3<> "/dev/tcp/127.0.0.1/$PORT") 2> /dev/null && chk warn port "$PORT is taken by something else - COMFY_PORT=" || chk ok port "$PORT free"
+	fi
+	mkdir -p "$DATA" 2> /dev/null
+	chk ok disk "$(df -h --output=avail "$DATA" 2> /dev/null | tail -1 | tr -d ' ') free in $DATA"
+	have fzf && chk ok fzf "menus" || chk warn fzf "missing - the menu falls back to a numbered list"
+	python3 -c "import gi; gi.require_version('WebKit2','4.1')" 2> /dev/null && chk ok window "WebKitGTK" || chk warn window "no WebKitGTK - the browser is opened instead"
+	python3 -c "import PIL, numpy" 2> /dev/null && chk ok gen-deps "PIL + numpy" || chk warn gen-deps "PIL/numpy missing - gen/qa/card need them"
+	have magick || have convert && chk ok imagemagick "" || chk warn imagemagick "missing - gen needs it"
+	return $bad
+}
+
+# ---- menu -----------------------------------------------------------------
+menu() {
+	while :; do
+		_c=$(printf '%s\t%s\n' \
+			status "is it installed / running" start "start and open the window" stop "stop" \
+			install "clone + venv + torch" update "update ComfyUI and nodes" \
+			models "list models" nodes "list custom nodes" logs "show the log" doctor "check requirements" quit "leave" |
+			lt_select --header "comfylauncher  ($(installed && { [ -n "$(running_pid)" ] && echo running || echo stopped; } || echo 'not installed'))" --prompt 'comfy> ' --mode select) || return 0
+		_c=${_c%%	*}
+		case $_c in quit | '') return 0 ;; esac
+		"$0" "$_c" || true
+		printf '\n[enter] ' >&2; read -r _ || return 0
+	done
+}
+
+case ${1:-} in
+	install) cmd_install ;;
+	update) cmd_update ;;
+	start) cmd_start ;;
+	stop) cmd_stop ;;
+	status) cmd_status ;;
+	logs) cmd_logs ;;
+	models) shift; cmd_models "$@" ;;
+	nodes) shift; cmd_nodes "$@" ;;
+	doctor) cmd_doctor ;;
+	gen | flow | loop | qa | card | window)
+		h=$1; shift
+		case $h in gen) h=comfygen ;; flow) h=comfyflow ;; loop) h=comfyloop ;; qa) h=comfyqa ;; card) h=cardblank ;; window) h=comfywin ;; esac
+		have python3 || die "python3 is missing"
+		exec python3 "$ROOT/helpers/$h" "$@" ;;
+	'') if [ -t 0 ] && [ -t 1 ]; then menu; else cmd_status; fi ;;
+	*) die "unknown command '$1' (comfylauncher --help)" ;;
+esac

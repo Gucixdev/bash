@@ -4,7 +4,7 @@
   comfywin [url]     # default http://127.0.0.1:8188/ ; a second call focuses the open window
 
 Single instance: Gtk.Application with a fixed id, so launching again raises the same window.
-Needs python-gobject + webkit2gtk-4.1. comfysetup uses it when present, Firefox otherwise.
+Needs python-gobject + webkit2gtk-4.1. comfylauncher start uses it when present, Firefox otherwise.
 """
 import sys, gi
 gi.require_version("Gtk", "3.0")

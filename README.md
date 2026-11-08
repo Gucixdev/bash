@@ -137,11 +137,16 @@ evq push -q jobs "resize a.png"        # file-backed FIFO, safe for many consume
 dspq -j 3 "$url|$dest|label"           # parallel, atomic, resumable downloads
 ```
 
-## Installers
+## Installers, launchers
 
-`installer/` has clone, build and run scripts for things that do not
-belong on `$PATH`: `comfysetup` (ComfyUI in a minimal container),
-`blenderlauncher`, `tos` (TempleOS in QEMU).
+| path | what |
+|---|---|
+| `comfy/comfylauncher` | ComfyUI in one folder (venv, no container): `install update start stop status models nodes logs doctor`, plus `gen flow loop qa card window` for the asset helpers in `comfy/helpers/`. No arguments: a menu. Data (models, nodes, output) in `comfy/data`, git-ignored. Adds `--lowvram` under 6 GB of VRAM. |
+| `protonlauncher` | run a Windows exe through Proton (GE-Proton from Steam's `compatibilitytools.d`), one prefix per game, env presets, gamemode/mangohud/gamescope when present: `tools list run presets prefix winecfg winetricks doctor`. |
+| `installer/blenderlauncher` | clone, build and run Blender. |
+| `installer/templeos` | TempleOS in QEMU. |
+
+`installer/` holds only real one-shot installers; long-lived tools sit at the top level or in their own folder.
 
 ## Layout
 
@@ -151,7 +156,9 @@ lib/lazytui      reference copy of the lt_* UI helpers tools carry
 lib/settings     per-app KEY=VALUE settings: get, set, unset, list, export
 lib/wizard       ask a list of questions, print answers as eval-able assignments
 lib/dspq, evq    download queue and event queue for shell scripts
+comfy/           comfylauncher + helpers (asset generation), one folder
 installer/       one-shot clone, build, run scripts
+templates/       run, build, setup, wizard, bench, compare, test: starting points
 tests/           bats: libs, every tool's offline behaviour, --help, shellcheck
 ```
 

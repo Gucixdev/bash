@@ -6,4 +6,6 @@ __pycache__/
 *.pyc
 .blenderlauncher/
 installer/.tos/
-installer/.comfy/
+comfy/data/
+comfy/ComfyUI/
+comfy/venv/
