@@ -32,6 +32,7 @@
 #                     the remote first, so a new upstream commit changes the layer and only the layers after it rebuild
 #   copy SRC DEST   env K=V   workdir D   user U   run COMMAND   cmd ...   entrypoint ...   expose PORT
 #   check CMD => TEXT   after the build run CMD inside the image; it must print TEXT somewhere (several allowed)
+#   container NAME   name of the running container (default: the image name)
 #   port H:C   mount HOST:CONTAINER (HOST may use ~ and ${VAR:-default}; made if missing)   gpu    -- used by `bake up`
 # vm:
 #   iso URL|PATH [SHA256]   a URL is cached under the state dir and refreshed when the server's ETag/Last-Modified changed
@@ -58,7 +59,7 @@ expand() {	# ~ and ${VAR:-default} in a mount path; nothing that could run a com
 }
 
 # ---- reading a .bake file ----------------------------------------------
-KEYS=" name kind base family pkg copy env workdir user run cmd entrypoint expose git check port mount gpu iso disk format drive ram cpus qemu "
+KEYS=" name container kind base family pkg copy env workdir user run cmd entrypoint expose git check port mount gpu iso disk format drive ram cpus qemu "
 directives() {	# LINE<TAB>KEY<TAB>REST, comments and blanks gone
 	[ -r "${1:-}" ] || die "cannot read ${1:-(no file)}"
 	awk '{ sub(/^[ \t]+/, ""); if ($0 == "" || $0 ~ /^#/) next; sub(/[ \t]+#.*/, ""); sub(/[ \t]+$/, ""); k = $1; r = $0; sub(/^[^ \t]+[ \t]*/, "", r); printf "%d\t%s\t%s\n", NR, k, r }' "$1"
@@ -88,6 +89,8 @@ bakefile_arg() {	# a file, NAME -> NAME.bake, or a directory holding one .bake f
 	[ ${#l[@]} -eq 1 ] && { echo "${l[0]}"; return; }
 	die "several .bake files in $a ($(printf '%s ' "${l[@]##*/}")): name one, e.g. bake build $a/${l[0]##*/}"
 }
+
+cname() { local c; c=$(field "$1" container); echo "${c:-$(bake_name "$1")}"; }
 
 # ---- git sources -------------------------------------------------------
 srcdir() { echo "$state/src/$(bake_name "$1")"; }
@@ -156,7 +159,7 @@ containerfile() {	# containerfile FILE
 	validate "$f"; sdir=$(srcdir "$f")
 	while IFS=$'\t' read -r n key rest; do
 		case $key in
-		name | check | kind | port | mount | gpu | iso | disk | format | drive | ram | cpus | qemu) ;;
+		name | container | check | kind | port | mount | gpu | iso | disk | format | drive | ram | cpus | qemu) ;;
 		base) base=$rest; printf 'FROM %s\n' "$rest" ;;
 		family) fam=$rest ;;
 		pkg) [ -n "$base" ] || die "line $n: pkg before base"; pm_cmd "${fam:-$(guess_family "$base")}" $rest ;;
@@ -286,7 +289,7 @@ gpu_args() {	# the flags that hand the GPU to the container
 cmd_up() {
 	local gui='' iso='' nobuild='' a
 	while [ $# -gt 0 ]; do case $1 in --gui) gui=1; shift ;; --iso) iso=1; shift ;; --no-build) nobuild=1; shift ;; *) break ;; esac; done
-	a=$(bakefile_arg "${1:-}") || exit 1; local f=$a name; name=$(bake_name "$f")
+	a=$(bakefile_arg "${1:-}") || exit 1; local f=$a name cn; name=$(bake_name "$f"); cn=$(cname "$f")
 	if [ "$(kind_of "$f")" = vm ]; then
 		vm_prepare "$f"
 		local args=(--disk "$VM_DISK" --format "$VM_FORMAT" --drive-if "$VM_DRIVE" --ram "$VM_RAM" --cpus "$VM_CPUS")
@@ -299,26 +302,26 @@ cmd_up() {
 	fi
 	[ -n "$nobuild" ] || cmd_build "$f" || exit 1
 	local e; e=$(engine)
-	if "$e" container exists "$name" 2> /dev/null || "$e" inspect --type container "$name" > /dev/null 2>&1; then
-		[ "$("$e" inspect --format '{{index .Config.Labels "bake.managed"}}' "$name" 2> /dev/null)" = 1 ] || die "a container named $name exists and was not made by bake; not touching it"
-		"$e" rm -f "$name" > /dev/null || die "cannot replace the old $name container"
+	if "$e" container exists "$cn" 2> /dev/null || "$e" inspect --type container "$cn" > /dev/null 2>&1; then
+		[ "$("$e" inspect --format '{{index .Config.Labels "bake.managed"}}' "$cn" 2> /dev/null)" = 1 ] || die "a container named $cn exists and was not made by bake; not touching it (a 'container OTHERNAME' line picks another name)"
+		"$e" rm -f "$cn" > /dev/null || die "cannot replace the old $cn container"
 	fi
-	local runargs=(-d --name "$name" --label bake.managed=1) n key rest h c
+	local runargs=(-d --name "$cn" --label bake.managed=1) n key rest h c
 	while IFS=$'\t' read -r n key rest; do
 		case $key in
 		port) runargs+=(-p "$rest") ;;
-		mount) h=$(expand "${rest%%:*}"); c=${rest#*:}; mkdir -p "$h" || die "cannot make $h"; runargs+=(-v "$h:$c") ;;
+		mount) h=$(expand "${rest%:*}"); c=${rest##*:}; mkdir -p "$h" || die "cannot make $h"; runargs+=(-v "$h:$c") ;;
 		gpu) read -ra g <<< "$(gpu_args "$e")"; runargs+=("${g[@]}") ;;
 		esac
 	done < <(directives "$f")
-	"$e" run "${runargs[@]}" "$name" > /dev/null || die "could not start $name"
-	echo "bake: $name is running ($e logs -f $name; bake down $name)"
+	"$e" run "${runargs[@]}" "$name" > /dev/null || die "could not start $cn"
+	echo "bake: $cn is running ($e logs -f $cn; bake down $name)"
 }
 cmd_down() {
 	local f; f=$(bakefile_arg "${1:-}") || exit 1; local name; name=$(bake_name "$f")
 	if [ "$(kind_of "$f")" = vm ]; then cmd_vm stop "$name"; return; fi
-	local e; e=$(engine); "$e" stop "$name" > /dev/null || die "$name is not running"
-	echo "bake: $name stopped"
+	local cn e; cn=$(cname "$f"); e=$(engine); "$e" stop "$cn" > /dev/null || die "$cn is not running"
+	echo "bake: $cn stopped"
 }
 
 # ---- VMs ---------------------------------------------------------------

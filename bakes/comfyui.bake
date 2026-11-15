@@ -1,8 +1,9 @@
 # comfyui - ComfyUI from the newest upstream commit, as a podman image (GPU through the NVIDIA CDI spec).
 #   bake build comfyui      fetches the newest master; unchanged upstream = all layers from the cache
 #   bake outdated comfyui   has upstream moved since the image was built
-#   bake up comfyui         detached on http://127.0.0.1:8188, models and output kept on the host
+#   bake up comfyui         detached on http://127.0.0.1:8188; models and output live in $COMFY_HOME (default ~/.local/share/comfyui)
 name comfyui
+container comfyui-bake
 base docker.io/pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime
 pkg git gcc
 git https://github.com/comfyanonymous/ComfyUI master /opt/ComfyUI
@@ -12,6 +13,6 @@ expose 8188
 entrypoint ["python", "main.py", "--listen", "0.0.0.0", "--port", "8188"]
 check test -f /opt/ComfyUI/main.py && echo present => present
 port 127.0.0.1:8188:8188
-mount ${XDG_DATA_HOME:-~/.local/share}/comfyui/models:/opt/ComfyUI/models
-mount ${XDG_DATA_HOME:-~/.local/share}/comfyui/output:/opt/ComfyUI/output
+mount ${COMFY_HOME:-~/.local/share/comfyui}/models:/opt/ComfyUI/models
+mount ${COMFY_HOME:-~/.local/share/comfyui}/output:/opt/ComfyUI/output
 gpu

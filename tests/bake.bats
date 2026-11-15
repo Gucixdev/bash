@@ -198,3 +198,24 @@ bump() { printf '%s\n' "$1" > "$R/f"; git -C "$R" commit -qam "$1"; }
 	PATH=$T/fake:$PATH run ./bake up "$T/v.bake"; [ "$status" -eq 0 ]
 	! grep -q -- "-cdrom" "$T/qargs"
 }
+
+@test "bake: up passes port, mount (with a \${VAR:-default} host path), gpu and the container name to the engine, and never replaces a foreign container" {
+	mkdir "$T/fake"
+	cat > "$T/fake/podman" << EOF2
+#!/bin/sh
+echo "\$@" >> $T/calls
+case "\$1" in
+  inspect) [ -f $T/foreign ] && exit 0; exit 1 ;;
+  container) [ -f $T/foreign ] && exit 0; exit 1 ;;
+  nvidia-ctk) ;;
+esac
+exit 0
+EOF2
+	chmod +x "$T/fake/podman"
+	printf 'name u\ncontainer u-box\nbase scratch\nport 127.0.0.1:9000:80\nmount ${UHOME:-~/x}/data:/data\n' > "$T/u.bake"
+	UHOME=$T/h PATH=$T/fake:$PATH run ./bake up --no-build "$T/u.bake"; [ "$status" -eq 0 ]
+	grep -q -- "run -d --name u-box --label bake.managed=1 -p 127.0.0.1:9000:80 -v $T/h/data:/data u" "$T/calls"
+	[ -d "$T/h/data" ]
+	touch "$T/foreign"
+	UHOME=$T/h PATH=$T/fake:$PATH run ./bake up --no-build "$T/u.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"not touching it"* ]]
+}
