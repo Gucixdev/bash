@@ -118,7 +118,7 @@ the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 | `sniff` | What is this machine talking to: capture N seconds and get totals, protocol mix, busiest conversations, services and DNS names. `-r` reads a pcap, `-` reads `tcpdump -nn` text, `sniff conns` shows live connections per process without root. |
 | `findfat` | Biggest directories and files under a path, one filesystem only. `-dir`, `-file`, `-n COUNT`. |
 | `morph` | `mv` for formats: `morph a.png a.webp`, picks magick/ffmpeg/assimp/fontforge/pandoc by the two extensions. Never overwrites without `-f`. |
-| `fixmedia` | Repair broken video, audio and images into `fixed-NAME`: re-mux, then re-encode; images re-saved. `-c` only checks. |
+| `fixmedia` | Find why a video, song, subtitle or picture misbehaves (cuts out, no or silent sound, DTS/AC3, 10-bit, subtitle garbage) and write `fixed-NAME`; VLC is the judge. `-c` only checks, `--sync`, `--shift`, `--embed`. |
 | `manwriter` | Turn a script's header comment into a man page: `manwriter -d man tool...`. `manwriter new` writes a skeleton. |
 
 ## Libraries

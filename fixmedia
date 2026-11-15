@@ -1,91 +1,302 @@
 #!/usr/bin/env bash
-# fixmedia - try to repair broken audio, video and image files. The
-# original is never touched: the result is written as fixed-NAME next to it.
+# fixmedia - find out why a video, song, subtitle file or picture misbehaves and write a repaired copy next to it
+# as fixed-NAME. The original is never touched. Built on ffprobe/ffmpeg, with VLC (cvlc, no window) as the judge.
 #
-# Video and audio: re-mux without re-encoding first (fixes broken
-# containers and missing indexes), then a full re-encode if that is not
-# enough. Images: re-save through ImageMagick (reads truncated files and
-# writes a clean one), then ffmpeg.
+# What it looks for in a video or song:
+#   decode      the file does not decode cleanly (damaged, cut off, broken index): re-muxed without re-encoding,
+#               re-encoded when that is not enough
+#   timestamps  jumping or invalid timestamps, the usual reason a film plays a bit and stops: timestamps regenerated
+#   noaudio / silent   no sound stream, or the sound is flat silence (reported: nothing to repair from)
+#   quiet       sound present but very low: volume raised so the peak is -1 dB
+#   audiocodec  DTS, TrueHD, AC3/E-AC3 or 5.1+ sound that laptops, phones and many players play as silence or noise:
+#               re-encoded to stereo AAC, the video is copied
+#   pixfmt      10-bit or 4:4:4 video that hardware decoders refuse: re-encoded to 8-bit 4:2:0
+#   vlc         VLC itself reports errors when playing the file (checked before, and after the repair)
+# Subtitles next to a video (same name, .srt .ass .ssa .vtt .sub, also NAME.pl.srt): wrong character set (Polish letters
+# as garbage) is converted to UTF-8 and written as fixed-NAME...; one subtitle file whose name does not match the only
+# video in the folder is reported (players only load subtitles that start with the video's name).
+# A subtitle file given directly is repaired the same way. Pictures: re-saved through ImageMagick, then ffmpeg.
 #
-# usage: fixmedia FILE...
-#        fixmedia -c FILE...     only check, report ok or broken
+# usage: fixmedia [options] FILE...
+#   -c            only diagnose: print the problems, change nothing; exit 1 when a file has one
+#   --sync SEC    delay the sound by SEC seconds (negative: earlier), for lip-sync that is off by a fixed amount
+#   --shift SEC   move subtitle times by SEC seconds (negative: earlier)
+#   --embed       put the first subtitle file into the repaired video (mkv: srt, mp4: mov_text)
+#   --no-vlc      skip the VLC playback test (also skipped when cvlc is missing)
+# Environment: FIXMEDIA_SUBCHARSET=CP1250 (character set to assume when it cannot be detected, default CP1250)
+# Exit status: 0 everything fine or repaired, 1 a file could not be repaired or (-c) has problems, 2 bad usage.
 
 case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
-have() { command -v "$1" >/dev/null 2>&1; }
+have() { command -v "$1" > /dev/null 2>&1; }
 
-check=0
-[ "${1:-}" = "-c" ] && { check=1; shift; }
-[ $# -gt 0 ] || { echo "usage: fixmedia [-c] FILE..." >&2; exit 2; }
-
-is_image() {
-	case $(printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]') in
-	png | jpg | jpeg | webp | bmp | tif | tiff | avif | heic | ico | gif | ppm) return 0 ;;
+check=0 sync='' shift_s='' embed=0 vlc=1
+while [ $# -gt 0 ]; do
+	case $1 in
+	-c) check=1; shift ;;
+	--sync) sync=${2:?--sync needs seconds}; shift 2 ;;
+	--shift) shift_s=${2:?--shift needs seconds}; shift 2 ;;
+	--embed) embed=1; shift ;;
+	--no-vlc) vlc=0; shift ;;
+	--) shift; break ;;
+	-*) echo "fixmedia: unknown option $1 (fixmedia --help)" >&2; exit 2 ;;
+	*) break ;;
 	esac
-	return 1
+done
+[ $# -gt 0 ] || { echo "usage: fixmedia [-c] [--sync SEC] [--shift SEC] [--embed] [--no-vlc] FILE..." >&2; exit 2; }
+for v in "$sync" "$shift_s"; do
+	case $v in '' | [0-9]* | -[0-9]* | +[0-9]*) ;; *) echo "fixmedia: '$v' is not a number of seconds" >&2; exit 2 ;; esac
+done
+vlcon=0
+{ [ "$vlc" -eq 1 ] && have cvlc; } && vlcon=1
+
+ext() { printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]'; }
+is_image() { case $(ext "$1") in png | jpg | jpeg | webp | bmp | tif | tiff | avif | heic | ico | gif | ppm) return 0 ;; esac; return 1; }
+is_sub() { case $(ext "$1") in srt | ass | ssa | vtt | sub) return 0 ;; esac; return 1; }
+is_mp4() { case $(ext "$1") in mp4 | m4v | mov | m4a) return 0 ;; esac; return 1; }
+ff() { ffmpeg -nostdin "$@"; }	# never read the terminal or a here-string the caller is looping over
+
+# pstream FILE SEL KEY: one stream property (SEL like v:0, a:0), empty when the stream is missing
+pstream() { ffprobe -v error -select_streams "$2" -show_entries "stream=$3" -of default=nw=1:nk=1 "$1" 2> /dev/null | head -n 1; }
+num_lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 < b + 0) }'; }
+clean() { ff -v error -err_detect explode -i "$1" -f null - 2>&1 | head -n 1; }	# first decode error, empty when clean
+
+# vlc_errors FILE: the error lines VLC prints while playing the first seconds without a window or sound card
+vlc_errors() {
+	[ "$vlcon" -eq 1 ] || return 0
+	timeout 40 cvlc -I dummy -vv --no-video-title-show --vout=dummy --aout=dummy --play-and-exit --run-time=4 "$1" 2>&1 < /dev/null \
+		| grep -E '^\[[0-9a-f]+\] [a-z0-9_ ]+ error: ' | grep -v 'directory-extractor' | head -n 3
 }
 
-# healthy FILE: 0 when the file decodes without errors
-healthy() {
-	# decode every pixel to null: anything printed (e.g. "premature end of JPEG file") means damage
-	if is_image "$1" && have magick; then
-		[ -z "$(magick "$1" null: 2>&1)" ]
-	elif is_image "$1" && have convert; then
-		[ -z "$(convert "$1" null: 2>&1)" ]
-	elif have ffmpeg; then
-		[ -z "$(ffmpeg -v error -i "$1" -f null - 2>&1 | head -n 1)" ]
+# ---- diagnosis: fills PROBLEMS (codes) and prints one line per finding ----------------------------------------------
+PROBLEMS=''
+MAXV=''
+say_problem() { PROBLEMS="$PROBLEMS $1"; printf 'problem  %-11s %s\n' "$1" "$2"; }
+has_problem() { case " $PROBLEMS " in *" $1 "*) return 0 ;; esac; return 1; }
+TS_RE='non-monoton|invalid dts|invalid pts|timestamp'
+ERR_RE='error|premature|ended|invalid data|corrupt|truncat|damaged|moov atom|overread|concealment|missing|failed|partial|could not|unable'
+
+diagnose_av() {
+	local f=$1 out vcodec acodec ach pix prof maxv line
+	PROBLEMS=''; MAXV=''
+	have ffmpeg && have ffprobe || { echo "fixmedia: need ffmpeg and ffprobe" >&2; exit 1; }
+	out=$(ff -v warning -i "$f" -f null - 2>&1 | head -n 40)
+	line=$(printf '%s\n' "$out" | grep -iE "$TS_RE" | head -n 1)
+	[ -z "$line" ] || say_problem timestamps "jumping or invalid timestamps ($(printf '%s' "$line" | cut -c1-90))"
+	line=$(printf '%s\n' "$out" | grep -iE "$ERR_RE" | grep -viE "$TS_RE" | head -n 1)
+	[ -z "$line" ] || say_problem decode "does not decode cleanly ($(printf '%s' "$line" | cut -c1-90))"
+	vcodec=$(pstream "$f" v:0 codec_name); acodec=$(pstream "$f" a:0 codec_name)
+	if [ -z "$acodec" ]; then
+		[ -z "$vcodec" ] || say_problem noaudio "the file has no sound stream"
 	else
-		return 1
+		ach=$(pstream "$f" a:0 channels)
+		case $acodec in
+		dts | truehd | mlp | eac3 | ac3) say_problem audiocodec "$acodec sound (${ach:-?} ch): many players give silence or noise" ;;
+		*) if [ "${ach:-2}" -gt 2 ] 2> /dev/null; then say_problem audiocodec "$ach channels in $acodec: no stereo downmix for laptops and phones"; fi ;;
+		esac
+		maxv=$(ff -v info -t 300 -i "$f" -vn -af volumedetect -f null - 2>&1 | sed -n 's/.*max_volume: \(-\{0,1\}[0-9.]*\) dB.*/\1/p' | tail -n 1)
+		if [ -z "$maxv" ] || num_lt "$maxv" -70; then say_problem silent "the sound is silent (peak ${maxv:--inf} dB)"
+		elif num_lt "$maxv" -18; then say_problem quiet "the sound is very low (peak $maxv dB)"
+		fi
+		MAXV=$maxv
 	fi
+	if [ -n "$vcodec" ]; then
+		pix=$(pstream "$f" v:0 pix_fmt); prof=$(pstream "$f" v:0 profile)
+		case $pix in yuv420p | yuvj420p | '') ;; *) say_problem pixfmt "$vcodec in $pix ($prof): hardware decoders refuse it" ;; esac
+	fi
+	out=$(vlc_errors "$f")
+	[ -z "$out" ] || say_problem vlc "VLC reports: $(printf '%s' "$out" | head -n 1 | cut -c1-100)"
+}
+
+# ---- subtitles ------------------------------------------------------------------------------------------------------
+sub_charset() { # FILE -> UTF-8 when valid UTF-8, else the detected or assumed set
+	local cs=''
+	if iconv -f UTF-8 -t UTF-8 "$1" > /dev/null 2>&1; then echo UTF-8; return; fi
+	have uchardet && cs=$(uchardet "$1" 2> /dev/null)
+	case $cs in '' | unknown | ASCII* | UTF-8) cs=${FIXMEDIA_SUBCHARSET:-CP1250} ;; esac
+	echo "$cs"
+}
+sub_has_bom() { [ "$(head -c 3 "$1" | od -An -tx1 | tr -d ' \n')" = efbbbf ]; }
+sub_bad() { # FILE: prints why and returns 0 when it is not clean UTF-8 or has a BOM
+	local cs; cs=$(sub_charset "$1")
+	if [ "$cs" != UTF-8 ]; then echo "not UTF-8 ($cs): accents show as garbage"; return 0; fi
+	if sub_has_bom "$1"; then echo "UTF-8 BOM at the start"; return 0; fi
+	return 1
+}
+# write_sub IN OUT: UTF-8, no BOM, LF line ends, optional time shift
+write_sub() {
+	local cs tmp fmt; cs=$(sub_charset "$1")
+	tmp=$(mktemp) || return 1
+	iconv -f "$cs" -t UTF-8//TRANSLIT "$1" 2> /dev/null | sed '1s/^\xEF\xBB\xBF//; s/\r$//' > "$tmp"
+	[ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
+	if [ -n "$shift_s" ] && [ "$shift_s" != 0 ]; then
+		case $(ext "$1") in
+		srt | ass | ssa | vtt)
+			fmt=$(ext "$1" | sed 's/^ssa$/ass/; s/^vtt$/webvtt/')
+			ff -v error -y -itsoffset "$shift_s" -f "$fmt" -i "$tmp" "$2" 2> /dev/null || { rm -f "$tmp"; return 1; } ;;
+		*) echo "fixmedia: cannot shift .$(ext "$1") files, only the character set is fixed" >&2; cp "$tmp" "$2" ;;
+		esac
+	else
+		cp "$tmp" "$2"
+	fi
+	rm -f "$tmp"
+	[ -s "$2" ]
+}
+
+# companion subtitles of a video: NAME.srt, NAME.pl.srt ...
+companions() { # VIDEO
+	local d b s
+	d=$(dirname -- "$1"); b=$(basename -- "$1"); b=${b%.*}
+	for s in "$d/$b".*; do if [ -f "$s" ] && is_sub "$s"; then printf '%s\n' "$s"; fi; done
+}
+orphan_sub() { # VIDEO: a lone subtitle file whose name does not start with the video's, when this is the only video there
+	local d b v=0 s='' n=0 x
+	d=$(dirname -- "$1"); b=$(basename -- "$1"); b=${b%.*}
+	for x in "$d"/*; do
+		[ -f "$x" ] || continue
+		case $(ext "$x") in mkv | mp4 | avi | mov | webm | m4v | mpg | mpeg | wmv | flv | ts) v=$((v + 1)) ;; esac
+		if is_sub "$x"; then case $(basename -- "$x") in "$b".* | fixed-*) ;; *) s=$x; n=$((n + 1)) ;; esac; fi
+	done
+	[ "$v" -eq 1 ] && [ "$n" -eq 1 ] && printf '%s\n' "$s"
+}
+
+# ---- the repair of a video or song ------------------------------------------------------------------------------------
+# run_ffmpeg FILE OUT VIDEOMODE AUDIOMODE: VIDEOMODE copy|x264, AUDIOMODE copy|aac|gain
+run_ffmpeg() {
+	local f=$1 out=$2 vmode=$3 amode=$4 args=() maps=() sub1=() c=() sidx gain delayed=0
+	[ -n "$sync" ] && [ "$sync" != 0 ] && delayed=1
+	args=(-v error -y -err_detect ignore_err -fflags +genpts -i "$f")
+	if [ "$delayed" -eq 1 ]; then args+=(-itsoffset "$sync" -i "$f"); maps=(-map 0:v? -map 1:a?); sidx=2; else maps=(-map 0:v? -map 0:a?); sidx=1; fi
+	if [ -n "$SUBINPUT" ]; then
+		args+=(-i "$SUBINPUT"); maps+=(-map "$sidx:0")
+		if is_mp4 "$out"; then sub1=(-c:s mov_text); else sub1=(-c:s srt); fi
+	elif [ -n "$(pstream "$f" s:0 codec_name)" ]; then
+		maps+=(-map 0:s?)
+		if is_mp4 "$out"; then sub1=(-c:s mov_text); else sub1=(-c:s copy); fi
+	fi
+	case $vmode in
+	copy) c=(-c:v copy) ;;
+	x264) c=(-c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p) ;;
+	esac
+	case $amode in
+	copy) c+=(-c:a copy) ;;
+	aac) c+=(-c:a aac -ac 2 -b:a 192k) ;;
+	gain)
+		gain=$(awk -v m="${MAXV:-0}" 'BEGIN { printf "%.1f", -1 - m }')
+		c+=(-c:a aac -af "volume=${gain}dB") ;;
+	esac
+	if is_mp4 "$out"; then c+=(-movflags +faststart); fi
+	c+=("${sub1[@]}")
+	ff "${args[@]}" "${maps[@]}" "${c[@]}" "$out" 2> /dev/null && [ -s "$out" ]
+}
+
+fix_av() { # FILE OUT -> prints how, returns 1 when nothing worked
+	local f=$1 out=$2 vmode=copy amode=copy
+	has_problem decode && vmode=x264
+	has_problem pixfmt && vmode=x264
+	has_problem quiet && amode=gain
+	has_problem audiocodec && amode=aac
+	if run_ffmpeg "$f" "$out" "$vmode" "$amode" && [ -z "$(clean "$out")" ]; then
+		printf 'video %s, sound %s' "$vmode" "$amode"
+		return 0
+	fi
+	rm -f "$out"
+	if [ "$vmode" = copy ] && run_ffmpeg "$f" "$out" x264 "$amode" && [ -z "$(clean "$out")" ]; then
+		printf 're-encoded, copying was not enough'
+		return 0
+	fi
+	rm -f "$out"
+	return 1
 }
 
 rc=0
 for f in "$@"; do
-	if [ ! -f "$f" ]; then
-		echo "fixmedia: no such file: $f" >&2
-		rc=1
+	if [ ! -f "$f" ]; then echo "fixmedia: no such file: $f" >&2; rc=1; continue; fi
+	dir=$(dirname -- "$f"); base=$(basename -- "$f"); out="$dir/fixed-$base"
+
+	# ---- a subtitle file given directly
+	if is_sub "$f"; then
+		why=$(sub_bad "$f"); bad=$?
+		if [ -n "$shift_s" ] && [ "$shift_s" != 0 ]; then bad=0; why="shift by $shift_s s asked for"; fi
+		if [ "$bad" -ne 0 ]; then echo "ok       $f"; continue; fi
+		echo "problem  subtitles   $why"
+		if [ "$check" -eq 1 ]; then rc=1; continue; fi
+		if [ -e "$out" ]; then echo "skip     $f ($out exists)" >&2; rc=1; continue; fi
+		if write_sub "$f" "$out"; then echo "fixed    $f -> $out"; else rm -f "$out"; echo "FAILED   $f" >&2; rc=1; fi
 		continue
 	fi
-	if healthy "$f"; then
-		echo "ok       $f"
-		continue
-	fi
-	if [ "$check" -eq 1 ]; then
-		echo "broken   $f"
-		rc=1
-		continue
-	fi
-	dir=$(dirname -- "$f")
-	base=$(basename -- "$f")
-	out="$dir/fixed-$base"
-	if [ -e "$out" ]; then
-		echo "skip     $f ($out exists)" >&2
-		rc=1
-		continue
-	fi
-	done=
+
+	# ---- a picture
 	if is_image "$f"; then
-		if have magick && magick "$f" "$out" 2>/dev/null && [ -s "$out" ]; then done="re-saved with ImageMagick"
-		elif have convert && convert "$f" "$out" 2>/dev/null && [ -s "$out" ]; then done="re-saved with ImageMagick"
-		elif have ffmpeg && ffmpeg -v error -err_detect ignore_err -i "$f" "$out" 2>/dev/null && [ -s "$out" ]; then done="re-encoded with ffmpeg"
-		fi
-	elif have ffmpeg; then
-		if ffmpeg -v error -err_detect ignore_err -i "$f" -c copy "$out" 2>/dev/null && [ -s "$out" ] && healthy "$out"; then
-			done="re-muxed, streams copied"
-		else
-			rm -f "$out"
-			if ffmpeg -v error -err_detect ignore_err -i "$f" "$out" 2>/dev/null && [ -s "$out" ]; then done="re-encoded"; fi
-		fi
-	else
-		echo "fixmedia: need ffmpeg (or ImageMagick for images)" >&2
-		exit 1
+		healthy=0
+		if have magick; then [ -z "$(magick "$f" null: 2>&1)" ] && healthy=1
+		elif have convert; then [ -z "$(convert "$f" null: 2>&1)" ] && healthy=1
+		elif have ffmpeg; then [ -z "$(ff -v error -i "$f" -f null - 2>&1 | head -n 1)" ] && healthy=1; fi
+		if [ "$healthy" -eq 1 ]; then echo "ok       $f"; continue; fi
+		echo "problem  decode      the picture does not decode cleanly"
+		if [ "$check" -eq 1 ]; then rc=1; continue; fi
+		if [ -e "$out" ]; then echo "skip     $f ($out exists)" >&2; rc=1; continue; fi
+		done=
+		if have magick && magick "$f" "$out" 2> /dev/null && [ -s "$out" ]; then done="re-saved with ImageMagick"
+		elif have convert && convert "$f" "$out" 2> /dev/null && [ -s "$out" ]; then done="re-saved with ImageMagick"
+		elif have ffmpeg && ff -v error -err_detect ignore_err -i "$f" "$out" 2> /dev/null && [ -s "$out" ]; then done="re-encoded with ffmpeg"; fi
+		if [ -n "$done" ]; then echo "fixed    $f -> $out ($done)"; else rm -f "$out"; echo "FAILED   $f (nothing could read it)" >&2; rc=1; fi
+		continue
 	fi
-	if [ -n "$done" ]; then
-		echo "fixed    $f -> $out ($done)"
-	else
-		rm -f "$out"
-		echo "FAILED   $f (nothing could read it)" >&2
-		rc=1
+
+	# ---- a video or a song
+	echo "== $f"
+	diagnose_av "$f"
+	SUBFIX='' SUBINPUT='' o=''
+	b=${base%.*}
+	while IFS= read -r s; do
+		[ -n "$s" ] || continue
+		if why=$(sub_bad "$s"); then say_problem subtitles "$(basename -- "$s"): $why"; SUBFIX="$SUBFIX$s"$'\n'
+		elif [ -n "$shift_s" ] && [ "$shift_s" != 0 ]; then SUBFIX="$SUBFIX$s"$'\n'; fi
+	done < <(companions "$f")
+	if o=$(orphan_sub "$f"); then say_problem subname "$(basename -- "$o") will not load: players only take subtitles named like the video ($b.*)"; else o=''; fi
+	forced=0
+	if [ -n "$sync" ] && [ "$sync" != 0 ]; then forced=1; fi
+	[ "$embed" -eq 1 ] && forced=1
+	if [ -z "$PROBLEMS" ] && [ "$forced" -eq 0 ] && [ -z "$SUBFIX" ]; then echo "ok       $f"; continue; fi
+	if [ "$check" -eq 1 ]; then [ -z "$PROBLEMS" ] || rc=1; continue; fi
+
+	avprob=$forced
+	for code in decode timestamps quiet audiocodec pixfmt vlc; do has_problem "$code" && avprob=1; done
+	if [ "$avprob" -eq 1 ]; then
+		if [ -e "$out" ]; then
+			echo "skip     $f ($out exists)" >&2; rc=1
+		else
+			if [ "$embed" -eq 1 ]; then
+				s=$(companions "$f" | head -n 1)
+				if [ -n "$s" ]; then
+					SUBINPUT=$(mktemp --suffix=.srt) || SUBINPUT=''
+					if [ -n "$SUBINPUT" ] && ! write_sub "$s" "$SUBINPUT"; then echo "fixmedia: subtitle for --embed unusable" >&2; rm -f "$SUBINPUT"; SUBINPUT=''; fi
+				fi
+			fi
+			if how=$(fix_av "$f" "$out"); then
+				after=$(vlc_errors "$out")
+				if [ -n "$after" ]; then echo "fixed    $f -> $out ($how) -- VLC still says: $(printf '%s' "$after" | head -n 1 | cut -c1-80)"
+				elif [ "$vlcon" -eq 1 ]; then echo "fixed    $f -> $out ($how; VLC plays it cleanly)"
+				else echo "fixed    $f -> $out ($how)"; fi
+			else
+				echo "FAILED   $f (nothing could read it)" >&2; rc=1
+			fi
+			[ -z "$SUBINPUT" ] || rm -f "$SUBINPUT"
+		fi
+	fi
+	# subtitles next to the video get the repaired video's name stem (fixed-NAME.pl.srt matches fixed-NAME.mp4)
+	if [ -n "$SUBFIX" ]; then
+		while IFS= read -r s; do
+			[ -n "$s" ] || continue
+			so="$dir/fixed-$(basename -- "$s")"
+			if [ -e "$so" ]; then echo "skip     $s ($so exists)" >&2; continue; fi
+			if write_sub "$s" "$so"; then echo "fixed    $s -> $so"; else rm -f "$so"; echo "FAILED   $s" >&2; rc=1; fi
+		done <<< "$SUBFIX"
+	fi
+	if [ -n "$o" ]; then
+		so="$dir/fixed-${b}.$(ext "$o")"
+		if [ ! -e "$so" ] && write_sub "$o" "$so"; then echo "fixed    $o -> $so (named after the video)"; fi
 	fi
 done
 exit "$rc"
