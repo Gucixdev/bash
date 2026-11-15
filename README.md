@@ -162,7 +162,7 @@ lib/wizard       ask a list of questions, print answers as eval-able assignments
 lib/dspq, evq    download queue and event queue for shell scripts
 comfy/           comfylauncher + helpers (asset generation), one folder
 installer/       one-shot clone, build, run scripts
-templates/       run, build, setup, wizard, bench, compare, test: starting points
+templates/       run, build, setup, wizard, bench, compare, test, download_references: starting points
 tests/           bats: libs, every tool's offline behaviour, --help, shellcheck
 ```
 
