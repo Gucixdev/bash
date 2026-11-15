@@ -87,7 +87,7 @@ E2
 
 @test "bake: no arguments for usage gives help, an unknown command exits 2" {
 	run ./bake --help
-	[ "$status" -eq 0 ]; [[ "$output" == *"bake build [FILE]"* ]]
+	[ "$status" -eq 0 ]; [[ "$output" == *"bake build [--pull] [FILE]"* ]]
 	run ./bake nonsense
 	[ "$status" -eq 2 ]
 }
@@ -135,4 +135,66 @@ E2
 	[ "$status" -eq 0 ]
 	run ./bake vm ls
 	[[ "$output" == *$'t\tstopped'* ]]
+}
+
+# a local upstream repo with one commit; bake_commit adds another
+mkrepo() {
+	R=$T/upstream; git init -q -b main "$R"
+	git -C "$R" config user.email t@t; git -C "$R" config user.name t; git -C "$R" config commit.gpgsign false
+	printf 'one\n' > "$R/f"; git -C "$R" add f; git -C "$R" commit -qm one
+}
+bump() { printf '%s\n' "$1" > "$R/f"; git -C "$R" commit -qam "$1"; }
+
+@test "bake: a git line becomes COPY --from=src0 with the upstream commit in a label, and sources follow upstream" {
+	mkrepo; mkdir "$T/g"
+	printf 'base scratch\ngit file://%s main /app\n' "$R" > "$T/g/g.bake"
+	run ./bake show "$T/g/g.bake"; [ "$status" -eq 0 ]; [[ "$output" == *"COPY --from=src0 / /app"* && "$output" == *unsynced* ]]
+	run ./bake sync_nothing; [ "$status" -eq 2 ]
+	# sync through the build path, with the engine replaced by a fake that records its arguments
+	mkdir "$T/fake"; printf '#!/bin/sh\necho "$@" >> %s/calls\ncat > %s/cf\nexit 0\n' "$T" "$T" > "$T/fake/podman"; chmod +x "$T/fake/podman"
+	PATH=$T/fake:$PATH run ./bake build "$T/g/g.bake"; [ "$status" -eq 0 ]
+	sha1=$(git -C "$R" rev-parse main)
+	[[ "$output" == *": ${sha1:0:9}"* && "$output" != *"->"* ]]
+	grep -q -- "--build-context src0=" "$T/calls"; grep -q "bake.src.0=\"file://$R main $sha1\"" "$T/cf"
+	[ "$(cat "$T/state/bake/src/g/0/f")" = one ]; [ ! -e "$T/state/bake/src/g/0/.git" ]
+	PATH=$T/fake:$PATH run ./bake build "$T/g/g.bake"; [[ "$output" == *"(unchanged)"* ]]
+	bump two; sha2=$(git -C "$R" rev-parse main)
+	PATH=$T/fake:$PATH run ./bake build "$T/g/g.bake"; [[ "$output" == *"${sha1:0:9} -> ${sha2:0:9}"* ]]
+	[ "$(cat "$T/state/bake/src/g/0/f")" = two ]
+	BAKE_OFFLINE=1 PATH=$T/fake:$PATH run ./bake build "$T/g/g.bake"; [ "$status" -eq 0 ]; [[ "$output" == *offline* ]]
+}
+
+@test "bake: BAKE_OFFLINE with a source never fetched is refused; a git line needs 2 or 3 words" {
+	mkrepo; mkdir "$T/fake"; printf '#!/bin/sh\ncat > /dev/null\n' > "$T/fake/podman"; chmod +x "$T/fake/podman"
+	printf 'base scratch\ngit file://%s /app\n' "$R" > "$T/o.bake"
+	BAKE_OFFLINE=1 PATH=$T/fake:$PATH run ./bake build "$T/o.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"never fetched"* ]]
+	printf 'base scratch\ngit onlyone\n' > "$T/w.bake"
+	run ./bake show "$T/w.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"git needs URL"* ]]
+}
+
+@test "bake: outdated compares the image label with upstream (real engine)" {
+	need_engine; mkrepo; mkdir "$T/g"
+	printf 'base %s\ngit file://%s main /app\ncheck cat /app/f => one\n' "$BASE" "$R" > "$T/g/bake-out.bake"
+	run ./bake outdated "$T/g/bake-out.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"no image built yet"* ]]
+	run ./bake build "$T/g/bake-out.bake"; [ "$status" -eq 0 ]; [[ "$output" == *"check ok"* ]]
+	run ./bake outdated "$T/g/bake-out.bake"; [ "$status" -eq 0 ]; [[ "$output" == *current* ]]
+	bump two
+	run ./bake outdated "$T/g/bake-out.bake"; [ "$status" -eq 1 ]; [[ "$output" == *upstream* ]]
+	run ./bake build "$T/g/bake-out.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"check FAIL"* ]]	# the check still wants "one"
+	run ./bake outdated "$T/g/bake-out.bake"; [ "$status" -eq 0 ]
+	podman rmi bake-out > /dev/null 2>&1 || docker rmi bake-out > /dev/null 2>&1 || true
+}
+
+@test "bake: vm kind takes a local ISO, makes the disk once, and attaches the ISO only while the disk has no boot sector" {
+	command -v qemu-img > /dev/null || skip "no qemu-img"
+	mkdir "$T/fake"; printf '#!/bin/sh\necho "$@" > %s/qargs\nexit 0\n' "$T" > "$T/fake/qemu-system-$(uname -m)"; chmod +x "$T/fake/qemu-system-$(uname -m)"
+	printf 'x' > "$T/a.iso"
+	printf 'kind vm\niso %s\ndisk 1M\ndrive ide\nram 256M\nqemu -vga std\n' "$T/a.iso" > "$T/v.bake"
+	PATH=$T/fake:$PATH run ./bake up "$T/v.bake"; [ "$status" -eq 0 ]
+	grep -q -- "-cdrom $T/a.iso" "$T/qargs"; grep -q "if=ide" "$T/qargs"; grep -q -- "-vga std" "$T/qargs"; grep -q -- "-m 256M" "$T/qargs"
+	d=$T/state/bake/disk/v.img; [ -f "$d" ]
+	printf '\x55\xaa' | dd of="$d" bs=1 seek=510 conv=notrunc 2> /dev/null
+	: > "$T/qargs"; rm -rf "$T/state/bake/vm"
+	PATH=$T/fake:$PATH run ./bake up "$T/v.bake"; [ "$status" -eq 0 ]
+	! grep -q -- "-cdrom" "$T/qargs"
 }

@@ -1,0 +1,10 @@
+# templeos - TempleOS in QEMU, same as launchers/templeos but described as a .bake.
+#   bake up templeos --gui     first boot attaches the ISO until TempleOS has written a boot sector to the disk
+#   bake outdated templeos     does the server have a newer ISO
+kind vm
+iso https://templeos.org/Downloads/TempleOS.ISO
+disk 64M
+format raw
+drive ide
+ram 256M
+cpus 1
