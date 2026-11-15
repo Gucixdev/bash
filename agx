@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# agx - run tools for AI agents (MCP servers, CLIs) without installing them, the way npx does, from one bash file.
+# A name from the registry is fetched once into a cache (npm, pip, git or a checked download) and started from there.
+#
+#   agx run NAME [ARGS...]     fetch if needed, then run (exec): this is what an MCP config calls
+#   agx NAME [ARGS...]         the same, when NAME is not one of the commands below
+#   agx list                   name, kind, cached or not, description (TSV)
+#   agx search WORD            list, filtered
+#   agx info NAME              the registry row and what is in the cache
+#   agx add NAME KIND SOURCE [REF [CMD [DESC [SETUP]]]]   add or replace a row in your registry
+#   agx remove NAME            drop the row from your registry (the built-in rows stay)
+#   agx update NAME            throw the cached copy away and fetch again
+#   agx clean [NAME]           move the cache (or one entry) to the trash
+#   agx path NAME              the cache directory of NAME
+#   agx mcp NAME               print the line that registers NAME as an MCP server in Claude Code
+#
+# Kinds: npm (SOURCE = package or local dir, REF = version), pip (SOURCE = package or path, REF = version),
+#   git (SOURCE = repo URL, REF = tag/branch/commit, CMD = shell command run with AGX_DIR set, SETUP = command run once in the checkout),
+#   url (SOURCE = download, REF = sha256 REQUIRED, the file becomes the command).
+# Registry rows are tab-separated: name kind source ref cmd desc setup. Yours: ${XDG_CONFIG_HOME:-~/.config}/agx/registry.tsv
+# (first match wins, yours before the built-in ones). REF "latest" or empty = whatever is newest at the first fetch.
+# Safety: nothing is fetched or run for the first time without a "y" (-y or AGX_YES=1 skips it; without a terminal it is required).
+#   npm lifecycle scripts stay off unless AGX_SCRIPTS=1. AGX_OFFLINE=1 never touches the network. AGX_HOME moves the cache.
+set -u
+case ${1:-} in -h | --help | '') awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+die() { printf 'agx: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" > /dev/null 2>&1 || die "$1 is missing (install: $2)"; }
+home=${AGX_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/agx}
+userreg=${AGX_REGISTRY:-${XDG_CONFIG_HOME:-$HOME/.config}/agx/registry.tsv}
+yes=${AGX_YES:-}
+
+builtin_registry() {	# names are the packages' published names, as remembered: `agx info NAME` and a first run show if one is wrong
+	cat << 'R'
+context7	npm	@upstash/context7-mcp	latest		docs for any library, current
+playwright	npm	@playwright/mcp	latest		browser automation over MCP
+filesystem	npm	@modelcontextprotocol/server-filesystem	latest		files under directories you pass as arguments
+memory	npm	@modelcontextprotocol/server-memory	latest		knowledge-graph memory
+sequential-thinking	npm	@modelcontextprotocol/server-sequential-thinking	latest		step-by-step reasoning tool
+fetch	pip	mcp-server-fetch	latest		fetch a URL as text
+git	pip	mcp-server-git	latest		git repository tools
+R
+}
+
+registry() { { [ -r "$userreg" ] && cat "$userreg"; builtin_registry; } | grep -v '^#' ; }
+row() { registry | awk -F '\t' -v n="$1" '$1 == n { print; exit }'; }
+field() { printf '%s' "$2" | awk -F '\t' -v i="$1" '{ print $i }'; }
+
+cached() { [ -f "$home/$1/.ok" ]; }
+trashdir() { echo "${XDG_DATA_HOME:-$HOME/.local/share}/Trash/files"; }
+totrash() {	# move, never delete
+	local d; d=$(trashdir); mkdir -p "$d" || die "cannot make $d"
+	mv -- "$1" "$d/agx-$(basename "$1")-$(date +%s)" || die "cannot move $1 to the trash"
+}
+
+confirm() {	# confirm "text"
+	[ -n "$yes" ] && return 0
+	[ -t 0 ] && [ -t 2 ] || die "$1 - needs your yes: run it once on a terminal, or pass -y / AGX_YES=1"
+	printf 'agx: %s. Continue? [y/N] ' "$1" >&2
+	local a; read -r a; case $a in y | Y | yes) return 0 ;; *) die "cancelled" ;; esac
+}
+
+npm_name() {	# package name from a source: strip @version, keep @scope; a local dir reads its package.json
+	case $1 in
+	/* | ./* | ../*) [ -d "$1" ] && node -p "require('$(cd "$1" && pwd)/package.json').name" || basename "$1" ;;
+	*) printf '%s' "$1" | sed -E 's/^(@?[^@]+)@.*/\1/' ;;
+	esac
+}
+
+fetch_npm() {	# fetch_npm DIR SOURCE REF CMD
+	need npm "nodejs/npm"
+	local spec=$2
+	case $2 in /* | ./* | ../*) ;; *) case ${3:-latest} in latest | '') ;; *) spec=$2@$3 ;; esac ;; esac
+	local flags=(--no-audit --no-fund --prefix "$1")
+	if [ -z "${AGX_SCRIPTS:-}" ]; then flags+=(--ignore-scripts)
+	elif npm config list -l 2> /dev/null | grep -q '^dangerously-allow-all-scripts'; then flags+=(--dangerously-allow-all-scripts)	# npm 12 blocks them unless told
+	fi
+	[ -z "${AGX_OFFLINE:-}" ] || flags+=(--offline)
+	npm install "${flags[@]}" "$spec" > "$1/.log" 2>&1 || { tail -5 "$1/.log" >&2; die "npm install $spec failed (log: $1/.log)"; }
+	local bin=$4
+	if [ -z "$bin" ]; then
+		bin=$(cd "$1" && node -e "const p=require('./node_modules/$(npm_name "$2")/package.json');const b=p.bin;console.log(typeof b==='string'?p.name.split('/').pop():Object.keys(b||{})[0]||'')" 2> /dev/null)
+	fi
+	[ -n "$bin" ] && [ -x "$1/node_modules/.bin/$bin" ] || die "cannot tell which command $2 provides; name it: agx add NAME npm $2 REF CMD (bins: $(ls "$1/node_modules/.bin" 2> /dev/null | tr '\n' ' '))"
+	printf '%s\n' "$1/node_modules/.bin/$bin" > "$1/.cmd"
+}
+
+fetch_pip() {
+	local spec=$2
+	case ${3:-latest} in latest | '') ;; *) spec="$2==$3" ;; esac
+	local off=; [ -z "${AGX_OFFLINE:-}" ] || off=--offline
+	if command -v uv > /dev/null 2>&1; then
+		uv venv -q "$1/venv" > "$1/.log" 2>&1 && uv pip install -q $off --python "$1/venv/bin/python" "$spec" >> "$1/.log" 2>&1
+	else
+		need python3 python; python3 -m venv "$1/venv" > "$1/.log" 2>&1 && "$1/venv/bin/pip" install -q ${off:+--no-index} "$spec" >> "$1/.log" 2>&1
+	fi || { tail -5 "$1/.log" >&2; die "pip install $spec failed (log: $1/.log)"; }
+	local bin=${4:-$(printf '%s' "$2" | sed -E 's#^.*/##; s/\[.*//')}
+	[ -x "$1/venv/bin/$bin" ] || die "$bin not found after install; name the command: agx add NAME pip $2 REF CMD (bins: $(ls "$1/venv/bin" | tr '\n' ' '))"
+	printf '%s\n' "$1/venv/bin/$bin" > "$1/.cmd"
+}
+
+fetch_git() {	# fetch_git DIR SOURCE REF CMD SETUP
+	need git git; [ -n "$4" ] || die "a git row needs a CMD (what to run inside the checkout)"
+	[ -z "${AGX_OFFLINE:-}" ] || case $2 in /* | file://*) ;; *) die "AGX_OFFLINE is set and $2 is remote" ;; esac
+	local s="$1/src"; mkdir -p "$s"
+	( cd "$s" && git init -q && git remote add origin "$2" && git fetch -q --depth 1 origin "${3:-HEAD}" && git -c advice.detachedHead=false checkout -q FETCH_HEAD ) > "$1/.log" 2>&1 \
+		|| { tail -5 "$1/.log" >&2; die "git fetch of $2 ${3:-HEAD} failed"; }
+	[ -z "${5:-}" ] || ( cd "$s" && bash -c "$5" ) >> "$1/.log" 2>&1 || { tail -5 "$1/.log" >&2; die "setup command failed (log: $1/.log)"; }
+	printf 'bash -c %q agx\n' "$4 \"\$@\"" > "$1/.cmd"
+}
+
+fetch_url() {
+	need curl curl; need sha256sum coreutils
+	[ -n "$3" ] && [ "$3" != latest ] || die "a url row needs the sha256 of the file in the REF column"
+	mkdir -p "$1/bin"
+	local f; f=$1/bin/${4:-$(basename "${2%%\?*}")}
+	curl -fsSL -o "$f" "$2" || die "download of $2 failed"
+	[ "$(sha256sum "$f" | cut -d' ' -f1)" = "$3" ] || { mv -- "$f" "$f.bad"; die "sha256 of $2 does not match the registry (moved to $f.bad)"; }
+	chmod +x "$f"; printf '%s\n' "$f" > "$1/.cmd"
+}
+
+ensure() {	# ensure NAME -> prints nothing; the command line is in $home/NAME/.cmd
+	local r; r=$(row "$1"); [ -n "$r" ] || die "no registry row for '$1' (agx list; agx add ...)"
+	cached "$1" && return 0
+	[ -z "${AGX_OFFLINE:-}" ] || [ "$(field 2 "$r")" = git ] || die "$1 is not cached and AGX_OFFLINE is set"
+	local kind src ref cmd setup; kind=$(field 2 "$r"); src=$(field 3 "$r"); ref=$(field 4 "$r"); cmd=$(field 5 "$r"); setup=$(field 7 "$r")
+	confirm "first run of '$1': fetch $kind $src@${ref:-latest} into $home/$1 and run it"
+	mkdir -p "$home" || die "cannot make $home"
+	need flock util-linux
+	exec 9> "$home/.lock-$1"; flock 9
+	cached "$1" && return 0	# somebody else finished while we waited
+	local d=$home/$1; [ ! -e "$d" ] || totrash "$d"
+	mkdir -p "$d"
+	case $kind in
+	npm) fetch_npm "$d" "$src" "$ref" "$cmd" ;;
+	pip) fetch_pip "$d" "$src" "$ref" "$cmd" ;;
+	git) fetch_git "$d" "$src" "$ref" "$cmd" "$setup" ;;
+	url) fetch_url "$d" "$src" "$ref" "$cmd" ;;
+	*) die "unknown kind '$kind' in the row for $1 (npm pip git url)" ;;
+	esac
+	date +%s > "$d/.ok"
+}
+
+run() {
+	[ $# -ge 1 ] || die "run needs a NAME"
+	local n=$1; shift
+	ensure "$n" || exit 1
+	export AGX_DIR=$home/$n
+	local c; c=$(cat "$AGX_DIR/.cmd")
+	case $c in
+	bash\ -c\ *) eval "exec $c \"\$@\"" ;;
+	*) exec "$c" "$@" ;;
+	esac
+}
+
+cmd_list() { registry | awk -F '\t' -v h="$home" 'BEGIN { OFS = "\t" } !seen[$1]++ { c = system("test -f \"" h "/" $1 "/.ok\"") == 0 ? "cached" : "-"; print $1, $2, c, $6 }'; }
+
+case $1 in
+run) shift; run "$@" ;;
+list) cmd_list ;;
+search) shift; cmd_list | grep -i -- "${1:?search needs a word}" ;;
+info)
+	r=$(row "${2:?info needs a NAME}"); [ -n "$r" ] || die "no row for $2"
+	printf 'name\t%s\nkind\t%s\nsource\t%s\nref\t%s\ncmd\t%s\ndesc\t%s\nsetup\t%s\n' "$(field 1 "$r")" "$(field 2 "$r")" "$(field 3 "$r")" "$(field 4 "$r")" "$(field 5 "$r")" "$(field 6 "$r")" "$(field 7 "$r")"
+	if cached "$2"; then printf 'cache\t%s (fetched %s)\ncommand\t%s\n' "$home/$2" "$(date -d "@$(cat "$home/$2/.ok")" '+%F %T')" "$(cat "$home/$2/.cmd")"; else printf 'cache\t-\n'; fi ;;
+add)
+	[ $# -ge 4 ] || die "usage: agx add NAME KIND SOURCE [REF [CMD [DESC [SETUP]]]]"
+	case $3 in npm | pip | git | url) ;; *) die "kind must be npm, pip, git or url" ;; esac
+	mkdir -p "$(dirname "$userreg")" || die "cannot make the registry directory"
+	t=$(mktemp "$userreg.XXXXXX") || die "mktemp failed"
+	{ [ -r "$userreg" ] && awk -F '\t' -v n="$2" '$1 != n' "$userreg"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "${5:-latest}" "${6:-}" "${7:-}" "${8:-}"; } > "$t" && mv -- "$t" "$userreg"
+	echo "agx: $2 saved in $userreg" ;;
+remove)
+	[ -r "$userreg" ] && awk -F '\t' -v n="${2:?remove needs a NAME}" '$1 == n { f = 1 } END { exit !f }' "$userreg" || die "'$2' is not in your registry ($userreg)"
+	t=$(mktemp "$userreg.XXXXXX") && awk -F '\t' -v n="$2" '$1 != n' "$userreg" > "$t" && mv -- "$t" "$userreg" && echo "agx: $2 removed from your registry" ;;
+update)
+	n=${2:?update needs a NAME}; [ -d "$home/$n" ] && totrash "$home/$n"
+	ensure "$n" && echo "agx: $n fetched again" ;;
+clean)
+	if [ -n "${2:-}" ]; then [ -d "$home/$2" ] || die "$2 is not cached"; totrash "$home/$2"
+	else [ -d "$home" ] && for d in "$home"/*/; do [ -d "$d" ] && totrash "${d%/}"; done; fi
+	echo "agx: cache moved to $(trashdir)" ;;
+path) printf '%s\n' "$home/${2:?path needs a NAME}" ;;
+mcp)
+	n=${2:?mcp needs a NAME}; [ -n "$(row "$n")" ] || die "no row for $n"
+	printf 'claude mcp add %s -- %s run %s\n' "$n" "$(readlink -f "$0")" "$n" ;;
+-*) die "unknown option $1 (agx --help)" ;;
+*) run "$@" ;;
+esac
