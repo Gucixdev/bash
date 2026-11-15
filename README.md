@@ -14,74 +14,6 @@ ln -s "$PWD/logcollector" ~/.local/bin/    # put any tool on PATH
 `bats tests/` runs the tests. Scripts are also kept clean under
 `shellcheck -S warning`.
 
-## What it looks like
-
-`logcollector -n -s "2 hours ago"` on a desktop with a couple of failing units:
-
-```
-logcollector summary (since 2 hours ago)
-
-err      1 lines
-warning  44 lines
-
-failed units:
-  cachyos-iw-set-regdomain.service     loaded failed failed Set Wireless Regulatory Domain on Timezone Change
-  systemd-networkd-wait-online.service loaded failed failed Wait for Network to be Online
-
-most repeated errors:
-  1   entries --
-
-skipped:
-  coredumps.txt: no output (needs privileges, or nothing logged)
-```
-
-`sniff -` on a few lines of `tcpdump -nn` output (sample, a synthetic capture):
-
-```
-9 packets, 3.2 KiB in 4.4s (749.318 B/s)
-
-protocols
-  icmp         1 packets        64 B
-  udp          4 packets       240 B
-  arp          1 packets        28 B
-  tcp          3 packets     2.9 KiB
-
-busiest conversations
-     1.9 KiB  142.250.74.46 <-> 192.168.1.10
-      1000 B  2001:db8::1 <-> 2001:db8::2
-
-services
-     2.9 KiB  tcp/https (443)
-       74 B  udp/dns (53)
-
-DNS names asked
-           1  example.com.
-```
-
-## Principles
-
-- **One file, no runtime dependency on this repo.** Interactive tools
-  carry the few `lt_*` UI functions they call (selection menus with
-  preview and key hints) as a marked block copied from `lib/lazytui`,
-  so a tool still runs after being copied to another machine.
-- **Wrap the real thing.** `ezcontainers` drives whichever of Docker and
-  Podman is installed, `flatseal` drives `flatpak`, `wifi` drives
-  NetworkManager, iwd or wpa_supplicant, whichever is running. `gh`, `hf`
-  and `nmap` go on PATH under the real tool's name: they add their own
-  commands and views and hand everything else to the real one, which they
-  find by skipping themselves. Link them into a directory that comes before
-  the real one on PATH (`~/.local/bin` usually does).
-- **Degrade, don't die.** A missing optional dependency means a simpler
-  path and a one-line message. A missing required one fails fast with the
-  install command.
-- **Show before doing.** Anything destructive lists what it will touch
-  and asks once. `cleaner` never removes packages on its own.
-- **No secrets in the repo.** Tokens come from the environment
-  (`GH_TOKEN`, `HF_TOKEN`, see `secrets.example`; the shell loads them from `~/.secrets`).
-  `gh` hands its token to curl on stdin, so it never shows up in `ps`.
-
-Every tool prints its header with `--help`.
-
 ## Interactive managers
 
 Built on `lib/lazytui`: arrows or Tab to move, space to mark rows
@@ -121,26 +53,6 @@ the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 | `fixmedia` | Find why a video, song, subtitle or picture misbehaves (cuts out, no or silent sound, DTS/AC3, 10-bit, subtitle garbage) and write `fixed-NAME`; VLC is the judge. `-c` only checks, `--sync`, `--shift`, `--embed`. |
 | `manwriter` | Turn a script's header comment into a man page: `manwriter -d man tool...`. `manwriter new` writes a skeleton. |
 
-## Libraries
-
-`lib/` holds helpers other scripts call. Each is a command, so they work
-from any language, not only sh:
-
-```sh
-settings set myapp theme dark          # ~/.config/myapp/settings, mode 600
-settings get myapp theme               # MYAPP_THEME in the environment wins
-eval "$(settings export myapp)"        # MYAPP_THEME='dark'
-
-eval "$(wizard <<'STEPS'
-name|Your name
-shell|Shell|bash,zsh,fish|zsh
-STEPS
-)"                                     # fzf if installed, numbered prompt if not
-
-evq push -q jobs "resize a.png"        # file-backed FIFO, safe for many consumers
-dspq -j 3 "$url|$dest|label"           # parallel, atomic, resumable downloads
-```
-
 ## Installers, launchers
 
 | path | what |
@@ -151,6 +63,10 @@ dspq -j 3 "$url|$dest|label"           # parallel, atomic, resumable downloads
 | `installer/templeos` | TempleOS in QEMU. |
 
 `installer/` holds only real one-shot installers; long-lived tools sit at the top level or in their own folder.
+
+## More
+
+[What it looks like](docs/look.md), [principles](docs/principles.md), [libraries](docs/libs.md), [ideas](docs/ideas.md).
 
 ## Layout
 
@@ -165,16 +81,6 @@ installer/       one-shot clone, build, run scripts
 templates/       run, build, setup, wizard, bench, compare, test, download_references: starting points
 tests/           bats: libs, every tool's offline behaviour, --help, shellcheck
 ```
-
-## Ideas
-
-Not built yet:
-
-- **lazytui in C/ANSI.** The shell library stays as the reference; a C
-  version of the same widgets (key hints bar, `raw` and `select` modes,
-  actions declared as `key = command`) is planned.
-- **dspq as a tool.** `lib/dspq` is a parallel, atomic download queue for
-  shell scripts; a front end with a progress view would sit on top.
 
 ## Status
 
