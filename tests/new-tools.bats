@@ -310,7 +310,7 @@ setup() {
 	head -c $((sz * 7 / 10)) "$tmp/p.jpg" > "$tmp/cut.jpg"
 	run ./fixmedia -c "$tmp/cut.jpg"
 	[ "$status" -eq 1 ]
-	[[ "$output" == broken* ]]
+	[[ "$output" == problem*decode* ]]
 	run ./fixmedia "$tmp/cut.jpg"
 	[ "$status" -eq 0 ]
 	[ -s "$tmp/fixed-cut.jpg" ]
