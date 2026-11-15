@@ -110,7 +110,7 @@ the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 | `skilltree` | Tree of Claude Code skills from their SKILL.md headers: priority, parts (`references/`), requirements, and the always-loaded description cost. `-w NAME` shows who requires NAME. |
 | `claude_maintain` | Checks `~/.claude` for rot: broken skill links, memory index drift, bad settings JSON, hooks that point nowhere, what weighs most. Reports only; `-f` trashes broken skill links, nothing is deleted. |
 | `agx` | Runs tools for AI agents (MCP servers, CLIs) without installing them, like npx: a registry row says npm, pip, git or a checked download, the first run fetches into a cache after a yes, later runs work offline. `agx mcp NAME` prints the `claude mcp add` line. | npm, uv or python3, git, curl |
-| `bake` | Describe an image once in a small `bakefile` (base, pkg, copy, run, `check CMD => TEXT`), then build it as a container, export a rootfs tarball, or boot a kernel/ISO/disk in QEMU headless with a console log. Made to be driven by an agent: show before build, checks run after. | podman or docker, qemu |
+| `bake` | Describe an image once in a small `NAME.bake` file (base, pkg, copy, run, `check CMD => TEXT`), then build it as a container, export a rootfs tarball, or boot a kernel/ISO/disk in QEMU headless with a console log. Made to be driven by an agent: show before build, checks run after. | podman or docker, qemu |
 | `wifi` | Wi-Fi picker over NetworkManager, iwd or wpa_supplicant. |
 | `btth` | Bluetooth picker over `bluetoothctl`. |
 | `metadata_cleaner` | Strip EXIF and other metadata into a new `clean-NAME` file. mat2 or exiftool, else ffmpeg or ImageMagick. |

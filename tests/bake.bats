@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# bake: bakefile translation without any engine; build, rootfs and VM boot when podman/docker, a local base image and qemu exist.
+# bake: .bake file translation without any engine; build, rootfs and VM boot when podman/docker, a local base image and qemu exist.
 
 setup() {
 	cd "$BATS_TEST_DIRNAME/.."
@@ -17,7 +17,7 @@ need_engine() {
 }
 
 @test "bake: show turns directives into a Containerfile, package family guessed from the base" {
-	cat > "$T/bakefile" << 'E2'
+	cat > "$T/x.bake" << 'E2'
 # comment
 name x
 base docker.io/library/debian:12
@@ -30,7 +30,7 @@ user nobody
 cmd ["sh"]
 check true => nothing
 E2
-	run ./bake show "$T/bakefile"
+	run ./bake show "$T/x.bake"
 	[ "$status" -eq 0 ]
 	[ "${lines[0]}" = "FROM docker.io/library/debian:12" ]
 	[[ "${lines[1]}" == "RUN apt-get update && apt-get install -y --no-install-recommends curl jq"* ]]
@@ -55,14 +55,34 @@ E2
 	[ "$status" -eq 1 ]
 }
 
-@test "bake: new writes a starter that shows cleanly, and does not overwrite" {
+@test "bake: new writes NAME.bake; several .bake files sit side by side and ls lists them" {
 	cd "$T"
-	run "$BATS_TEST_DIRNAME/../bake" new proj
-	[ -f proj/bakefile ]
-	run "$BATS_TEST_DIRNAME/../bake" show proj
-	[ "$status" -eq 0 ]
-	run "$BATS_TEST_DIRNAME/../bake" new proj
+	B="$BATS_TEST_DIRNAME/../bake"
+	run "$B" new web
+	[ -f web.bake ]
+	run "$B" new db
+	run "$B" new web
 	[ "$status" -eq 1 ]
+	run "$B" ls
+	[ "$output" = $'db\t./db.bake\nweb\t./web.bake' ]
+	run "$B" show web
+	[ "$status" -eq 0 ]; [ "${lines[0]}" = "FROM docker.io/library/alpine:3.20" ]
+	run "$B" show db.bake
+	[ "$status" -eq 0 ]
+}
+
+@test "bake: a directory with one .bake file works, with several it asks which, the old bakefile name still works" {
+	cd "$T"
+	B="$BATS_TEST_DIRNAME/../bake"
+	mkdir one many old
+	printf 'base x\n' > one/a.bake
+	printf 'base x\n' > many/a.bake; printf 'base y\n' > many/b.bake
+	printf 'base z\n' > old/bakefile
+	run "$B" show one;  [ "$status" -eq 0 ]; [ "$output" = "FROM x" ]
+	run "$B" show many; [ "$status" -eq 1 ]; [[ "$output" == *"several .bake files"* && "$output" == *"a.bake b.bake"* ]]
+	run "$B" show many/b; [ "$output" = "FROM y" ]
+	run "$B" show old;  [ "$output" = "FROM z" ]
+	run "$B" show empty_dir_that_does_not_exist; [ "$status" -eq 1 ]
 }
 
 @test "bake: no arguments for usage gives help, an unknown command exits 2" {
@@ -75,13 +95,13 @@ E2
 @test "bake: build runs the checks, a failing check exits 1, rootfs exports the filesystem" {
 	need_engine
 	mkdir "$T/p"
-	printf 'name bake-bats\nbase %s\nenv G=hi\nrun echo built-$G > /built\ncheck cat /built => built-hi\n' "$BASE" > "$T/p/bakefile"
+	printf 'base %s\nenv G=hi\nrun echo built-$G > /built\ncheck cat /built => built-hi\n' "$BASE" > "$T/p/bake-bats.bake"
 	run ./bake build "$T/p"
 	[ "$status" -eq 0 ]; [[ "$output" == *"check ok:   cat /built => built-hi"* ]]
-	printf 'check true => never\n' >> "$T/p/bakefile"
+	printf 'check true => never\n' >> "$T/p/bake-bats.bake"
 	run ./bake build "$T/p"
 	[ "$status" -eq 1 ]; [[ "$output" == *"check FAIL"* ]]
-	sed -i '/never/d' "$T/p/bakefile"
+	sed -i '/never/d' "$T/p/bake-bats.bake"
 	run ./bake rootfs "$T/p" "$T/root.tar"
 	[ "$status" -eq 0 ]
 	[ "$(tar -xOf "$T/root.tar" built)" = "built-hi" ]

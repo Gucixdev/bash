@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# bake - describe an image once in a small bakefile, then build it as a container, a rootfs tarball or boot it in a VM.
+# bake - describe an image once in a small NAME.bake file, then build it as a container, a rootfs tarball or boot it in a VM.
 # Made to be driven by an agent: every step prints what it will do, the result can be checked inside the same file.
 #
-#   bake new NAME                 write NAME/bakefile, a starter
-#   bake show [FILE]              print the Containerfile the bakefile turns into (nothing is built)
+#   bake new NAME                 write NAME.bake here, a starter
+#   bake ls [DIR]                 the .bake files in DIR (default: here)
+#   bake show [FILE]              print the Containerfile a .bake file turns into (nothing is built)
 #   bake build [FILE]             build the image (podman, else docker), then run the `check` lines
 #   bake run IMAGE [CMD...]       run an image once and remove the container
 #   bake rootfs [FILE] [OUT.tar]  build, then export the filesystem as a tarball (for nspawn, bwrap, a VM disk)
@@ -11,8 +12,10 @@
 #   bake vm start NAME [--disk F] [--iso F] [--kernel K] [--initrd I] [--append "..."] [--ram 2G] [--cpus 2] [--ssh PORT] [--gui]
 #   bake vm stop NAME | ls | log NAME   QEMU, KVM when /dev/kvm is usable; headless with the serial console in a log, unless --gui
 #
-# bakefile: one directive per line, # starts a comment, the build context is the bakefile's directory.
-#   name X            image name (default: the directory name)        base IMG     FROM (docker.io/library/alpine:3.20, scratch, ...)
+# FILE is a path, or a NAME that means NAME.bake, or a directory with exactly one .bake file; any number of .bake files
+# can sit side by side (an old plain `bakefile` is still found). One directive per line, # starts a comment, the build
+# context is the file's directory.
+#   name X            image name (default: the file name without .bake)        base IMG     FROM (docker.io/library/alpine:3.20, scratch, ...)
 #   pkg a b           install packages with the base's package manager (apk, apt, pacman, dnf; family guessed from base, or `family apk`)
 #   copy SRC DEST     env K=V      workdir D      user U      run COMMAND      cmd COMMAND
 #   check CMD => TEXT   after the build run CMD inside the image; it must print TEXT somewhere (several allowed)
@@ -67,8 +70,21 @@ containerfile() {	# containerfile BAKEFILE
 	done < "$1"
 	[ -n "$base" ] || die "$1 has no base line"
 }
-bake_name() { local n; n=$(awk '$1 == "name" { print $2; exit }' "$1"); echo "${n:-$(basename "$(dirname "$(readlink -f "$1")")")}" | tr 'A-Z ' 'a-z-'; }
-bakefile_arg() { local f=${1:-bakefile}; [ -d "$f" ] && f=$f/bakefile; [ -r "$f" ] || die "no bakefile at $f (bake new NAME)"; echo "$f"; }
+bake_name() {
+	local n base; n=$(awk '$1 == "name" { print $2; exit }' "$1")
+	if [ -z "$n" ]; then base=$(basename "$1"); case $base in bakefile) n=$(basename "$(dirname "$(readlink -f "$1")")") ;; *) n=${base%.bake} ;; esac; fi
+	printf '%s\n' "$n" | tr 'A-Z ' 'a-z-'
+}
+bakefile_arg() {	# a file, NAME -> NAME.bake, or a directory holding one .bake file
+	local a=${1:-.}
+	[ -f "$a" ] && { echo "$a"; return; }
+	[ -f "$a.bake" ] && { echo "$a.bake"; return; }
+	[ -d "$a" ] || die "no .bake file '$a' (bake new NAME)"
+	local l=("$a"/*.bake)
+	if [ ! -e "${l[0]}" ]; then [ -f "$a/bakefile" ] && { echo "$a/bakefile"; return; }; die "no .bake file in $a (bake new NAME)"; fi
+	[ ${#l[@]} -eq 1 ] && { echo "${l[0]}"; return; }
+	die "several .bake files in $a ($(printf '%s ' "${l[@]##*/}")): name one, e.g. bake build $a/${l[0]##*/}"
+}
 
 cmd_build() {
 	local f; f=$(bakefile_arg "${1:-}"); local e name dir cf; e=$(engine); name=$(bake_name "$f"); dir=$(dirname "$f")
@@ -140,21 +156,26 @@ cmd_vm() {
 }
 
 cmd_new() {
-	local n=${1:-}; [ -n "$n" ] || usage "new needs a NAME"; [ ! -e "$n/bakefile" ] || die "$n/bakefile exists"
-	mkdir -p "$n" && cat > "$n/bakefile" << E2
+	local n=${1:-}; [ -n "$n" ] || usage "new needs a NAME"; [ ! -e "$n.bake" ] || die "$n.bake exists"
+	cat > "$n.bake" << E2
 # $n - edit, then: bake show $n; bake build $n
-name $n
 base docker.io/library/alpine:3.20
 pkg curl
 run echo built > /built
 cmd cat /built
 check cat /built => built
 E2
-	echo "bake: wrote $n/bakefile"
+	echo "bake: wrote $n.bake"
+}
+
+cmd_ls() {
+	local d=${1:-.} f; [ -d "$d" ] || die "$d is not a directory"
+	for f in "$d"/*.bake; do [ -e "$f" ] && printf '%s\t%s\n' "$(bake_name "$f")" "$f"; done; true
 }
 
 case $1 in
 new) shift; cmd_new "$@" ;;
+ls) shift; cmd_ls "$@" ;;
 show) shift; f=$(bakefile_arg "${1:-}"); containerfile "$f" ;;
 build) shift; cmd_build "$@" ;;
 run) shift; [ $# -ge 1 ] || usage "run needs an IMAGE"; e=$(engine); exec "$e" run --rm "$@" ;;
