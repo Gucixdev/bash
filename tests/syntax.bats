@@ -30,7 +30,7 @@ setup() {
 
 @test "every top-level tool answers --help from its header" {
 	for f in btth cleaner ezcontainers flatseal metadata_cleaner nmap scenario sniff todo trash wifi \
-		hf gh screenshot logcollector manwriter findfat morph fixmedia protonlauncher; do
+		hf gh screenshot logcollector manwriter findfat morph fixmedia protonlauncher skilltree claude_maintain; do
 		run ./"$f" --help
 		[ "$status" -eq 0 ]
 		[ -n "$output" ]

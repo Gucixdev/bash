@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# claude_maintain - check ~/.claude for rot and fix the safe part.
+#
+# Looks at: skill links that point nowhere, skill folders without a SKILL.md, the always-loaded cost of
+# the skill descriptions, memory (index lines whose file is gone, memory files missing from the index,
+# files without name/description/type in the header), settings JSON that does not parse, hook commands
+# that point at a missing or non-executable file, and what the biggest folders weigh.
+#
+# It only reports unless you pass -f. With -f the one fix it makes is moving broken skill links to the
+# trash. Nothing is ever deleted; sessions, memory and settings are never touched.
+#
+# usage: claude_maintain [-f] [DIR]
+#   DIR   the Claude config folder; default ${CLAUDE_CONFIG_DIR:-~/.claude}
+#   -f    trash the broken skill links
+# Exit 0 when nothing needs doing, 1 when something does, 2 on bad usage.
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+fix=0 dir=""
+for a in "$@"; do
+	case $a in
+		-f) fix=1 ;;
+		-*) echo "claude_maintain: unknown option $a (see --help)" >&2; exit 2 ;;
+		*) dir=$a ;;
+	esac
+done
+dir=${dir:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}
+[ -d "$dir" ] || { echo "claude_maintain: no such folder: $dir" >&2; exit 2; }
+
+problems=0
+say() { printf '  %s\n' "$*"; problems=$((problems + 1)); }
+section() { printf '\n%s\n' "$*"; }
+
+trash() { # trash PATH: freedesktop trash, never rm
+	local t
+	t=$(type -P trash) && "$t" "$1" > /dev/null 2>&1 && [ ! -e "$1" ] && [ ! -L "$1" ] && return 0
+	command -v gio > /dev/null && gio trash -- "$1" 2> /dev/null && return 0
+	command -v trash-put > /dev/null && trash-put -- "$1" 2> /dev/null && return 0
+	# by hand, into the home trash (gio refuses on another mount); Path is not percent-encoded, fine for these paths
+	local tr=${XDG_DATA_HOME:-$HOME/.local/share}/Trash base to n=1
+	base=$(basename -- "$1") to=$base
+	mkdir -p "$tr/files" "$tr/info" || return 1
+	while [ -e "$tr/files/$to" ] || [ -e "$tr/info/$to.trashinfo" ]; do n=$((n + 1)) to="$base.$n"; done
+	printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$(realpath -s -- "$1")" "$(date +%Y-%m-%dT%H:%M:%S)" > "$tr/info/$to.trashinfo" &&
+		mv -- "$1" "$tr/files/$to"
+}
+
+# --- skills ---------------------------------------------------------------------------------------
+section "skills ($dir/skills)"
+if [ -d "$dir/skills" ]; then
+	chars=0 n=0
+	for s in "$dir"/skills/*; do
+		[ -e "$s" ] || [ -L "$s" ] || continue
+		name=$(basename "$s")
+		[ "$name" = synced ] && continue
+		if [ -L "$s" ] && [ ! -e "$s" ]; then
+			if [ "$fix" = 1 ] && trash "$s"; then echo "  trashed broken link $name -> $(readlink "$s")"
+			else say "broken link: $name -> $(readlink "$s")"; fi
+			continue
+		fi
+		[ -d "$s" ] || continue
+		if [ ! -f "$s/SKILL.md" ]; then
+			say "no SKILL.md in $name (Claude ignores the folder)"
+			continue
+		fi
+		n=$((n + 1))
+		c=$(awk '/^description:/ { sub(/^description:[ \t]*/, ""); print length($0); exit }' "$s/SKILL.md")
+		chars=$((chars + ${c:-0}))
+	done
+	echo "  $n skills, descriptions always loaded: $chars chars (about $((chars / 4)) tokens)"
+	[ "$chars" -gt 20000 ] && say "descriptions over 20000 chars: fold skills into hubs, shorten the descriptions"
+else
+	echo "  no skills folder"
+fi
+
+# --- memory ---------------------------------------------------------------------------------------
+section "memory ($dir/projects/*/memory)"
+found=0
+for m in "$dir"/projects/*/memory; do
+	[ -d "$m" ] || continue
+	found=1
+	idx=$m/MEMORY.md
+	echo "  $(basename "$(dirname "$m")"): $(find "$m" -maxdepth 1 -name '*.md' ! -name MEMORY.md | wc -l) files"
+	if [ ! -f "$idx" ]; then say "no MEMORY.md index here"; continue; fi
+	while IFS= read -r f; do
+		[ -f "$m/$f" ] || say "index points at a missing file: $f"
+	done < <(grep -o '](\([^)]*\.md\))' "$idx" | sed 's/^](//; s/)$//' | sort -u)
+	for f in "$m"/*.md; do
+		b=$(basename "$f")
+		[ "$b" = MEMORY.md ] && continue
+		grep -qF "($b)" "$idx" || say "not in the index: $b"
+		while IFS= read -r l; do say "$l"; done < <(awk -v b="$b" '
+			NR == 1 && $0 != "---" { print "no header: " b; bad = 1; exit }
+			NR > 1 && $0 == "---" { exit }
+			/^name:/ { n = 1 } /^description:/ { d = 1 } /^[ \t]*type:/ { t = 1 }
+			END { if (!bad && !(n && d && t)) print "header lacks name/description/type: " b }' "$f")
+	done
+done
+[ "$found" = 0 ] && echo "  no memory folders"
+
+# --- settings and hooks ---------------------------------------------------------------------------
+section "settings"
+if ! command -v jq > /dev/null; then
+	echo "  jq not installed: JSON and hooks not checked"
+else
+	for s in "$dir"/settings.json "$dir"/settings.local.json; do
+		[ -f "$s" ] || continue
+		b=$(basename "$s")
+		if ! jq -e . "$s" > /dev/null 2>&1; then say "$b is not valid JSON"; continue; fi
+		hooks=$(jq -r '[.. | objects | select(has("command")) | .command] | length' "$s")
+		echo "  $b: valid JSON, $hooks hook commands"
+		while IFS= read -r c; do
+			p=${c%% *}
+			p=${p/#\~/$HOME}
+			case $p in /*) [ -x "$p" ] || say "$b: hook command missing or not executable: $p" ;; esac
+		done < <(jq -r '.. | objects | select(has("command")) | .command' "$s")
+	done
+fi
+
+# --- weight ---------------------------------------------------------------------------------------
+section "weight (listed only)"
+du -sk "$dir"/* 2> /dev/null | sort -rn | head -5 | awk '{ printf "  %8.1f MB  %s\n", $1 / 1024, $2 }' | sed "s#$dir/##"
+old=$(find "$dir"/projects -maxdepth 2 -name '*.jsonl' -mtime +60 2> /dev/null | wc -l)
+[ "$old" -gt 0 ] && echo "  $old session transcripts older than 60 days: yours to trash, this tool leaves history alone"
+
+echo
+if [ "$problems" -eq 0 ]; then echo "nothing to do"; exit 0; fi
+echo "$problems things to look at"
+exit 1

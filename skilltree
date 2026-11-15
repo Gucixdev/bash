@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# skilltree - the tree of Claude Code skills, read from their SKILL.md headers.
+#
+# Shows every skill by priority (0 loads first), its parts (references/*.md) and what it requires,
+# and what the always-loaded descriptions cost: every description is in the context of every session,
+# so the number at the bottom is the price of owning these skills.
+#
+# usage: skilltree [-s] [-t TAG] [-w NAME] [DIR]
+#   DIR       skills folder; default ~/.claude/skills (links followed). A repo's skills/ works too,
+#             including groups one folder deep (skills/anything/NAME/SKILL.md)
+#   -s        sizes: description characters and the bytes of each part
+#   -t TAG    only skills carrying #TAG (with or without the hash)
+#   -w NAME   who requires NAME (directly), and what NAME itself requires
+# Header read: name, description, metadata priority / tags / requires (skill: items only).
+# Exit 0, or 2 for bad usage or a folder without skills.
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+sizes=0 tag="" who="" dir=""
+while [ $# -gt 0 ]; do
+	case $1 in
+		-s) sizes=1 ;;
+		-t) [ $# -ge 2 ] || { echo "skilltree: -t needs a tag" >&2; exit 2; }; tag=${2#\#}; shift ;;
+		-w) [ $# -ge 2 ] || { echo "skilltree: -w needs a name" >&2; exit 2; }; who=$2; shift ;;
+		-*) echo "skilltree: unknown option $1 (see --help)" >&2; exit 2 ;;
+		*) dir=$1 ;;
+	esac
+	shift
+done
+dir=${dir:-$HOME/.claude/skills}
+[ -d "$dir" ] || { echo "skilltree: no such folder: $dir" >&2; exit 2; }
+
+tab="|"
+# One row per skill: priority, name, path, description chars, tags, requires
+rows=$(find -L "$dir" -mindepth 2 -maxdepth 3 -name SKILL.md -not -path '*/references/*' -not -path '*/trash/*' -not -path '*/synced/*' 2>/dev/null |
+	sort | while IFS= read -r f; do
+	awk -v path="$(dirname "$f")" '
+		function val(s) { sub(/^[^:]*:[ \t]*/, "", s); gsub(/^"|"[ \t]*$/, "", s); return s }
+		NR == 1 && $0 != "---" { exit }
+		NR > 1 && $0 == "---" { exit }
+		/^name:/ { name = val($0) }
+		/^description:/ { desc = val($0) }
+		/^[ \t]+priority:/ { prio = val($0) }
+		/^[ \t]+tags:/ { tags = val($0) }
+		/^[ \t]+requires:/ { req = val($0) }
+		END {
+			n = split(req, a, /[ \t]+/); r = ""
+			for (i = 1; i <= n; i++) if (a[i] ~ /^\??skill:/) { x = a[i]; sub(/^\??skill:/, "", x); r = r (r ? " " : "") (a[i] ~ /^\?/ ? "?" : "") x }
+			if (name == "") name = path
+			printf "%s|%s|%s|%d|%s|%s\n", (prio == "" ? 9 : prio), name, path, length(desc), tags, r
+		}' "$f"
+done | sort -t "$tab" -k1,1n -k2,2)
+
+[ -n "$rows" ] || { echo "skilltree: no skills under $dir" >&2; exit 2; }
+
+if [ -n "$who" ]; then
+	echo "$who requires:"
+	echo "$rows" | awk -F'|' -v w="$who" '$2 == w { n = split($6, a, " "); for (i = 1; i <= n; i++) print "  " a[i]; if (n == 0) print "  (nothing)" }'
+	echo "required by:"
+	echo "$rows" | awk -F'|' -v w="$who" '{ n = split($6, a, " "); for (i = 1; i <= n; i++) { x = a[i]; sub(/^\?/, "", x); if (x == w) print "  " $2 " (p" $1 ")" } }' | sort | awk '{ print } END { if (NR == 0) print "  (nobody)" }'
+	exit 0
+fi
+
+total=0 count=0 cur=""
+while IFS="$tab" read -r prio name path chars tags req; do
+	if [ -n "$tag" ]; then
+		case " $tags " in *" #$tag "*) ;; *) continue ;; esac
+	fi
+	if [ "$prio" != "$cur" ]; then
+		[ -n "$cur" ] && echo
+		echo "priority $prio"
+		cur=$prio
+	fi
+	total=$((total + chars)) count=$((count + 1))
+	line="  $name"
+	[ "$sizes" = 1 ] && line="$line  ($chars chars)"
+	echo "$line"
+	[ -n "$req" ] && echo "    requires: $req"
+	if [ -d "$path/references" ]; then
+		for p in "$path"/references/*.md; do
+			[ -e "$p" ] || continue
+			b=$(basename "$p" .md)
+			if [ "$sizes" = 1 ]; then printf '    - %s  (%s bytes)\n' "$b" "$(wc -c < "$p")"; else echo "    - $b"; fi
+		done
+	fi
+done <<EOF
+$rows
+EOF
+
+echo
+echo "$count skills; descriptions always loaded: $total chars (about $((total / 4)) tokens)"

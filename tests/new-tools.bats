@@ -337,3 +337,40 @@ setup() {
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"==="* ]]
 }
+
+@test "skilltree: priorities, parts, requirements, who-requires, bad folder" {
+	tmp=$(mktemp -d)
+	mkdir -p "$tmp/a/references" "$tmp/grp/b"
+	printf -- '---\nname: a\ndescription: "does a"\nmetadata:\n  priority: "0"\n  tags: "#x #y"\n---\n' > "$tmp/a/SKILL.md"
+	: > "$tmp/a/references/part.md"
+	printf -- '---\nname: b\ndescription: does b\nmetadata:\n  priority: "2"\n  requires: "skill:a ?skill:zzz"\n---\n' > "$tmp/grp/b/SKILL.md"
+	run ./skilltree "$tmp"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"priority 0"* && "$output" == *"- part"* && "$output" == *"requires: a ?zzz"* ]]
+	[[ "$output" == *"2 skills"* ]]
+	run ./skilltree -w a "$tmp"
+	[[ "$output" == *"b (p2)"* ]]
+	run ./skilltree -t y "$tmp"
+	[[ "$output" == *"1 skills"* ]]
+	run ./skilltree "$tmp/nope"
+	[ "$status" -eq 2 ]
+	rm -rf "$tmp"
+}
+
+@test "claude_maintain: reports a broken link and index drift, -f trashes only the link" {
+	tmp=$(mktemp -d)
+	export XDG_DATA_HOME="$tmp/share"
+	mkdir -p "$tmp/skills/ok" "$tmp/projects/p/memory"
+	printf -- '---\nname: ok\ndescription: d\n---\n' > "$tmp/skills/ok/SKILL.md"
+	ln -s "$tmp/nowhere" "$tmp/skills/dead"
+	printf '# i\n- [x](gone.md) hook\n' > "$tmp/projects/p/memory/MEMORY.md"
+	printf 'no header\n' > "$tmp/projects/p/memory/loose.md"
+	run ./claude_maintain "$tmp"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"broken link: dead"* && "$output" == *"missing file: gone.md"* && "$output" == *"not in the index: loose.md"* ]]
+	[ -L "$tmp/skills/dead" ]
+	run ./claude_maintain -f "$tmp"
+	[ ! -L "$tmp/skills/dead" ]
+	[ -f "$tmp/projects/p/memory/loose.md" ]
+	rm -rf "$tmp"
+}

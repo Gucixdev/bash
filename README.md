@@ -107,6 +107,8 @@ the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 | `cleaner` | Bloat across package cache, journal, containers, Flatpak runtimes, language caches, `~/.cache` and Trash. Dry run first, one confirmation. Backend: pacman, apt, dnf, zypper, apk, xbps or portage. |
 | `trash` | The freedesktop.org Trash spec, implemented directly, so file managers can restore what it deletes. |
 | `todo` | todo.txt capture: `todo "task"`, `todo ls`, `todo done N`. |
+| `skilltree` | Tree of Claude Code skills from their SKILL.md headers: priority, parts (`references/`), requirements, and the always-loaded description cost. `-w NAME` shows who requires NAME. |
+| `claude_maintain` | Checks `~/.claude` for rot: broken skill links, memory index drift, bad settings JSON, hooks that point nowhere, what weighs most. Reports only; `-f` trashes broken skill links, nothing is deleted. |
 | `wifi` | Wi-Fi picker over NetworkManager, iwd or wpa_supplicant. |
 | `btth` | Bluetooth picker over `bluetoothctl`. |
 | `metadata_cleaner` | Strip EXIF and other metadata into a new `clean-NAME` file. mat2 or exiftool, else ffmpeg or ImageMagick. |
