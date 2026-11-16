@@ -15,19 +15,28 @@ case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print;
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-if [ "${1:-}" = "-l" ]; then
+force=0 list=0 args=()
+while [ $# -gt 0 ]; do
+	case $1 in
+	-f) force=1 ;;
+	-l) list=1 ;;
+	--) shift; args+=("$@"); break ;;
+	-?*) echo "morph: unknown option $1" >&2; exit 2 ;;
+	*) args+=("$1") ;;
+	esac
+	shift
+done
+if [ "$list" -eq 1 ]; then
 	for t in magick convert ffmpeg assimp fontforge pandoc; do
 		if have "$t"; then echo "  ok       $t"; else echo "  missing  $t"; fi
 	done
 	exit 0
 fi
-
-force=0
-[ "${1:-}" = "-f" ] && { force=1; shift; }
-[ $# -eq 2 ] || { echo "usage: morph [-f] IN OUT   |   morph -l" >&2; exit 2; }
-in=$1 out=$2
+[ ${#args[@]} -eq 2 ] || { echo "usage: morph [-f] IN OUT   |   morph -l" >&2; exit 2; }
+in=${args[0]} out=${args[1]}
 [ -f "$in" ] || { echo "morph: no such file: $in" >&2; exit 1; }
-if [ -e "$out" ] && [ "$force" -ne 1 ]; then
+if [ -d "$out" ]; then echo "morph: $out is a directory" >&2; exit 1; fi
+if { [ -e "$out" ] || [ -L "$out" ]; } && [ "$force" -ne 1 ]; then
 	echo "morph: $out exists (use -f to overwrite)" >&2
 	exit 1
 fi
@@ -55,32 +64,47 @@ if [ "$ie" = gif ] && [ "$ok" = video ]; then ik=video; fi
 if [ "$oe" = gif ] && [ "$ik" = video ]; then ok=video; fi
 
 need() { echo "morph: need $1 for $ik -> $ok (pacman -S $2 / apt install $2)" >&2; exit 1; }
-ow=; [ "$force" -eq 1 ] && ow=-y
+
+# convert into a private temp folder next to OUT and move the result into place:
+# a failure or Ctrl-C never touches an existing OUT (or IN, when they are the same file)
+tmpd=$(mktemp -d "$(dirname -- "$out")/.morph.XXXXXX") || { echo "morph: cannot write next to $out" >&2; exit 1; }
+trap 'rm -rf -- "$tmpd"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+tmp=$tmpd/result.$oe
+# backends see ./name, so a name with a leading - or a "x:" prefix is not an option or a coder
+src=$in; case $in in /*) ;; *) src=./$in ;; esac
 
 case "$ik:$ok" in
 image:image)
-	if have magick; then magick "$in" "$out"
-	elif have convert; then convert "$in" "$out"
-	elif have ffmpeg; then ffmpeg -v error ${ow:--n} -i "$in" "$out"
+	if have magick; then magick "$src" "$tmp"
+	elif have convert; then convert "$src" "$tmp"
+	elif have ffmpeg; then ffmpeg -nostdin -v error -y -i "$src" "$tmp"
 	else need "ImageMagick or ffmpeg" imagemagick; fi ;;
 audio:audio | video:video | video:audio | audio:video)
 	[ "$ik:$ok" = audio:video ] && { echo "morph: cannot make video from audio" >&2; exit 1; }
 	have ffmpeg || need ffmpeg ffmpeg
-	if [ "$ik:$ok" = video:audio ]; then ffmpeg -v error ${ow:--n} -i "$in" -vn "$out"
-	else ffmpeg -v error ${ow:--n} -i "$in" "$out"; fi ;;
+	if [ "$ik:$ok" = video:audio ]; then ffmpeg -nostdin -v error -y -i "$src" -vn "$tmp"
+	else ffmpeg -nostdin -v error -y -i "$src" "$tmp"; fi ;;
 model:model)
 	have assimp || need assimp assimp
-	assimp export "$in" "$out" ;;
+	assimp export "$src" "$tmp" ;;
 font:font)
 	have fontforge || need fontforge fontforge
-	fontforge -quiet -lang=ff -c 'Open($1); Generate($2)' "$in" "$out" ;;
+	fontforge -quiet -lang=ff -c 'Open($1); Generate($2)' "$src" "$tmp" ;;
 doc:doc)
 	have pandoc || need pandoc pandoc
-	pandoc "$in" -o "$out" ;;
+	pandoc "$src" -o "$tmp" ;;
 *)
 	echo "morph: cannot convert $ik (.$ie) to $ok (.$oe)" >&2
 	exit 1 ;;
-esac || { rm -f "$out"; echo "morph: conversion failed" >&2; exit 1; }
+esac || { echo "morph: conversion failed" >&2; exit 1; }
 
-[ -s "$out" ] || { rm -f "$out"; echo "morph: conversion produced no file" >&2; exit 1; }
+[ -s "$tmp" ] || { echo "morph: conversion produced no file" >&2; exit 1; }
+if [ "$force" -eq 1 ]; then
+	mv -f -- "$tmp" "$out" || { echo "morph: cannot write $out" >&2; exit 1; }
+else
+	mv -n -- "$tmp" "$out" 2>/dev/null
+	if [ -e "$tmp" ]; then echo "morph: $out exists (use -f to overwrite)" >&2; exit 1; fi
+fi
 echo "$out"

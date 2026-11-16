@@ -536,3 +536,58 @@ mc_path() {
 	[ "$status" -eq 1 ]
 	[[ "$output" != *wrote* ]]
 }
+
+# a PATH of coreutils plus one fake converter that fails, so the tool picks the fake
+morph_path() {
+	mkdir -p "$BATS_TEST_TMPDIR/bin"
+	for t in bash env dirname basename mktemp mv rm tr cat sleep; do
+		ln -sf "$(command -v $t)" "$BATS_TEST_TMPDIR/bin/$t"
+	done
+}
+
+@test "morph: a failed conversion never deletes the input, even with -f and IN == OUT" {
+	morph_path
+	printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/bin/pandoc"; chmod +x "$BATS_TEST_TMPDIR/bin/pandoc"
+	echo precious > "$BATS_TEST_TMPDIR/in.md"
+	PATH="$BATS_TEST_TMPDIR/bin" run ./morph -f "$BATS_TEST_TMPDIR/in.md" "$BATS_TEST_TMPDIR/in.md"
+	[ "$status" -eq 1 ]
+	[ "$(cat "$BATS_TEST_TMPDIR/in.md")" = precious ]
+	echo old > "$BATS_TEST_TMPDIR/out.html"
+	PATH="$BATS_TEST_TMPDIR/bin" run ./morph -f "$BATS_TEST_TMPDIR/in.md" "$BATS_TEST_TMPDIR/out.html"
+	[ "$status" -eq 1 ]
+	[ "$(cat "$BATS_TEST_TMPDIR/out.html")" = old ]
+}
+
+@test "morph: -f and -l are accepted after the file names too" {
+	morph_path
+	printf '#!/bin/sh\nfor a; do l=$a; done\necho new > "$l"\n' > "$BATS_TEST_TMPDIR/bin/pandoc"; chmod +x "$BATS_TEST_TMPDIR/bin/pandoc"
+	echo a > "$BATS_TEST_TMPDIR/in.md"; echo old > "$BATS_TEST_TMPDIR/out.html"
+	PATH="$BATS_TEST_TMPDIR/bin" run ./morph "$BATS_TEST_TMPDIR/in.md" "$BATS_TEST_TMPDIR/out.html" -f
+	[ "$status" -eq 0 ]
+	[ "$(cat "$BATS_TEST_TMPDIR/out.html")" = new ]
+	PATH="$BATS_TEST_TMPDIR/bin" run ./morph "$BATS_TEST_TMPDIR/in.md" "$BATS_TEST_TMPDIR/out.html" -z
+	[ "$status" -eq 2 ]
+}
+
+@test "morph: names with a leading - or an 'x:' prefix reach the backend as ./name" {
+	morph_path
+	printf '#!/bin/sh\necho "$@" > "$MORPH_ARGS"\nfor a; do l=$a; done\necho new > "$l"\n' > "$BATS_TEST_TMPDIR/bin/magick"; chmod +x "$BATS_TEST_TMPDIR/bin/magick"
+	cd "$BATS_TEST_TMPDIR"; echo x > ./-in.png
+	MORPH_ARGS="$BATS_TEST_TMPDIR/args" PATH="$BATS_TEST_TMPDIR/bin" run "$BATS_TEST_DIRNAME/../morph" -- -in.png 'x:y.webp'
+	[ "$status" -eq 0 ]
+	[ -s "$BATS_TEST_TMPDIR/x:y.webp" ]
+	[[ "$(cat "$BATS_TEST_TMPDIR/args")" == "./-in.png "* ]]
+	[[ "$(cat "$BATS_TEST_TMPDIR/args")" != *" x:"* ]]
+}
+
+@test "morph: SIGTERM midway leaves no partial output and no temp folder" {
+	morph_path
+	printf '#!/bin/sh\necho half > "$3"\nsleep 1\n' > "$BATS_TEST_TMPDIR/bin/pandoc"; chmod +x "$BATS_TEST_TMPDIR/bin/pandoc"
+	echo a > "$BATS_TEST_TMPDIR/in.md"
+	PATH="$BATS_TEST_TMPDIR/bin" "$BATS_TEST_DIRNAME/../morph" "$BATS_TEST_TMPDIR/in.md" "$BATS_TEST_TMPDIR/o.html" &
+	pid=$!
+	sleep 0.3; kill -TERM "$pid"
+	wait "$pid" || true
+	[ ! -e "$BATS_TEST_TMPDIR/o.html" ]
+	[ -z "$(ls -A "$BATS_TEST_TMPDIR" | grep -v -e '^bin$' -e '^in.md$')" ]
+}
