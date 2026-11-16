@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# layer2sprite - every layer of a layered image (GIMP .xcf, OpenRaster .ora, ...) becomes one sprite PNG.
+#
+#   layer2sprite [-o DIR] [-t] [-a] FILE.xcf
+#
+#   -o DIR   where the sprites go (default: a folder named like the file, next to it)
+#   -t       trim transparent borders of each sprite (the .tsv keeps the true position)
+#   -a       also hidden layers (default: visible layers only)
+#
+# Writes DIR/NN-layername.png (NN = stacking order, bottom layer is 00) and DIR/layers.tsv with one line per sprite:
+# index, file, layer name, x, y, w, h, where the sprite sat on the canvas. Layer groups are exported as one sprite.
+# Feed the folder to sprite2grid to get a sheet. Needs GIMP 3 (gimp-console, or the flatpak org.gimp.GIMP; it runs
+# headless, no window) and, for -t, ImageMagick. Exit: 0 fine, 1 failed, 2 bad usage.
+set -u
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+die() { printf 'layer2sprite: %s\n' "$*" >&2; exit "${2:-2}"; }
+out='' trim=0 hidden=0
+while getopts o:ta o; do
+	case $o in
+	o) out=$OPTARG ;;
+	t) trim=1 ;;
+	a) hidden=1 ;;
+	*) die "usage: layer2sprite [-o DIR] [-t] [-a] FILE.xcf" ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 1 ] || die "usage: layer2sprite [-o DIR] [-t] [-a] FILE.xcf"
+in=$1
+[ -f "$in" ] || die "no such file: $in" 1
+in=$(readlink -f "$in")
+[ -n "$out" ] || out="${in%.*}"
+mkdir -p "$out" || die "cannot create $out" 1
+out=$(readlink -f "$out")
+[ "$trim" -eq 0 ] || command -v magick > /dev/null || die "-t needs ImageMagick (magick)" 1
+
+work=$(mktemp -d) || die "no temp dir" 1
+trap 'mv "$work" "${TMPDIR:-/tmp}/layer2sprite.$$" 2> /dev/null' EXIT
+job="$work/job.py"
+q() { python3 -c 'import sys; print(repr(sys.argv[1]))' "$1"; }
+{
+	printf 'IN = %s\nOUT = %s\nHIDDEN = %s\n' "$(q "$in")" "$(q "$work")" "$([ "$hidden" -eq 1 ] && echo True || echo False)"
+	cat << 'PY'
+import gi, re
+gi.require_version('Gimp', '3.0')
+from gi.repository import Gimp, Gio
+img = Gimp.file_load(Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(IN))
+layers = list(img.get_layers())      # top first
+layers.reverse()                     # bottom first = 00
+rows = []
+for i, l in enumerate(layers):
+    if not HIDDEN and not l.get_visible():
+        continue
+    ok, x, y = l.get_offsets()
+    name = l.get_name() or "layer"
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', name).strip('_') or "layer"
+    fn = "%02d-%s.png" % (i, safe)
+    Gimp.edit_copy([l])
+    tmp = Gimp.edit_paste_as_new_image()
+    Gimp.file_save(Gimp.RunMode.NONINTERACTIVE, tmp, Gio.File.new_for_path(OUT + "/" + fn), None)
+    tmp.delete()
+    rows.append("%s\t%s\t%d\t%d\t%d\t%d" % (fn, name.replace("\t", " ").replace("\n", " "), x, y, l.get_width(), l.get_height()))
+open(OUT + "/layers.raw", "w").write("\n".join(rows) + ("\n" if rows else ""))
+img.delete()
+print("layer2sprite: %d layers" % len(rows))
+PY
+} > "$job"
+
+if command -v gimp-console > /dev/null; then
+	gimp=(gimp-console)
+elif command -v flatpak > /dev/null && flatpak info org.gimp.GIMP > /dev/null 2>&1; then
+	gimp=(flatpak run --filesystem="$work" --filesystem="$(dirname "$in")" --command=gimp-console org.gimp.GIMP)
+else
+	die "GIMP 3 not found (gimp-console or flatpak org.gimp.GIMP)" 1
+fi
+log="$work/gimp.log"
+"${gimp[@]}" -i --batch-interpreter=python-fu-eval -b "exec(open($(q "$job")).read())" --quit > "$log" 2>&1
+if [ ! -s "$work/layers.raw" ] && ! grep -q 'layer2sprite: 0 layers' "$log"; then
+	grep -v '^GIMP-Message\|stray image' "$log" | tail -8 >&2
+	die "GIMP could not export the layers of $in" 1
+fi
+
+: > "$out/layers.tsv"
+i=0
+while IFS=$'\t' read -r fn name x y w h; do
+	if [ "$trim" -eq 1 ]; then
+		# a 1 px transparent frame first: -trim cuts by the corner colour, so a layer with no transparent border must not vanish
+		box=$(magick "$work/$fn" -bordercolor none -border 1 -format '%@' info: 2> /dev/null) || box=
+		if [[ $box =~ ^([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)$ ]]; then
+			w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]}
+			x=$((x + BASH_REMATCH[3] - 1)) y=$((y + BASH_REMATCH[4] - 1))
+			magick "$work/$fn" -bordercolor none -border 1 -trim +repage "$work/$fn.trim" && mv "$work/$fn.trim" "$work/$fn"
+		fi
+	fi
+	cp "$work/$fn" "$out/$fn" || die "cannot write $out/$fn" 1
+	printf '%d\t%s\t%s\t%d\t%d\t%d\t%d\n' "$i" "$fn" "$name" "$x" "$y" "$w" "$h" >> "$out/layers.tsv"
+	i=$((i + 1))
+done < "$work/layers.raw"
+printf '%s: %d sprites, map %s/layers.tsv\n' "$out" "$i" "$out"
