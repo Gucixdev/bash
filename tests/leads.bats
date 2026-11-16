@@ -280,3 +280,94 @@ score_of() { awk -F '\t' -v u="$1" '$5 == u { print $7 }' leads.tsv; }
 	run shellcheck -S warning -s bats "$BATS_TEST_FILENAME"
 	[ "$status" -eq 0 ]
 }
+
+# rawsrv MODE: a socket server on a free port; mode bad = answers garbage, hang = accepts and says nothing
+rawsrv() {
+	cat > "$T/raw.py" << 'EOF'
+import os, socket, sys, time
+mode, portfile, logfile = sys.argv[1:4]
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(5)
+open(portfile, "w").write(str(s.getsockname()[1]))
+while True:
+    c, _ = s.accept()
+    open(logfile, "a").write("conn\n")
+    if mode == "bad":
+        c.recv(4096); c.sendall(b"this is not http\r\n\r\n"); c.close()
+    else:
+        time.sleep(60)
+EOF
+	python3 "$T/raw.py" "$1" "$T/rawport" "$T/rawlog" 3>&- &
+	RAW=$!
+	for _ in $(seq 50); do [ -s "$T/rawport" ] && break; sleep 0.1; done
+	RP=$(cat "$T/rawport")
+}
+
+@test "leads: a server that is not speaking http skips that query and keeps the earlier leads" {
+	rawsrv bad
+	q 'hn\tneed a fast sqlite viewer\nreddit\talternative\n'
+	run env LEADS_BASE_REDDIT=http://127.0.0.1:$RP "$LEADS" run
+	kill "$RAW" 2> /dev/null || true
+	[ "$status" -eq 0 ]
+	[[ "$output" != *Traceback* ]]
+	[[ "$output" == *"4 new"* && "$output" == *"skipped"* ]]
+	[ "$(wc -l < leads.tsv)" -eq 5 ]
+}
+
+@test "leads: a json answer of the wrong shape skips that query, no traceback" {
+	printf '%s\n' '{"hits":["a string","another"]}' > "$F/api_v1_search_by_date"
+	q 'hn\tneed a fast sqlite viewer\nrss\thttp://127.0.0.1:'"$P"'/feed.xml sqlite viewer\n'
+	run "$LEADS" run
+	[ "$status" -eq 0 ]
+	[[ "$output" != *Traceback* ]]
+	[[ "$output" == *"unexpected response"* ]]
+	[[ "$output" == *"1 new"* ]]
+}
+
+@test "leads: leads found before a kill are already on disk" {
+	rawsrv hang
+	q 'hn\tneed a fast sqlite viewer\nreddit\talternative\n'
+	env LEADS_BASE_REDDIT=http://127.0.0.1:$RP "$LEADS" run > "$T/out" 2>&1 &
+	L=$!
+	for _ in $(seq 100); do [ -s "$T/rawlog" ] && break; sleep 0.1; done
+	[ -s "$T/rawlog" ]
+	for c in $(pgrep -P "$L"); do kill -TERM "$c" 2> /dev/null || true; done
+	wait "$L" 2> /dev/null || true
+	kill "$RAW" 2> /dev/null || true
+	[ "$(wc -l < leads.tsv)" -eq 5 ]
+}
+
+@test "leads: an unwritable leads.tsv fails before any request" {
+	q 'hn\tneed a fast sqlite viewer\n'
+	run env LEADS_TSV="$T/nodir/leads.tsv" "$LEADS" run
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"cannot write"* && "$output" != *Traceback* ]]
+	[ "$(reqs)" -eq 0 ]
+}
+
+@test "leads: a feed with a DOCTYPE only inside CDATA is not refused" {
+	cat > "$F/cdata.xml" << 'EOF'
+<?xml version="1.0"?>
+<rss version="2.0"><channel><title>t</title>
+<item><title>Anyone know a sqlite viewer?</title><link>https://blog.example/c1</link><description><![CDATA[<!DOCTYPE html><p>need one</p>]]></description></item>
+</channel></rss>
+EOF
+	q 'rss\thttp://127.0.0.1:'"$P"'/cdata.xml sqlite viewer\n'
+	run "$LEADS" run
+	[[ "$output" == *"1 new"* ]]
+}
+
+@test "leads: a BOM and bad bytes in leads.queries or leads.tsv do not crash it" {
+	printf '\xef\xbb\xbfhn\tneed a fast sqlite viewer\n# caf\xe9 \xff\n' > leads.queries
+	printf 'date\tsource\tquery\tauthor\turl\ttitle\tscore\nx\thn\tq\ta\thttp://old\tcaf\xe9\t1\n' > leads.tsv
+	run "$LEADS" run
+	[ "$status" -eq 0 ]
+	[[ "$output" != *Traceback* && "$output" != *"unknown source"* ]]
+	[[ "$output" == *"4 new"* ]]
+}
+
+@test "leads: a non-numeric LEADS_DELAY is a one-line error" {
+	q 'hn\tx\n'
+	run env LEADS_DELAY=abc "$LEADS" run
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"LEADS_DELAY must be a number"* && "$output" != *Traceback* ]]
+}

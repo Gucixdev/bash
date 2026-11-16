@@ -53,16 +53,26 @@ import urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import http.client
 import json
 
 E = os.environ
+
+
+def num(name, default, cast):
+    try:
+        return cast(E.get(name, default))
+    except ValueError:
+        sys.exit("leads: %s must be a number, not %r" % (name, E.get(name)))
+
+
 UA = E.get("LEADS_UA") or "linux:leads-bash:v1 (public lead search, read only; set LEADS_UA)"
-DELAY = float(E.get("LEADS_DELAY", "1"))
-TTL = int(E.get("LEADS_CACHE_TTL", "3600"))
+DELAY = num("LEADS_DELAY", "1", float)
+TTL = num("LEADS_CACHE_TTL", "3600", int)
 CACHE = E.get("LEADS_CACHE", ".leads-cache")
 TSV = E.get("LEADS_TSV", "leads.tsv")
 QFILE = E.get("LEADS_QUERIES", "leads.queries")
-HITS = int(E.get("LEADS_HITS", "30"))
+HITS = num("LEADS_HITS", "30", int)
 MAXB = 5 * 1024 * 1024
 HEAD = "date\tsource\tquery\tauthor\turl\ttitle\tscore"
 NOACCESS = {"x", "twitter", "facebook", "fb", "instagram", "ig", "linkedin"}
@@ -197,7 +207,8 @@ def rss_build(q):
 
 
 def rss_parse(body, q):
-    if re.search(rb"<!(DOCTYPE|ENTITY)", body, re.I):
+    m = re.search(rb"<[A-Za-z_]", body)	# entities can only be declared in the prolog; a DOCTYPE inside CDATA is just text
+    if re.search(rb"<!(DOCTYPE|ENTITY)", body[:m.start()] if m else body, re.I):
         raise ValueError("feed has a DOCTYPE/ENTITY, refused")
     _, more = rss_split(q)
     local = lambda t: t.rsplit("}", 1)[-1]
@@ -257,8 +268,10 @@ def cache_read(url):
 def cache_write(url, body):
     try:
         os.makedirs(CACHE, exist_ok=True)
-        with open(os.path.join(CACHE, key(url) + ".body"), "wb") as f:
+        p = os.path.join(CACHE, key(url) + ".body")
+        with open(p + ".tmp", "wb") as f:	# written whole or not at all: a half file would be read as an answer for an hour
             f.write(body)
+        os.replace(p + ".tmp", p)
     except OSError as e:
         print("leads: cache not written: %s" % e, file=sys.stderr)
 
@@ -308,7 +321,7 @@ def http_get(url, accept):
             res = (r.status, r.read(MAXB + 1), r.headers, None)
     except urllib.error.HTTPError as e:
         res = (e.code, b"", e.headers, None)
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
         res = (None, b"", None, str(getattr(e, "reason", e)))
     LAST[host] = time.monotonic()
     return res
@@ -317,7 +330,7 @@ def http_get(url, accept):
 # ---- run
 def read_queries():
     try:
-        f = open(QFILE, encoding="utf-8")
+        f = open(QFILE, encoding="utf-8-sig", errors="replace")
     except OSError:
         sys.exit("leads: no queries file %s (one per line: SOURCE<TAB>QUERY, e.g. hn<TAB>need a fast sqlite viewer)" % QFILE)
     out = []
@@ -338,11 +351,27 @@ def field(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 
+def append(rows):
+    if not rows:
+        return
+    try:
+        with open(TSV, "a", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            if f.tell() == 0:
+                f.write(HEAD + "\n")
+            f.write("\n".join(rows) + "\n")
+    except OSError as e:
+        sys.exit("leads: cannot write %s: %s" % (TSV, e))
+
+
 def run(dry):
     queries = read_queries()
+    if not dry:
+        if not os.access(TSV if os.path.exists(TSV) else (os.path.dirname(TSV) or "."), os.W_OK):
+            sys.exit("leads: cannot write %s (checked before any request is sent)" % TSV)
     seen = set()
     if os.path.exists(TSV):
-        with open(TSV, encoding="utf-8") as f:
+        with open(TSV, encoding="utf-8", errors="replace") as f:
             for line in f:
                 c = line.rstrip("\n").split("\t")
                 if len(c) >= 5:
@@ -406,7 +435,7 @@ def run(dry):
                 continue
         try:
             items = parse(body, q)
-        except (ValueError, KeyError, TypeError, ET.ParseError) as e:
+        except Exception as e:	# whatever a third party sends must not end the run and lose the other queries
             print("%s: unexpected response (%s), skipped" % (label, e))
             continue
         if not cached:
@@ -422,16 +451,12 @@ def run(dry):
             rows.append("\t".join([datetime.fromtimestamp(it["ts"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), src,
                                    field(q), field(it["author"]), field(it["url"]), shown, str(sc)]))
             new += 1
+        append(rows)	# per query: Ctrl-C or a crash later keeps what was found
+        rows = []
         total += new
         print("%s: %d hits, %d new%s" % (label, len(items), new, " (cache)" if cached else ""))
     if dry:
         return
-    if rows:
-        with open(TSV, "a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            if f.tell() == 0:
-                f.write(HEAD + "\n")
-            f.write("\n".join(rows) + "\n")
     print("%d new leads in %s" % (total, TSV))
 
 
