@@ -125,3 +125,24 @@ setup() {
 	run ./requirements check
 	[ "$status" -eq 0 ]
 }
+
+@test "-n and the mode may come in any order: install -n and check -n change nothing" {
+	printf 'cmd aaa-missing\n' > requirements.list
+	run ./requirements install -n
+	[ "$status" -eq 0 ]; [[ $output == *"run     sudo pacman"* ]]; [ ! -s calls.log ]
+	run ./requirements -n check
+	[ "$status" -eq 1 ]; [[ $output != *"run     "* ]]; [ ! -s calls.log ]
+	run ./requirements check -n
+	[ "$status" -eq 1 ]; [ ! -s calls.log ]
+	run ./requirements check install bogus
+	[ "$status" -eq 2 ]
+}
+
+@test "a requirements.list with Windows line ends is read like a normal one" {
+	printf 'cmd aaa-missing pacman=apkg\r\ncmd sh\r\n' > requirements.list
+	run ./requirements check
+	[ "$status" -eq 1 ]; [[ $output == *"missing cmd aaa-missing (package apkg)"* ]]
+	[[ $output != *$'\r'* ]]
+	run ./requirements
+	grep -qx 'sudo pacman -S --needed --noconfirm apkg' calls.log
+}

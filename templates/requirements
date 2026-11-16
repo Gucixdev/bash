@@ -15,7 +15,9 @@
 set -u
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 list=requirements.list dry=0 mode=install
-case ${1:-} in '' | install) ;; check | list) mode=$1 ;; -n) dry=1 ;; -h | --help) sed -n '2,/^# Exit/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; *) echo "requirements: unknown '$1' (requirements --help)" >&2; exit 2 ;; esac
+for a in "$@"; do	# the mode and -n in any order: `requirements check -n`, `requirements -n install`
+	case $a in install) ;; check | list) mode=$a ;; -n) dry=1 ;; -h | --help) sed -n '2,/^# Exit/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; *) echo "requirements: unknown '$a' (requirements --help)" >&2; exit 2 ;; esac
+done
 [ -f "$list" ] || { echo "requirements: no $list here" >&2; exit 2; }
 
 PATH=$PWD/.local/bin:$PWD/.venv/bin:$PATH; export PATH
@@ -60,7 +62,7 @@ while read -r kind name rest <&3 || [ -n "$kind" ]; do	# fd 3: a step must not e
 		else missing=1; say missing refs; [ "$mode" != install ] || run ./download_references; fi ;;
 	*) echo "requirements: $list: unknown kind '$kind'" >&2; exit 2 ;;
 	esac
-done 3< "$list"
+done 3< <(tr -d '\r' < "$list")
 
 case $mode in
 list) exit 0 ;;
