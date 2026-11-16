@@ -55,6 +55,7 @@ the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 | `morph` | `mv` for formats: `morph a.png a.webp`, picks magick/ffmpeg/assimp/fontforge/pandoc by the two extensions. Never overwrites without `-f`. |
 | `fixmedia` | Find why a video, song, subtitle or picture misbehaves (cuts out, no or silent sound, DTS/AC3, 10-bit, subtitle garbage) and write `fixed-NAME`; VLC is the judge. `-c` only checks, `--sync`, `--shift`, `--embed`. |
 | `manwriter` | Turn a script's header comment into a man page: `manwriter -d man tool...`. `manwriter new` writes a skeleton. |
+| `textswap` | Privacy filter for a screenshot, photo or clip: swaps a fraction of the words (`--ratio`, default half) for random Chinese characters in the text's own colour on its own background; `--seed` repeats it exactly. Words from tesseract or `--boxes FILE`; videos at `--fps`, no flicker, audio kept ([container recipe](docs/textswap.md)). |
 
 ## Installers, launchers
 
