@@ -26,6 +26,7 @@ case ${1:-} in -h | --help | help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, "");
 die() { printf 'protonlauncher: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" > /dev/null 2>&1; }
 HOME_DIR=${PROTONLAUNCHER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/protonlauncher}
+case $HOME_DIR in /*) ;; *) HOME_DIR=$PWD/$HOME_DIR ;; esac   # Proton changes directory: a relative prefix path would point elsewhere
 PFX=$HOME_DIR/prefixes
 
 # >>> lazytui (copy of lib/lazytui) >>>
@@ -314,7 +315,7 @@ cmd_list() {
 }
 cmd_prefix() {
 	case ${1:-} in
-		new) d=$(prefix_dir "${2:-}") || exit 1; mkdir -p "$d/pfx" && echo "$d" ;;
+		new) d=$(prefix_dir "${2:-}") || exit 1; mkdir -p "$d/pfx" || die "cannot make $d"; echo "$d" ;;
 		path) prefix_dir "${2:-}" ;;
 		rm)
 			d=$(prefix_dir "${2:-}") || exit 1
@@ -349,7 +350,8 @@ cmd_run() {
 	[ -f "$exe" ] || die "no such file: $exe"
 	exe=$(readlink -f "$exe")
 	[ -n "$name" ] || name=$(basename "$(dirname "$exe")" | sed 's/[^A-Za-z0-9._-]/_/g; s/^[._-]*//')
-	[ -n "$name" ] || name=game
+	# a folder name with no ASCII letters in it must not make every such game share one prefix
+	[ -n "$name" ] || name=game-$(dirname "$exe" | cksum | cut -d' ' -f1)
 	pdir=$(prefix_dir "$name") || exit 1
 	[ -n "$tool" ] || tool=$(conf_get "$pdir" tool)
 	[ -n "$tool" ] || tool=$(default_tool)
@@ -376,8 +378,9 @@ cmd_run() {
 		printf 'command : %s\n' "${cmd[*]}"
 	} >&2
 	[ -n "$dry" ] && return 0
-	mkdir -p "$pdir/pfx"
-	conf_set "$pdir" tool "$tool"; conf_set "$pdir" preset "$preset"; conf_set "$pdir" last "$(date '+%F %H:%M')"
+	mkdir -p "$pdir/pfx" || die "cannot make the prefix $pdir"
+	conf_set "$pdir" tool "$tool" && conf_set "$pdir" preset "$preset" && conf_set "$pdir" last "$(date '+%F %H:%M')" ||
+		die "cannot write $pdir/.pl.conf"
 	# shellcheck disable=SC2086   # $penv is a list of NAME=value words
 	exec env STEAM_COMPAT_DATA_PATH="$pdir" STEAM_COMPAT_CLIENT_INSTALL_PATH="$root" SteamAppId=0 SteamGameId=0 $penv "${cmd[@]}"
 }

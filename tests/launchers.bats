@@ -161,3 +161,35 @@ EOT
 	run ./launchers/protonlauncher/protonlauncher run -n --mangohud "$BATS_TEST_DIRNAME/launchers.bats"
 	[ "$status" -eq 0 ]
 }
+
+# ---- audit round 2
+
+@test "protonlauncher: a prefix root that cannot be written stops the run before the game starts" {
+	fake_proton
+	mkdir -p "$BATS_TEST_TMPDIR/ro" "$BATS_TEST_TMPDIR/g"; : > "$BATS_TEST_TMPDIR/g/a.exe"; chmod 555 "$BATS_TEST_TMPDIR/ro"
+	[ -w "$BATS_TEST_TMPDIR/ro" ] && skip "running as root"
+	PROTONLAUNCHER_HOME=$BATS_TEST_TMPDIR/ro/x run ./launchers/protonlauncher/protonlauncher run "$BATS_TEST_TMPDIR/g/a.exe"
+	[ "$status" -eq 1 ]; [[ "$output" == *"cannot make the prefix"* ]]
+	[ ! -e "$FAKE_LOG" ]
+	PROTONLAUNCHER_HOME=$BATS_TEST_TMPDIR/ro/x run ./launchers/protonlauncher/protonlauncher prefix new foo
+	chmod 755 "$BATS_TEST_TMPDIR/ro"
+	[ "$status" -eq 1 ]; [[ "$output" == *cannot* ]]
+}
+
+@test "protonlauncher: a relative PROTONLAUNCHER_HOME still hands Proton an absolute prefix path" {
+	fake_proton
+	mkdir -p "$BATS_TEST_TMPDIR/g"; : > "$BATS_TEST_TMPDIR/g/a.exe"
+	cd "$BATS_TEST_TMPDIR"
+	PROTONLAUNCHER_HOME=rel run "$BATS_TEST_DIRNAME/../launchers/protonlauncher/protonlauncher" run g/a.exe
+	[ "$status" -eq 0 ]
+	grep -q "COMPAT=$BATS_TEST_TMPDIR/rel/prefixes/g" "$FAKE_LOG"
+}
+
+@test "protonlauncher: games in folders with no ASCII letters do not all share one prefix" {
+	fake_proton
+	mkdir -p "$BATS_TEST_TMPDIR/日本" "$BATS_TEST_TMPDIR/한국"; : > "$BATS_TEST_TMPDIR/日本/a.exe"; : > "$BATS_TEST_TMPDIR/한국/a.exe"
+	run ./launchers/protonlauncher/protonlauncher run "$BATS_TEST_TMPDIR/日本/a.exe"; [ "$status" -eq 0 ]
+	p1=$(grep COMPAT "$FAKE_LOG")
+	run ./launchers/protonlauncher/protonlauncher run "$BATS_TEST_TMPDIR/한국/a.exe"; [ "$status" -eq 0 ]
+	[ "$p1" != "$(grep COMPAT "$FAKE_LOG")" ]
+}
