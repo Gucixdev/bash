@@ -163,3 +163,58 @@ mk() { # OUT AUDIO-ARGS... : 2 s 160x120 test video
 	[ "$status" -eq 0 ]
 	[[ $output == *"usage: fixmedia"* ]]
 }
+
+mk10() { mk "$1" -c:v libx264 -pix_fmt yuv420p10le -c:a aac; }
+
+@test "fixmedia: -c after the file names still means check only" {
+	mk10 "$T/t.mkv"
+	run "$FM" --no-vlc "$T/t.mkv" -c
+	[ "$status" -eq 1 ]
+	[[ $output == *pixfmt* ]]
+	[ ! -e "$T/fixed-t.mkv" ]
+}
+
+@test "fixmedia: a number of seconds must be a number" {
+	for v in 1abc 5x -- 1.2.3; do
+		run "$FM" --no-vlc --sync "$v" "$T/x.mkv"
+		[ "$status" -eq 2 ]
+		run "$FM" --no-vlc --shift "$v" "$T/x.mkv"
+		[ "$status" -eq 2 ]
+	done
+	run "$FM" --no-vlc "$T/x.mkv" --sync
+	[ "$status" -eq 2 ]
+}
+
+@test "fixmedia: a file whose name starts with - is diagnosed, not reported ok" {
+	cd "$T"
+	mk10 ./-d.mkv
+	run "$FM" --no-vlc -c -- -d.mkv
+	[ "$status" -eq 1 ]
+	[[ $output == *pixfmt* ]]
+}
+
+@test "fixmedia: a dangling fixed-NAME link is not written through" {
+	mk10 "$T/t.mkv"
+	ln -s "$T/target" "$T/fixed-t.mkv"
+	run "$FM" --no-vlc "$T/t.mkv"
+	[ "$status" -eq 1 ]
+	[ ! -e "$T/target" ]
+}
+
+@test "fixmedia: SIGTERM midway leaves no half-written fixed-NAME" {
+	mk10 "$T/t.mkv"
+	mkdir "$T/fk"
+	real=$(command -v ffmpeg)
+	cat > "$T/fk/ffmpeg" <<SH
+#!/bin/sh
+for a; do l=\$a; done
+case \$l in */fixed-*) echo half > "\$l"; sleep 2; exit 1 ;; esac
+exec $real "\$@"
+SH
+	chmod +x "$T/fk/ffmpeg"
+	PATH="$T/fk:$PATH" "$FM" --no-vlc "$T/t.mkv" > /dev/null 2>&1 &
+	pid=$!
+	sleep 1; kill -TERM "$pid"
+	wait "$pid" || true
+	[ ! -e "$T/fixed-t.mkv" ]
+}
