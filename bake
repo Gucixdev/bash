@@ -46,6 +46,7 @@ case ${1:-} in -h | --help | '') awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); p
 die() { printf 'bake: %s\n' "$*" >&2; exit 1; }
 usage() { printf 'bake: %s (bake --help)\n' "$*" >&2; exit 2; }
 need() { command -v "$1" > /dev/null 2>&1 || die "$1 is missing (install: $2)"; }
+offline() { case ${BAKE_OFFLINE:-} in '' | 0 | no | false | off) return 1 ;; esac; }	# BAKE_OFFLINE=0 is off
 engine() { for e in podman docker; do command -v "$e" > /dev/null 2>&1 && { echo "$e"; return; }; done; die "neither podman nor docker is installed"; }
 state=${XDG_STATE_HOME:-$HOME/.local/state}/bake
 totrash() {	# move, never delete
@@ -62,7 +63,7 @@ expand() {	# ~ and ${VAR:-default} in a mount path; nothing that could run a com
 KEYS=" name container kind base family pkg copy env workdir user run cmd entrypoint expose git check port mount gpu iso disk format drive ram cpus qemu "
 directives() {	# LINE<TAB>KEY<TAB>REST, comments and blanks gone
 	[ -r "${1:-}" ] || die "cannot read ${1:-(no file)}"
-	awk '{ sub(/^[ \t]+/, ""); if ($0 == "" || $0 ~ /^#/) next; sub(/[ \t]+#.*/, ""); sub(/[ \t]+$/, ""); k = $1; r = $0; sub(/^[^ \t]+[ \t]*/, "", r); printf "%d\t%s\t%s\n", NR, k, r }' "$1"
+	awk '{ sub(/\r$/, ""); sub(/^[ \t]+/, ""); if ($0 == "" || $0 ~ /^#/) next; sub(/[ \t]+#.*/, ""); sub(/[ \t]+$/, ""); k = $1; r = $0; sub(/^[^ \t]+[ \t]*/, "", r); printf "%d\t%s\t%s\n", NR, k, r }' "$1"
 }
 field() {	# field FILE KEY [DEFAULT]: the value of the last line with that key
 	local v; v=$(directives "$1" | awk -F '\t' -v k="$2" '$2 == k { v = $3 } END { print v }'); echo "${v:-${3:-}}"
@@ -79,14 +80,19 @@ bake_name() {
 	if [ -z "$n" ]; then base=$(basename "$1"); case $base in bakefile) n=$(basename "$(dirname "$(readlink -f "$1")")") ;; *) n=${base%.bake} ;; esac; fi
 	printf '%s\n' "$n" | tr 'A-Z ' 'a-z-'
 }
+good_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }	# a name ends up in state paths: no /, no leading -, no ..
+bakefile_ok() {	# print the bake file after checking the name it will use
+	local n; n=$(bake_name "$1"); good_name "$n" || die "$1: '$n' is not a usable name (letters, digits . _ - ; set it with a name line)"
+	echo "$1"
+}
 bakefile_arg() {	# a file, NAME -> NAME.bake, or a directory holding one .bake file
 	local a=${1:-.}
-	[ -f "$a" ] && { echo "$a"; return; }
-	[ -f "$a.bake" ] && { echo "$a.bake"; return; }
+	[ -f "$a" ] && { bakefile_ok "$a"; return; }
+	[ -f "$a.bake" ] && { bakefile_ok "$a.bake"; return; }
 	[ -d "$a" ] || die "no .bake file '$a' (bake new NAME)"
 	local l=("$a"/*.bake)
-	if [ ! -e "${l[0]}" ]; then [ -f "$a/bakefile" ] && { echo "$a/bakefile"; return; }; die "no .bake file in $a (bake new NAME)"; fi
-	[ ${#l[@]} -eq 1 ] && { echo "${l[0]}"; return; }
+	if [ ! -e "${l[0]}" ]; then [ -f "$a/bakefile" ] && { bakefile_ok "$a/bakefile"; return; }; die "no .bake file in $a (bake new NAME)"; fi
+	[ ${#l[@]} -eq 1 ] && { bakefile_ok "${l[0]}"; return; }
 	die "several .bake files in $a ($(printf '%s ' "${l[@]##*/}")): name one, e.g. bake build $a/${l[0]##*/}"
 }
 
@@ -97,6 +103,8 @@ srcdir() { echo "$state/src/$(bake_name "$1")"; }
 git_split() {	# git_split "URL [REF] DEST" -> GURL GREF GDEST
 	local a; read -ra a <<< "$1"
 	case ${#a[@]} in 2) GURL=${a[0]} GREF=HEAD GDEST=${a[1]} ;; 3) GURL=${a[0]} GREF=${a[1]} GDEST=${a[2]} ;; *) return 1 ;; esac
+	case $GURL in -*) die "git URL '$GURL' starts with -: git would take it as an option" ;; esac
+	case $GREF in -*) die "git REF '$GREF' starts with -: git would take it as an option" ;; esac
 }
 remote_sha() {	# the commit a ref points to on the remote; a 40-hex ref is already one
 	[[ $2 =~ ^[0-9a-f]{40}$ ]] && { echo "$2"; return; }
@@ -120,7 +128,7 @@ sync_sources() {
 		[ "$key" = git ] || continue
 		git_split "$rest" || die "line $n: git needs URL [REF] DEST"
 		old=$(cat "$sdir/$i.sha" 2> /dev/null || true)
-		if [ -n "${BAKE_OFFLINE:-}" ]; then
+		if offline; then
 			[ -n "$old" ] && [ -d "$sdir/$i" ] || die "BAKE_OFFLINE is set and source $i ($GURL) was never fetched"
 			echo "bake: source $i $GURL $GREF: ${old:0:9} (offline, as fetched before)" >&2
 		else
@@ -182,9 +190,11 @@ containerfile() {	# containerfile FILE
 }
 
 cmd_build() {
-	local pull='' a
-	while [ $# -gt 0 ]; do case $1 in --pull) pull=1; shift ;; *) break ;; esac; done
-	a=$(bakefile_arg "${1:-}") || exit 1; local f=$a
+	local pull='' fa='' arg f
+	for arg in "$@"; do	# options may come before or after FILE
+		case $arg in --pull) pull=1 ;; -*) usage "unknown build option $arg" ;; *) [ -z "$fa" ] || usage "build takes one FILE (got $fa and $arg)"; fa=$arg ;; esac
+	done
+	f=$(bakefile_arg "$fa") || exit 1
 	if [ "$(kind_of "$f")" = vm ]; then vm_prepare "$f"; echo "bake: $(bake_name "$f") ready (iso $VM_ISO, disk $VM_DISK)"; return; fi
 	local e name dir cf sdir i=0 n key rest ctx=() log
 	e=$(engine); name=$(bake_name "$f"); dir=$(dirname "$f"); sdir=$(srcdir "$f")
@@ -208,9 +218,11 @@ cmd_build() {
 cmd_rootfs() {
 	local f out; f=$(bakefile_arg "${1:-}") || exit 1; cmd_build "$f" || exit 1
 	local e name c; e=$(engine); name=$(bake_name "$f"); out=${2:-$name-rootfs.tar}
+	[ ! -e "$out" ] && [ ! -L "$out" ] || die "$out exists"
 	c=$("$e" create "$name" true) || die "cannot create a container from $name"
-	"$e" export -o "$out" "$c" || { "$e" rm "$c" > /dev/null; die "export failed"; }
+	"$e" export -o "$out.part" "$c" || { "$e" rm "$c" > /dev/null; [ ! -e "$out.part" ] || totrash "$out.part"; die "export failed"; }
 	"$e" rm "$c" > /dev/null
+	mv -- "$out.part" "$out" || die "cannot write $out"
 	echo "bake: $out ($(du -h "$out" | cut -f1))"
 }
 
@@ -220,7 +232,7 @@ fetch_iso() {	# fetch_iso NAME URL [SHA256] -> VM_ISO; downloads when missing or
 	local iso=$state/iso/$1.iso tag='' have=''
 	mkdir -p "$state/iso" || die "cannot make $state/iso"
 	VM_ISO=$iso; [ -f "$iso" ] && have=1
-	if [ -n "${BAKE_OFFLINE:-}" ]; then [ -n "$have" ] || die "BAKE_OFFLINE is set and $2 was never downloaded"; return; fi
+	if offline; then [ -n "$have" ] || die "BAKE_OFFLINE is set and $2 was never downloaded"; return; fi
 	need curl curl
 	tag=$(remote_tag "$2")
 	if [ -n "$have" ]; then
@@ -241,7 +253,7 @@ vm_prepare() {	# vm_prepare FILE -> VM_ISO VM_DISK VM_FORMAT VM_DRIVE VM_RAM VM_
 	VM_RAM=$(field "$f" ram 512M); VM_CPUS=$(field "$f" cpus 1); VM_QEMU=$(field "$f" qemu)
 	isoline=$(field "$f" iso); size=$(field "$f" disk 8G)
 	[ -n "$isoline" ] || die "$f: a vm needs an iso line"
-	read -r src sha <<< "$isoline"
+	read -r src sha <<< "$isoline"; sha=${sha,,}
 	case $src in
 	http://* | https://*) fetch_iso "$VM_NAME" "$src" "$sha" ;;
 	*) VM_ISO=$(expand "$src"); [ -r "$VM_ISO" ] || die "iso $VM_ISO is not readable" ;;
@@ -281,15 +293,25 @@ cmd_outdated() {
 	[ $stale -eq 0 ] || exit 1
 }
 
+split_mount() {	# "HOST:CONTAINER[:opts]" -> MH, MC; HOST may hold ${VAR:-default}, whose colon is not the separator
+	local s=$1 i c d=0
+	for ((i = 0; i < ${#s}; i++)); do
+		c=${s:i:1}
+		case $c in '{') d=$((d + 1)) ;; '}') d=$((d - 1)) ;; ':') [ $d -eq 0 ] && { MH=${s:0:i}; MC=${s:i+1}; [ -n "$MH" ] && [ -n "$MC" ]; return; } ;; esac
+	done
+	return 1
+}
 gpu_args() {	# the flags that hand the GPU to the container
 	if [ "$1" = podman ]; then
 		if { command -v nvidia-ctk > /dev/null && nvidia-ctk cdi list 2> /dev/null | grep -q 'nvidia.com/gpu'; } || [ -e /etc/cdi/nvidia.yaml ]; then echo "--device nvidia.com/gpu=all"; else echo "bake: gpu asked but no NVIDIA CDI spec (nvidia-ctk cdi generate), starting without it" >&2; fi
 	else echo "--gpus all"; fi
 }
 cmd_up() {
-	local gui='' iso='' nobuild='' a
-	while [ $# -gt 0 ]; do case $1 in --gui) gui=1; shift ;; --iso) iso=1; shift ;; --no-build) nobuild=1; shift ;; *) break ;; esac; done
-	a=$(bakefile_arg "${1:-}") || exit 1; local f=$a name cn; name=$(bake_name "$f"); cn=$(cname "$f")
+	local gui='' iso='' nobuild='' fa='' arg f name cn
+	for arg in "$@"; do	# options may come before or after FILE
+		case $arg in --gui) gui=1 ;; --iso) iso=1 ;; --no-build) nobuild=1 ;; -*) usage "unknown up option $arg" ;; *) [ -z "$fa" ] || usage "up takes one FILE (got $fa and $arg)"; fa=$arg ;; esac
+	done
+	f=$(bakefile_arg "$fa") || exit 1; name=$(bake_name "$f"); cn=$(cname "$f")
 	if [ "$(kind_of "$f")" = vm ]; then
 		vm_prepare "$f"
 		local args=(--disk "$VM_DISK" --format "$VM_FORMAT" --drive-if "$VM_DRIVE" --ram "$VM_RAM" --cpus "$VM_CPUS")
@@ -310,7 +332,9 @@ cmd_up() {
 	while IFS=$'\t' read -r n key rest; do
 		case $key in
 		port) runargs+=(-p "$rest") ;;
-		mount) h=$(expand "${rest%:*}"); c=${rest##*:}; mkdir -p "$h" || die "cannot make $h"; runargs+=(-v "$h:$c") ;;
+		mount)
+			split_mount "$rest" || die "line $n: mount needs HOST:CONTAINER[:OPTIONS], got '$rest'"
+			h=$(expand "$MH"); mkdir -p "$h" || die "cannot make $h"; runargs+=(-v "$h:$MC") ;;
 		gpu) read -ra g <<< "$(gpu_args "$e")"; runargs+=("${g[@]}") ;;
 		esac
 	done < <(directives "$f")
@@ -320,7 +344,11 @@ cmd_up() {
 cmd_down() {
 	local f; f=$(bakefile_arg "${1:-}") || exit 1; local name; name=$(bake_name "$f")
 	if [ "$(kind_of "$f")" = vm ]; then cmd_vm stop "$name"; return; fi
-	local cn e; cn=$(cname "$f"); e=$(engine); "$e" stop "$cn" > /dev/null || die "$cn is not running"
+	local cn e; cn=$(cname "$f"); e=$(engine)
+	if "$e" inspect --type container "$cn" > /dev/null 2>&1 && [ "$("$e" inspect --format '{{index .Config.Labels "bake.managed"}}' "$cn" 2> /dev/null)" != 1 ]; then
+		die "a container named $cn exists and was not made by bake; not touching it"
+	fi
+	"$e" stop "$cn" > /dev/null || die "$cn is not running"
 	echo "bake: $cn stopped"
 }
 
@@ -329,6 +357,7 @@ monitor_sock() { local r=${XDG_RUNTIME_DIR:-/tmp/bake-$(id -u)}; mkdir -p "$r" &
 vm_alive() { local p; p=$(cat "$state/vm/$1/pid" 2> /dev/null) || return 1; case $(ps -o comm= -p "$p" 2> /dev/null) in qemu*) return 0 ;; *) return 1 ;; esac; }
 cmd_vm() {
 	local sub=${1:-}; shift || true
+	case $sub in start | stop | log | shot) good_name "${1:-x}" || die "'$1' is not a usable VM name (letters, digits . _ - )" ;; esac
 	case $sub in
 	start)
 		local name=${1:-}; [ -n "$name" ] || usage "vm start needs a NAME"; shift
@@ -349,7 +378,7 @@ cmd_vm() {
 		local args=(-name "$name" -m "$ram" -smp "$cpus" -pidfile "$d/pid" -daemonize -serial "file:$d/log" -monitor "unix:$mon,server,nowait" -no-reboot)
 		if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then args+=(-enable-kvm -cpu host); else echo "bake: no usable /dev/kvm, using software emulation (slow)" >&2; fi
 		if [ -n "$gui" ]; then args+=(-display gtk); else args+=(-display none); fi
-		[ -z "$disk" ] || args+=(-drive "file=$disk,if=$dif${fmt:+,format=$fmt}")
+		[ -z "$disk" ] || args+=(-drive "file=${disk//,/,,},if=$dif${fmt:+,format=$fmt}")
 		[ -z "$iso" ] || args+=(-cdrom "$iso" -boot d)
 		[ -z "$kernel" ] || args+=(-kernel "$kernel" -append "$append")
 		[ -z "$initrd" ] || args+=(-initrd "$initrd")
@@ -366,14 +395,18 @@ cmd_vm() {
 		for _ in 1 2 3 4 5 6 7 8 9 10; do vm_alive "$name" || break; sleep 0.3; done
 		vm_alive "$name" && die "$name did not stop (pid $p)"
 		echo "bake: $name stopped" ;;
-	ls) [ -d "$state/vm" ] && for d in "$state/vm"/*/; do n=$(basename "$d"); printf '%s\t%s\n' "$n" "$(vm_alive "$n" && echo running || echo stopped)"; done; true ;;
+	ls) [ -d "$state/vm" ] && for d in "$state/vm"/*/; do [ -d "$d" ] || continue; n=$(basename "$d"); printf '%s\t%s\n' "$n" "$(vm_alive "$n" && echo running || echo stopped)"; done; true ;;
 	log) local name=${1:-}; [ -n "$name" ] || usage "vm log needs a NAME"; [ -r "$state/vm/$name/log" ] || die "no log for $name"; cat "$state/vm/$name/log" ;;
 	shot)
 		local name=${1:-} out=${2:-}; [ -n "$name" ] && [ -n "$out" ] || usage "vm shot needs NAME OUT.ppm"
 		vm_alive "$name" || die "$name is not running"; need socat socat
-		out=$(readlink -f "$out")
-		{ printf 'screendump %s\n' "$out"; sleep 1; } | socat - "UNIX-CONNECT:$(monitor_sock "$name")" > /dev/null 2>&1
-		[ -s "$out" ] || die "no screenshot came back (is the guest drawing anything yet?)"
+		out=$(readlink -f -- "$out")
+		case $out in *[\"\\]* | *$'\n'*) die "the screenshot path must not contain a quote, a backslash or a newline" ;; esac
+		# qemu writes to a fresh name, so an older screenshot at OUT cannot pass for a new one
+		local tmp=$out.shot.$$
+		{ printf 'screendump "%s"\n' "$tmp"; sleep 1; } | socat - "UNIX-CONNECT:$(monitor_sock "$name")" > /dev/null 2>&1
+		[ -s "$tmp" ] || { [ ! -e "$tmp" ] || totrash "$tmp"; die "no screenshot came back (is the guest drawing anything yet?)"; }
+		mv -f -- "$tmp" "$out" || die "cannot write $out"
 		if command -v magick > /dev/null 2>&1 && [ "${out%.ppm}" != "$out" ]; then magick "$out" "${out%.ppm}.png" 2> /dev/null && echo "bake: ${out%.ppm}.png"; fi
 		echo "bake: $out" ;;
 	*) usage "vm start|stop|ls|log|shot" ;;
@@ -381,7 +414,9 @@ cmd_vm() {
 }
 
 cmd_new() {
-	local n=${1:-} k=${2:-container}; [ -n "$n" ] || usage "new needs a NAME"; [ ! -e "$n.bake" ] || die "$n.bake exists"
+	local n=${1:-} k=${2:-container}; [ -n "$n" ] || usage "new needs a NAME"
+	good_name "$n" || usage "new: '$n' is not a usable name (letters, digits . _ - ; no /)"
+	[ ! -e "$n.bake" ] && [ ! -L "$n.bake" ] || die "$n.bake exists"
 	case $k in
 	vm) cat > "$n.bake" << E2
 # $n - a VM. bake up $n --gui   (first boot attaches the ISO while the disk is blank)

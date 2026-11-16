@@ -219,3 +219,143 @@ EOF2
 	touch "$T/foreign"
 	UHOME=$T/h PATH=$T/fake:$PATH run ./bake up --no-build "$T/u.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"not touching it"* ]]
 }
+
+# ---- audit round 2: fakes for the engine, qemu, curl and socat; nothing real is started -------------------------------
+
+fake_engine() { # a podman that logs every call; inspect/container answer from $T/foreign and $T/label
+	export XDG_DATA_HOME=$T/data
+	mkdir -p "$T/fake"
+	cat > "$T/fake/podman" << EOF2
+#!/bin/sh
+echo "\$@" >> $T/calls
+case "\$1" in
+  build) cat > $T/cf ;;
+  inspect|container) [ -f $T/foreign ] || exit 1
+     case "\$*" in *Labels*) [ -f $T/label ] && echo 1; exit 0 ;; esac; exit 0 ;;
+  export) [ -f $T/exportfail ] && { echo half > "\$3"; exit 1; }; echo tar > "\$3" ;;
+  create) echo cid ;;
+esac
+exit 0
+EOF2
+	chmod +x "$T/fake/podman"
+}
+
+@test "bake: BAKE_OFFLINE=0 or empty is not offline, only a set non-zero value is" {
+	fake_engine; mkrepo
+	printf 'base scratch\ngit file://%s main /app\n' "$R" > "$T/o.bake"
+	BAKE_OFFLINE=0 PATH=$T/fake:$PATH run ./bake build "$T/o.bake"
+	[ "$status" -eq 0 ]; [[ "$output" != *offline* ]]
+	rm -rf "$T/state"
+	BAKE_OFFLINE= PATH=$T/fake:$PATH run ./bake build "$T/o.bake"; [ "$status" -eq 0 ]
+	rm -rf "$T/state"
+	BAKE_OFFLINE=1 PATH=$T/fake:$PATH run ./bake build "$T/o.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"never fetched"* ]]
+}
+
+@test "bake: a name that is a path is refused, nothing is written outside the state dir" {
+	fake_engine
+	printf 'name ../../esc\nbase scratch\n' > "$T/n.bake"
+	PATH=$T/fake:$PATH run ./bake build "$T/n.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"usable name"* ]]
+	[ ! -e "$T/esc.log" ] && [ ! -e "$T/state/esc" ] && [ ! -s "$T/calls" ]
+	cd "$T"; B="$BATS_TEST_DIRNAME/../bake"
+	run "$B" new ../escaped; [ "$status" -eq 2 ]; [ ! -e "$T/../escaped.bake" ]
+	run "$B" new -x; [ "$status" -eq 2 ]
+	run "$B" new "a b"; [ "$status" -eq 2 ]
+	PATH=$T/fake:$PATH run "$B" vm start ../../x --kernel k; [ "$status" -eq 1 ]
+	PATH=$T/fake:$PATH run "$B" vm stop ../x; [ "$status" -eq 1 ]; [[ "$output" == *"usable VM name"* ]]
+}
+
+@test "bake: build and up read their options after FILE too" {
+	fake_engine; mkdir -p "$T/w"
+	printf 'name u\nbase scratch\nport 9000:80\n' > "$T/u.bake"
+	PATH=$T/fake:$PATH run ./bake build "$T/u.bake" --pull; [ "$status" -eq 0 ]
+	grep -q -- '--pull=newer' "$T/calls"
+	: > "$T/calls"
+	PATH=$T/fake:$PATH run ./bake up "$T/u.bake" --no-build; [ "$status" -eq 0 ]
+	! grep -q '^build' "$T/calls"
+	grep -q '^run -d --name u ' "$T/calls"
+	PATH=$T/fake:$PATH run ./bake up "$T/u.bake" --bogus; [ "$status" -eq 2 ]
+	PATH=$T/fake:$PATH run ./bake build "$T/u.bake" "$T/u.bake"; [ "$status" -eq 2 ]
+}
+
+@test "bake: a mount with :ro keeps the options and does not make a directory named after them" {
+	fake_engine
+	printf 'name u\nbase scratch\nmount ${UHOME:-~/x}/data:/data:ro\nmount %s/plain:/p\n' "$T" > "$T/u.bake"
+	UHOME=$T/h PATH=$T/fake:$PATH run ./bake up --no-build "$T/u.bake"; [ "$status" -eq 0 ]
+	grep -q -- "-v $T/h/data:/data:ro -v $T/plain:/p u" "$T/calls"
+	[ -d "$T/h/data" ] && [ -d "$T/plain" ]
+	[ ! -e "$T/h/data:" ] && [ ! -e "$T/h/data:/data" ]
+	printf 'name u\nbase scratch\nmount /nocolon\n' > "$T/v.bake"
+	PATH=$T/fake:$PATH run ./bake up --no-build "$T/v.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"HOST:CONTAINER"* ]]
+}
+
+@test "bake: down does not stop a container that bake did not make" {
+	fake_engine
+	printf 'name u\nbase scratch\n' > "$T/u.bake"
+	touch "$T/foreign"
+	PATH=$T/fake:$PATH run ./bake down "$T/u.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"not touching it"* ]]
+	! grep -q '^stop' "$T/calls"
+	touch "$T/label"
+	PATH=$T/fake:$PATH run ./bake down "$T/u.bake"; [ "$status" -eq 0 ]
+	grep -q '^stop u' "$T/calls"
+}
+
+@test "bake: rootfs refuses an existing tarball and a failed export leaves no tarball" {
+	fake_engine
+	printf 'name r\nbase scratch\n' > "$T/r.bake"
+	echo precious > "$T/out.tar"
+	PATH=$T/fake:$PATH run ./bake rootfs "$T/r.bake" "$T/out.tar"; [ "$status" -eq 1 ]; [[ "$output" == *"exists"* ]]
+	[ "$(cat "$T/out.tar")" = precious ]
+	touch "$T/exportfail"
+	PATH=$T/fake:$PATH run ./bake rootfs "$T/r.bake" "$T/new.tar"; [ "$status" -eq 1 ]
+	[ ! -e "$T/new.tar" ] && [ ! -e "$T/new.tar.part" ]
+}
+
+@test "bake: a git URL or ref that starts with - is refused (git would take it as an option)" {
+	printf 'base scratch\ngit --upload-pack=touch main /app\n' > "$T/d.bake"
+	run ./bake show "$T/d.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"starts with -"* ]]
+	printf 'base scratch\ngit https://x/y --output=z /app\n' > "$T/e.bake"
+	run ./bake show "$T/e.bake"; [ "$status" -eq 1 ]; [[ "$output" == *"starts with -"* ]]
+}
+
+@test "bake: vm ls with an empty vm folder lists nothing, not a '*' row" {
+	mkdir -p "$T/state/bake/vm"
+	run ./bake vm ls; [ "$status" -eq 0 ]; [ -z "$output" ]
+}
+
+@test "bake: CRLF line ends in a .bake file are ignored" {
+	printf 'base alpine:3.20\r\npkg git\r\nenv A=1\r\n' > "$T/c.bake"
+	run ./bake show "$T/c.bake"; [ "$status" -eq 0 ]
+	[[ "$output" != *$'\r'* ]]
+}
+
+@test "bake: vm shot refuses a stale screenshot, and quotes the path it hands to the monitor" {
+	command -v qemu-img > /dev/null || skip "no qemu-img"
+	mkdir -p "$T/fake" "$T/state/bake/vm/g"
+	cp "$(command -v sleep)" "$T/fake/qemu-fake"; "$T/fake/qemu-fake" 30 & echo $! > "$T/state/bake/vm/g/pid"
+	printf '#!/bin/sh\ncat > %s/mon\n' "$T" > "$T/fake/socat"; chmod +x "$T/fake/socat"
+	export XDG_RUNTIME_DIR=$T/run; mkdir -p "$XDG_RUNTIME_DIR"
+	echo old > "$T/my shot.ppm"
+	PATH=$T/fake:$PATH run ./bake vm shot g "$T/my shot.ppm"
+	kill "$(cat "$T/state/bake/vm/g/pid")" 2> /dev/null
+	[ "$status" -eq 1 ]; [[ "$output" == *"no screenshot came back"* ]]
+	[ "$(cat "$T/my shot.ppm")" = old ]
+	grep -q '^screendump "' "$T/mon"
+}
+
+@test "bake: an upper-case sha256 on an iso line is accepted" {
+	command -v qemu-img > /dev/null || skip "no qemu-img"
+	fake_engine
+	printf '#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do case $1 in -o) out=$2; shift ;; -fsSIL) printf "ETag: \\"1\\"\\r\\n"; exit 0 ;; esac; shift; done\n[ -z "$out" ] || printf "isobytes" > "$out"\n' > "$T/fake/curl"; chmod +x "$T/fake/curl"
+	sum=$(printf 'isobytes' | sha256sum | cut -d' ' -f1)
+	printf 'kind vm\niso http://example.invalid/a.iso %s\ndisk 1M\n' "${sum^^}" > "$T/v.bake"
+	PATH=$T/fake:$PATH run ./bake build "$T/v.bake"
+	[ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
+@test "bake: a comma in a vm disk path is doubled so qemu does not split the -drive option" {
+	mkdir -p "$T/fake"; q=qemu-system-$(uname -m)
+	printf '#!/bin/sh\necho "$@" > %s/qargs\nexit 0\n' "$T" > "$T/fake/$q"; chmod +x "$T/fake/$q"
+	PATH=$T/fake:$PATH run ./bake vm start c --disk "$T/a,b.img"
+	[ "$status" -eq 0 ] || { echo "$output"; false; }
+	grep -q -- "file=$T/a,,b.img,if=virtio" "$T/qargs"
+}
