@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# check - compile every .lean file in this folder (or the ones named) with Lean 4: a proof that does not compile is not a proof.
+#   lean4/check            all files here          lean4/check repos.lean   just that one
+# Finds `lean` on PATH, else the newest toolchain under ~/.elan/toolchains (elan need not have a default set).
+# Fails (exit 1) on any error, on a `sorry`, or on an axiom other than propext / Quot.sound / Classical.choice.
+# Exit: 0 all fine, 1 a file failed, 2 no lean found.
+set -u
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+lean=$(command -v lean || true)
+if [ -z "$lean" ]; then
+	for t in "$HOME"/.elan/toolchains/*/bin/lean; do [ -x "$t" ] && lean=$t; done
+fi
+[ -n "$lean" ] || { echo "check: no lean found (install elan: https://github.com/leanprover/elan)" >&2; exit 2; }
+[ $# -gt 0 ] || set -- ./*.lean
+rc=0
+for f in "$@"; do
+	[ -f "$f" ] || { echo "check: no such file: $f" >&2; rc=1; continue; }
+	if grep -q '\bsorry\b' "$f"; then echo "FAIL $f: contains sorry"; rc=1; continue; fi
+	out=$("$lean" "$f" 2>&1) || { echo "FAIL $f"; printf '%s\n' "$out" | head -20; rc=1; continue; }
+	if printf '%s\n' "$out" | grep -E "depends on axioms" | grep -vE "^'[^']+' depends on axioms: \[(propext|Quot\.sound|Classical\.choice|, )*\]$" | grep -q .; then
+		echo "FAIL $f: an unexpected axiom"; rc=1; continue
+	fi
+	echo "ok   $f"
+done
+exit $rc
