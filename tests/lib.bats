@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# lib/: the small helpers other scripts build on.
+# templates/: settings, evq, dspq helpers (the wizard and lazytui library sources no longer exist in the tree).
 
 setup() {
 	cd "$BATS_TEST_DIRNAME/.."
@@ -14,56 +14,56 @@ teardown() {
 # --- settings ----------------------------------------------------------
 
 @test "settings: set then get round-trips, values may contain = and quotes" {
-	run ./lib/settings set demo greeting "it's a=b"
+	run ./templates/settings set demo greeting "it's a=b"
 	[ "$status" -eq 0 ]
-	run ./lib/settings get demo greeting
+	run ./templates/settings get demo greeting
 	[ "$output" = "it's a=b" ]
 }
 
 @test "settings: unset key exits 1 without a default, prints the default with one" {
-	run ./lib/settings get demo nope
+	run ./templates/settings get demo nope
 	[ "$status" -eq 1 ]
-	run ./lib/settings get demo nope fallback
+	run ./templates/settings get demo nope fallback
 	[ "$status" -eq 0 ]
 	[ "$output" = fallback ]
 }
 
 @test "settings: environment variable APP_KEY wins over the file" {
-	./lib/settings set demo theme dark
-	DEMO_THEME=light run ./lib/settings get demo theme
+	./templates/settings set demo theme dark
+	DEMO_THEME=light run ./templates/settings get demo theme
 	[ "$output" = light ]
 }
 
 @test "settings: set replaces instead of appending, unset removes" {
-	./lib/settings set demo a 1
-	./lib/settings set demo a 2
-	./lib/settings set demo b 3
-	run ./lib/settings list demo
+	./templates/settings set demo a 1
+	./templates/settings set demo a 2
+	./templates/settings set demo b 3
+	run ./templates/settings list demo
 	[ "$output" = "$(printf 'a=2\nb=3')" ]
-	./lib/settings unset demo a
-	run ./lib/settings list demo
+	./templates/settings unset demo a
+	run ./templates/settings list demo
 	[ "$output" = "b=3" ]
 }
 
 @test "settings: the file is private (mode 600) and comments survive a write" {
-	./lib/settings set demo a 1
+	./templates/settings set demo a 1
 	printf '# keep me\n' >> "$SETTINGS_HOME/demo/settings"
-	./lib/settings set demo b 2
+	./templates/settings set demo b 2
 	[ "$(stat -c %a "$SETTINGS_HOME/demo/settings")" = 600 ]
 	grep -q '^# keep me$' "$SETTINGS_HOME/demo/settings"
 }
 
 @test "settings: export is eval-safe even with quotes and command syntax" {
-	./lib/settings set demo cmd "\$(touch $tmp/pwned); 'x'"
-	eval "$(./lib/settings export demo)"
+	./templates/settings set demo cmd "\$(touch $tmp/pwned); 'x'"
+	eval "$(./templates/settings export demo)"
 	[ "$DEMO_CMD" = "\$(touch $tmp/pwned); 'x'" ]
 	[ ! -e "$tmp/pwned" ]
 }
 
 @test "settings: rejects bad app and key names" {
-	run ./lib/settings set demo 'bad key' x
+	run ./templates/settings set demo 'bad key' x
 	[ "$status" -eq 2 ]
-	run ./lib/settings get '../etc' key
+	run ./templates/settings get '../etc' key
 	[ "$status" -eq 2 ]
 }
 
@@ -112,33 +112,33 @@ teardown() {
 
 @test "evq: events come out in the order they went in, then the queue is empty" {
 	export XDG_RUNTIME_DIR="$tmp"
-	./lib/evq push -q t one
-	./lib/evq push -q t two
-	run ./lib/evq count -q t
+	./templates/evq push -q t one
+	./templates/evq push -q t two
+	run ./templates/evq count -q t
 	[ "$output" = 2 ]
-	run ./lib/evq pop -q t
+	run ./templates/evq pop -q t
 	[ "$output" = one ]
-	run ./lib/evq pop -q t
+	run ./templates/evq pop -q t
 	[ "$output" = two ]
-	run ./lib/evq pop -q t
+	run ./templates/evq pop -q t
 	[ "$status" -eq 1 ]
 }
 
 @test "evq: peek does not consume, clear empties the queue" {
 	export XDG_RUNTIME_DIR="$tmp"
-	./lib/evq push -q t one
-	run ./lib/evq peek -q t
+	./templates/evq push -q t one
+	run ./templates/evq peek -q t
 	[ "$output" = one ]
-	run ./lib/evq count -q t
+	run ./templates/evq count -q t
 	[ "$output" = 1 ]
-	./lib/evq clear -q t
-	run ./lib/evq count -q t
+	./templates/evq clear -q t
+	run ./templates/evq count -q t
 	[ "$output" = 0 ]
 }
 
 @test "evq: a queue name with a slash is refused" {
 	export XDG_RUNTIME_DIR="$tmp"
-	run ./lib/evq push -q ../x boom
+	run ./templates/evq push -q ../x boom
 	[ "$status" -eq 2 ]
 }
 
@@ -146,7 +146,7 @@ teardown() {
 
 @test "dspq: downloads in parallel into place, atomically (no .part left)" {
 	echo hello > "$tmp/src"
-	run ./lib/dspq -j 2 --state "$tmp/st" "file://$tmp/src|$tmp/out/a|a" "file://$tmp/src|$tmp/out/b|b"
+	run ./templates/dspq -j 2 --state "$tmp/st" "file://$tmp/src|$tmp/out/a|a" "file://$tmp/src|$tmp/out/b|b"
 	[ "$status" -eq 0 ]
 	[ "$(cat "$tmp/out/a")" = hello ]
 	[ "$(cat "$tmp/out/b")" = hello ]
@@ -156,14 +156,14 @@ teardown() {
 
 @test "dspq: a failing entry makes the queue exit non-zero, the good one still lands" {
 	echo hello > "$tmp/src"
-	run ./lib/dspq --state "$tmp/st" "file://$tmp/src|$tmp/out/ok|ok" "file://$tmp/missing|$tmp/out/bad|bad"
+	run ./templates/dspq --state "$tmp/st" "file://$tmp/src|$tmp/out/ok|ok" "file://$tmp/missing|$tmp/out/bad|bad"
 	[ "$status" -ne 0 ]
 	[ -f "$tmp/out/ok" ]
 	[ ! -e "$tmp/out/bad" ]
 }
 
 @test "dspq: input without url|dest entries is a usage error" {
-	run ./lib/dspq -j 2 nonsense
+	run ./templates/dspq -j 2 nonsense
 	[ "$status" -eq 2 ]
 }
 

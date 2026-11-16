@@ -5,7 +5,7 @@ setup() {
 	cd "$BATS_TEST_DIRNAME/.."
 	export HOME="$BATS_TEST_TMPDIR/home" XDG_DATA_HOME="$BATS_TEST_TMPDIR/home/.local/share"
 	mkdir -p "$HOME" "$BATS_TEST_TMPDIR/bin"
-	export COMFY_HOME="$BATS_TEST_TMPDIR/data" COMFY_SRC="$BATS_TEST_TMPDIR/src" COMFY_VENV="$BATS_TEST_TMPDIR/venv" COMFY_YES=1 COMFY_NO_WINDOW=1
+	export COMFY_HOME="$BATS_TEST_TMPDIR/data" COMFY_SRC="$BATS_TEST_TMPDIR/src" COMFY_VENV="$BATS_TEST_TMPDIR/venv" COMFY_YES=1 COMFY_NO_WINDOW=1 COMFY_PORT=$((20000 + RANDOM % 20000))
 	export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
 }
 
@@ -29,19 +29,19 @@ EOT
 }
 
 @test "comfylauncher: --help comes from the header" {
-	run ./comfy/comfylauncher --help
+	run ./launchers/comfylauncher/comfylauncher --help
 	[ "$status" -eq 0 ]
 	[[ "$output" == comfylauncher\ -* ]]
 }
 
 @test "comfylauncher: no arguments off a terminal prints the status instead of a menu" {
-	run ./comfy/comfylauncher < /dev/null
+	run ./launchers/comfylauncher/comfylauncher < /dev/null
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"installed : no"* ]]
 }
 
 @test "comfylauncher: start without ComfyUI degrades with the install hint" {
-	run ./comfy/comfylauncher start
+	run ./launchers/comfylauncher/comfylauncher start
 	[ "$status" -eq 1 ]
 	[[ "$output" == *"comfylauncher install"* ]]
 }
@@ -52,29 +52,29 @@ EOT
 case $* in -L) echo "GPU 0: fake" ;; *) echo 4096 ;; esac
 EOT
 	chmod +x "$BATS_TEST_TMPDIR/bin/nvidia-smi"
-	run ./comfy/comfylauncher status
+	run ./launchers/comfylauncher/comfylauncher status
 	[[ "$output" == *"--lowvram"* ]]
-	COMFY_ACCEL=cpu run ./comfy/comfylauncher status
+	COMFY_ACCEL=cpu run ./launchers/comfylauncher/comfylauncher status
 	[[ "$output" == *"--cpu"* ]]
 	printf '#!/bin/sh\ncase $* in -L) echo GPU ;; *) echo 24576 ;; esac\n' > "$BATS_TEST_TMPDIR/bin/nvidia-smi"
-	run ./comfy/comfylauncher status
+	run ./launchers/comfylauncher/comfylauncher status
 	[[ "$output" == *"--highvram"* ]]
 }
 
 @test "comfylauncher: install shows the plan, builds the venv; start/stop use a pid file" {
 	fake_git
-	run ./comfy/comfylauncher install
+	run ./launchers/comfylauncher/comfylauncher install
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"will do:"* ]]
 	[ -x "$COMFY_VENV/bin/python" ]
 	[ -f "$COMFY_HOME/extra_model_paths.yaml" ]
-	COMFY_WAIT=1 run ./comfy/comfylauncher start
+	COMFY_WAIT=1 run ./launchers/comfylauncher/comfylauncher start
 	[ -f "$COMFY_HOME/comfy.pid" ]
-	run ./comfy/comfylauncher status
+	run ./launchers/comfylauncher/comfylauncher status
 	[[ "$output" == *"running   : yes"* ]]
-	run ./comfy/comfylauncher stop
+	run ./launchers/comfylauncher/comfylauncher stop
 	[[ "$output" == *stopped* ]]
-	run ./comfy/comfylauncher status
+	run ./launchers/comfylauncher/comfylauncher status
 	[[ "$output" == *"running   : no"* ]]
 }
 
@@ -82,15 +82,15 @@ EOT
 	mkdir -p "$COMFY_HOME/models/checkpoints" "$BATS_TEST_TMPDIR/other/loras"
 	: > "$COMFY_HOME/models/checkpoints/a.safetensors"
 	: > "$BATS_TEST_TMPDIR/other/loras/b.safetensors"
-	run ./comfy/comfylauncher models link "$BATS_TEST_TMPDIR/other"
+	run ./launchers/comfylauncher/comfylauncher models link "$BATS_TEST_TMPDIR/other"
 	[ "$status" -eq 0 ]
-	run ./comfy/comfylauncher models
+	run ./launchers/comfylauncher/comfylauncher models
 	[[ "$output" == *"a.safetensors"* && "$output" == *"b.safetensors"* ]]
 	grep -q linked_1 "$COMFY_HOME/extra_model_paths.yaml"
 }
 
 @test "comfylauncher: unknown command fails" {
-	run ./comfy/comfylauncher frobnicate
+	run ./launchers/comfylauncher/comfylauncher frobnicate
 	[ "$status" -eq 1 ]
 }
 
@@ -112,17 +112,17 @@ EOT
 }
 
 @test "protonlauncher: --help and no-argument non-tty both work" {
-	run ./protonlauncher --help
+	run ./launchers/protonlauncher/protonlauncher --help
 	[ "$status" -eq 0 ]
-	run ./protonlauncher < /dev/null
+	run ./launchers/protonlauncher/protonlauncher < /dev/null
 	[ "$status" -eq 0 ]
 }
 
 @test "protonlauncher: tools sorts newest first and picks the newest GE" {
 	fake_proton
-	run ./protonlauncher tools
+	run ./launchers/protonlauncher/protonlauncher tools
 	[ "${lines[1]%%	*}" = GE-Proton10-2 ]
-	run ./protonlauncher run -n "$BATS_TEST_DIRNAME/launchers.bats"
+	run ./launchers/protonlauncher/protonlauncher run -n "$BATS_TEST_DIRNAME/launchers.bats"
 	[[ "$output" == *"tool    : GE-Proton10-2"* ]]
 }
 
@@ -130,34 +130,34 @@ EOT
 	fake_proton
 	mkdir -p "$BATS_TEST_TMPDIR/Games/Cool Game"
 	: > "$BATS_TEST_TMPDIR/Games/Cool Game/game.exe"
-	run ./protonlauncher run -n "$BATS_TEST_TMPDIR/Games/Cool Game/game.exe"
+	run ./launchers/protonlauncher/protonlauncher run -n "$BATS_TEST_TMPDIR/Games/Cool Game/game.exe"
 	[ "$status" -eq 0 ]
 	[ ! -e "$FAKE_LOG" ]
-	run ./protonlauncher run -e dxvk-async "$BATS_TEST_TMPDIR/Games/Cool Game/game.exe" -windowed
+	run ./launchers/protonlauncher/protonlauncher run -e dxvk-async "$BATS_TEST_TMPDIR/Games/Cool Game/game.exe" -windowed
 	[ "$status" -eq 0 ]
 	grep -q 'run .*game.exe -windowed' "$FAKE_LOG"
 	grep -q "COMPAT=.*prefixes/Cool_Game" "$FAKE_LOG"
 	grep -q 'ASYNC=1' "$FAKE_LOG"
-	run ./protonlauncher list
+	run ./launchers/protonlauncher/protonlauncher list
 	[[ "$output" == *"Cool_Game"*"GE-Proton10-2"*"dxvk-async"* ]]
 }
 
 @test "protonlauncher: no Proton install gives a hint, not a crash" {
-	run ./protonlauncher run -n "$BATS_TEST_DIRNAME/launchers.bats"
+	run ./launchers/protonlauncher/protonlauncher run -n "$BATS_TEST_DIRNAME/launchers.bats"
 	[ "$status" -eq 1 ]
 	[[ "$output" == *"no Proton install found"* ]]
 }
 
 @test "protonlauncher: bad prefix names and unknown presets are refused" {
 	fake_proton
-	run ./protonlauncher prefix new '../evil'
+	run ./launchers/protonlauncher/protonlauncher prefix new '../evil'
 	[ "$status" -eq 1 ]
-	run ./protonlauncher run -n -e nope "$BATS_TEST_DIRNAME/launchers.bats"
+	run ./launchers/protonlauncher/protonlauncher run -n -e nope "$BATS_TEST_DIRNAME/launchers.bats"
 	[ "$status" -eq 1 ]
 }
 
 @test "protonlauncher: missing optional wrappers only warn" {
 	fake_proton
-	run ./protonlauncher run -n --mangohud "$BATS_TEST_DIRNAME/launchers.bats"
+	run ./launchers/protonlauncher/protonlauncher run -n --mangohud "$BATS_TEST_DIRNAME/launchers.bats"
 	[ "$status" -eq 0 ]
 }

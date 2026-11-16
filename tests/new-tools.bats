@@ -27,28 +27,28 @@ setup() {
 }
 
 @test "nmap: passthrough mode reaches the real nmap" {
-	run ./nmap -- --version
+	run ./templates/nmap -- --version
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"Nmap version"* ]]
 }
 
 @test "nmap: unknown preset is a clean error, not a crash" {
-	run ./nmap nope some-host
+	run ./templates/nmap nope some-host
 	[ "$status" -eq 2 ]
 }
 
-@test "logcollector: summary-only run writes no archive" {
+@test "logbucket: summary-only run writes no archive" {
 	tmp=$(mktemp -d)
-	run ./logcollector -n -s "1 hour ago" -o "$tmp"
+	run ./logbucket -n -s "1 hour ago" -o "$tmp"
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"logcollector summary"* ]]
 	[ -z "$(ls -A "$tmp")" ]
 	rm -rf "$tmp"
 }
 
-@test "logcollector: redacts tokens, passwords and private keys" {
+@test "logbucket: redacts tokens, passwords and private keys" {
 	tmp=$(mktemp -d)
-	eval "$(sed -n '/^redact() {/,/^}/p' ./logcollector)"
+	eval "$(sed -n '/^redact() {/,/^}/p' ./logbucket)"
 	redact_ip=0
 	out=$(printf '%s\n' \
 		'x ghp_abcdefghijklmnopqrstuvwxyz0123456789 y' \
@@ -162,9 +162,9 @@ setup() {
 	rm -rf "$tmp"
 }
 
-@test "logcollector: writes an archive that contains the summary" {
+@test "logbucket: writes an archive that contains the summary" {
 	tmp=$(mktemp -d)
-	run ./logcollector -s "10 minutes ago" -o "$tmp"
+	run ./logbucket -s "10 minutes ago" -o "$tmp"
 	[ "$status" -eq 0 ]
 	arch=$(ls "$tmp"/logcollector-*.tar.* | head -1)
 	[ -f "$arch" ]
@@ -175,8 +175,8 @@ setup() {
 	rm -rf "$tmp"
 }
 
-@test "logcollector: -I masks IPv4 and MAC addresses, without it they stay" {
-	eval "$(sed -n '/^redact() {/,/^}/p' ./logcollector)"
+@test "logbucket: -I masks IPv4 and MAC addresses, without it they stay" {
+	eval "$(sed -n '/^redact() {/,/^}/p' ./logbucket)"
 	redact_ip=0
 	out=$(echo 'link 192.168.1.20 aa:bb:cc:dd:ee:ff' | redact)
 	[[ "$out" == *192.168.1.20* ]]
@@ -186,8 +186,8 @@ setup() {
 	[[ "$out" != *aa:bb:cc* ]]
 }
 
-@test "logcollector: Authorization headers and URL credentials are redacted" {
-	eval "$(sed -n '/^redact() {/,/^}/p' ./logcollector)"
+@test "logbucket: Authorization headers and URL credentials are redacted" {
+	eval "$(sed -n '/^redact() {/,/^}/p' ./logbucket)"
 	redact_ip=0
 	out=$(printf '%s\n' 'curl -H "Authorization: Bearer abcdef1234567890" https://bob:s3cret@example.com/x' | redact)
 	[[ "$out" != *abcdef1234567890* ]]
@@ -195,13 +195,13 @@ setup() {
 	[[ "$out" == *example.com* ]]
 }
 
-@test "logcollector: redaction works under mawk (the default awk on Debian/Ubuntu)" {
+@test "logbucket: redaction works under mawk (the default awk on Debian/Ubuntu)" {
 	command -v mawk >/dev/null || skip "mawk not installed"
 	tmp=$(mktemp -d)
 	ln -s "$(command -v mawk)" "$tmp/awk"
 	PATH="$tmp:$PATH"
 	hash -r
-	eval "$(sed -n '/^redact() {/,/^}/p' ./logcollector)"
+	eval "$(sed -n '/^redact() {/,/^}/p' ./logbucket)"
 	redact_ip=1
 	out=$(printf '%s\n' \
 		'x ghp_abcdefghijklmnopqrstuvwxyz0123456789 y' \
@@ -220,13 +220,13 @@ setup() {
 	tmp=$(mktemp -d)
 	printf '#!/bin/sh\necho "$@"\n' > "$tmp/nmap"
 	chmod +x "$tmp/nmap"
-	PATH="$tmp:$PATH" run ./nmap quick host
+	PATH="$tmp:$PATH" run ./templates/nmap quick host
 	[ "$output" = "-T4 -F host" ]
-	PATH="$tmp:$PATH" run ./nmap full host
+	PATH="$tmp:$PATH" run ./templates/nmap full host
 	[ "$output" = "-p- host" ]
-	PATH="$tmp:$PATH" run ./nmap ping 10.0.0.0/24
+	PATH="$tmp:$PATH" run ./templates/nmap ping 10.0.0.0/24
 	[ "$output" = "-sn 10.0.0.0/24" ]
-	PATH="$tmp:$PATH" run ./nmap service host
+	PATH="$tmp:$PATH" run ./templates/nmap service host
 	[ "$output" = "-sV host" ]
 	rm -rf "$tmp"
 }
@@ -234,7 +234,7 @@ setup() {
 @test "nmap: does not call itself when it is the first nmap on PATH" {
 	tmp=$(mktemp -d)
 	mkdir "$tmp/bin" "$tmp/real"
-	ln -s "$PWD/nmap" "$tmp/bin/nmap"
+	ln -s "$PWD/templates/nmap" "$tmp/bin/nmap"
 	printf '#!/bin/sh\necho real "$@"\n' > "$tmp/real/nmap"
 	chmod +x "$tmp/real/nmap"
 	PATH="$tmp/bin:$tmp/real:$PATH" run nmap -- -V

@@ -17,20 +17,21 @@ setup() {
 	done
 }
 
-@test "every installer/ script parses" {
-	for f in installer/*; do
+@test "every launchers/ script parses" {
+	for f in launchers/blenderlauncher/blenderlauncher launchers/comfylauncher/comfylauncher \
+		launchers/protonlauncher/protonlauncher launchers/templeos/templeos; do
 		[ -f "$f" ] && [ -x "$f" ] || continue
 		bash -n "$f"
 	done
 }
 
-@test "comfy/comfylauncher parses" {
-	bash -n comfy/comfylauncher
+@test "launchers/comfylauncher/comfylauncher parses" {
+	bash -n launchers/comfylauncher/comfylauncher
 }
 
 @test "every top-level tool answers --help from its header" {
-	for f in btth cleaner ezcontainers flatseal metadata_cleaner nmap scenario sniff todo trash wifi \
-		hf gh screenshot logcollector manwriter findfat morph fixmedia protonlauncher skilltree claude_maintain; do
+	for f in btth cleaner ezcontainers flatseal metadata_cleaner scenario sniff todo trash wifi \
+		hf gh screenshot logbucket manwriter findfat morph fixmedia skilltree claude_maintain; do
 		run ./"$f" --help
 		[ "$status" -eq 0 ]
 		[ -n "$output" ]
@@ -39,8 +40,9 @@ setup() {
 
 @test "shellcheck: no warnings or errors" {
 	command -v shellcheck >/dev/null || skip "shellcheck not installed"
-	run shellcheck -S warning btth cleaner ezcontainers findfat fixmedia flatseal gh hf logcollector \
-		manwriter metadata_cleaner morph nmap protonlauncher scenario screenshot sniff todo trash wifi \
-		lib/lazytui lib/dspq lib/evq lib/settings lib/wizard installer/blenderlauncher comfy/comfylauncher templates/*
+	run shellcheck -S warning btth cleaner ezcontainers findfat fixmedia flatseal gh hf logbucket \
+		manwriter metadata_cleaner morph scenario screenshot sniff todo trash wifi \
+		launchers/blenderlauncher/blenderlauncher launchers/comfylauncher/comfylauncher \
+		launchers/protonlauncher/protonlauncher templates/*
 	[ "$status" -eq 0 ]
 }
