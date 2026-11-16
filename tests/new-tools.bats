@@ -459,3 +459,28 @@ setup() {
 	[ "$status" -ne 0 ]
 	[[ "$output" != *added* ]]
 }
+
+@test "findfat: -n without a value is an error, not an endless loop" {
+	run timeout 5 ./findfat -n
+	[ "$status" -eq 2 ]
+}
+
+@test "findfat: options after the DIR count, a second DIR is an error" {
+	d=$BATS_TEST_TMPDIR; mkdir -p "$d/t"
+	head -c 3000 /dev/zero > "$d/t/a"; head -c 2000 /dev/zero > "$d/t/b"; head -c 1000 /dev/zero > "$d/t/c"
+	run ./findfat "$d/t" -file -n 1
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"/t/a"* && "$output" != *"/t/b"* && "$output" != *"directories:"* ]]
+	run ./findfat "$d/t" "$d"
+	[ "$status" -eq 2 ]
+	run ./findfat -n 007 "$d/t"
+	[ "$status" -eq 0 ]
+}
+
+@test "findfat: -- lets a directory called -x be the DIR" {
+	d=$BATS_TEST_TMPDIR; mkdir -p "$d/w/-x"; head -c 3000 /dev/zero > "$d/w/-x/f"
+	cd "$d/w"
+	run "$BATS_TEST_DIRNAME/../findfat" -file -- -x
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"-x/f"* ]]
+}

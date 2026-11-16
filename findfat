@@ -14,17 +14,30 @@ case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print;
 want_dir=1
 want_file=1
 count=15
+dir=
 while [ $# -gt 0 ]; do
 	case $1 in
 	-dir | -d) want_file=0; shift ;;
 	-file | -f) want_dir=0; shift ;;
-	-n) count=${2:-}; shift 2 ;;
-	-*) echo "findfat: unknown option $1" >&2; exit 2 ;;
-	*) break ;;
+	-n)
+		[ $# -ge 2 ] || { echo "findfat: -n needs a number" >&2; exit 2; }
+		count=$2; shift 2 ;;
+	--) shift; break ;;
+	-?*) echo "findfat: unknown option $1" >&2; exit 2 ;;
+	*)
+		[ -z "$dir" ] || { echo "findfat: one DIR only (got $dir and $1)" >&2; exit 2; }
+		dir=$1; shift ;;
 	esac
 done
-case $count in '' | *[!0-9]* | 0) echo "findfat: -n wants a positive number" >&2; exit 2 ;; esac
-dir=${1:-.}
+if [ $# -gt 0 ]; then	# after --: the rest is the DIR, whatever it starts with
+	[ -z "$dir" ] && [ $# -eq 1 ] || { echo "findfat: one DIR only" >&2; exit 2; }
+	dir=$1
+fi
+case $count in '' | *[!0-9]*) count=0 ;; esac
+[ "${#count}" -le 9 ] && [ "$((10#$count))" -gt 0 ] || { echo "findfat: -n wants a positive number" >&2; exit 2; }
+count=$((10#$count))
+dir=${dir:-.}
+case $dir in -*) dir=./$dir ;; esac
 [ -d "$dir" ] || { echo "findfat: $dir is not a directory" >&2; exit 1; }
 
 human() {
