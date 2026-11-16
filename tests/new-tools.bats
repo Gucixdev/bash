@@ -404,3 +404,58 @@ setup() {
 	[ "$status" -eq 0 ]
 	[ -f "$d/data/Trash/files/-x" ]
 }
+
+@test "todo: 'done' without a number is a usage error, not a task called done" {
+	XDG_DATA_HOME="$BATS_TEST_TMPDIR" run ./todo done
+	[ "$status" -eq 1 ]
+	! grep -q . "$BATS_TEST_TMPDIR/todo/todo.txt"
+}
+
+@test "todo: done takes exactly one number, ranges and sed syntax are refused and nothing moves" {
+	export XDG_DATA_HOME="$BATS_TEST_TMPDIR"
+	./todo one >/dev/null; ./todo two >/dev/null; ./todo three >/dev/null
+	for bad in 1,2 '1p;2' 1abc 0 '$' ' 2'; do
+		run ./todo done "$bad"
+		[ "$status" -eq 1 ]
+	done
+	[ "$(wc -l < "$XDG_DATA_HOME/todo/todo.txt")" -eq 3 ]
+	[ ! -s "$XDG_DATA_HOME/todo/done.txt" ]
+}
+
+@test "todo: a newline in the task text stays one task" {
+	export XDG_DATA_HOME="$BATS_TEST_TMPDIR"
+	./todo "$(printf 'first\nsecond')" >/dev/null
+	[ "$(wc -l < "$XDG_DATA_HOME/todo/todo.txt")" -eq 1 ]
+	grep -q 'first second$' "$XDG_DATA_HOME/todo/todo.txt"
+}
+
+@test "todo: a todo.txt whose last line has no newline keeps its last task" {
+	export XDG_DATA_HOME="$BATS_TEST_TMPDIR"; mkdir -p "$XDG_DATA_HOME/todo"
+	printf 'old task' > "$XDG_DATA_HOME/todo/todo.txt"
+	printf 'old done' > "$XDG_DATA_HOME/todo/done.txt"
+	./todo "new task" >/dev/null
+	run ./todo ls
+	[[ "${lines[0]}" == *"old task" && "${lines[1]}" == *"new task" ]]
+	./todo done 1 >/dev/null
+	[ "$(sed -n 1p "$XDG_DATA_HOME/todo/done.txt")" = "old done" ]
+	grep -q '^x .* old task$' "$XDG_DATA_HOME/todo/done.txt"
+}
+
+@test "todo: a symlinked todo.txt stays a symlink after done" {
+	export XDG_DATA_HOME="$BATS_TEST_TMPDIR"; mkdir -p "$XDG_DATA_HOME/todo"
+	printf 'a\nb\n' > "$BATS_TEST_TMPDIR/real.txt"
+	ln -s "$BATS_TEST_TMPDIR/real.txt" "$XDG_DATA_HOME/todo/todo.txt"
+	./todo done 1 >/dev/null
+	[ -L "$XDG_DATA_HOME/todo/todo.txt" ]
+	[ "$(cat "$BATS_TEST_TMPDIR/real.txt")" = b ]
+}
+
+@test "todo: a write that fails is an error, not 'added'" {
+	export XDG_DATA_HOME="$BATS_TEST_TMPDIR"; mkdir -p "$XDG_DATA_HOME/todo"
+	: > "$XDG_DATA_HOME/todo/todo.txt"; : > "$XDG_DATA_HOME/todo/done.txt"
+	chmod 400 "$XDG_DATA_HOME/todo/todo.txt"
+	[ -w "$XDG_DATA_HOME/todo/todo.txt" ] && skip "running as root"
+	run ./todo "zzz"
+	[ "$status" -ne 0 ]
+	[[ "$output" != *added* ]]
+}

@@ -13,26 +13,38 @@ case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print;
 
 
 todo_dir="${XDG_DATA_HOME:-$HOME/.local/share}/todo"
-mkdir -p "$todo_dir"
 todo_file="$todo_dir/todo.txt"
 done_file="$todo_dir/done.txt"
-touch "$todo_file" "$done_file"
+mkdir -p "$todo_dir" && touch "$todo_file" "$done_file" || { echo "todo: cannot write in $todo_dir" >&2; exit 1; }
 
-if [ "$1" = "ls" ]; then
+# append one line; a file whose last line has no newline gets one first
+append() {
+	if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then echo >> "$1" || return 1; fi
+	printf '%s\n' "$2" >> "$1"
+}
+
+usage() { echo 'usage: todo "task description"  |  todo ls  |  todo done N' >&2; exit 1; }
+
+if [ $# -eq 1 ] && [ "$1" = "ls" ]; then
 	awk '{ printf "%3d  %s\n", NR, $0 }' "$todo_file"
-elif [ "$1" = "done" ] && [ -n "$2" ]; then
-	line="$(sed -n "${2}p" "$todo_file")"
-	if [ -z "$line" ]; then
+elif [ "$1" = "done" ]; then
+	[ $# -eq 2 ] || usage
+	case $2 in '' | 0* | *[!0-9]*) echo "todo: done wants a task number, got '$2'" >&2; exit 1 ;; esac
+	line="$(awk -v n="$2" 'NR == n { print; f = 1 } END { exit !f }' "$todo_file")" || {
 		echo "no task #$2"
 		exit 1
-	fi
-	echo "x $(date +%Y-%m-%d) $line" >> "$done_file"
-	sed -i "${2}d" "$todo_file"
+	}
+	tmp="$(mktemp "$todo_dir/.todo.XXXXXX")" || exit 1
+	trap 'rm -f "$tmp"' EXIT INT TERM
+	append "$done_file" "x $(date +%Y-%m-%d) $line" || { echo "todo: cannot write $done_file" >&2; exit 1; }
+	# rewrite in place (cat >) so a symlinked todo.txt stays a symlink
+	awk -v n="$2" 'NR != n' "$todo_file" > "$tmp" && cat "$tmp" > "$todo_file" || { echo "todo: cannot write $todo_file" >&2; exit 1; }
 	echo "done: $line"
-elif [ -n "$1" ]; then
-	echo "(B) $(date +%Y-%m-%d) $*" >> "$todo_file"
+elif [ -n "$*" ]; then
+	task="$(printf '%s' "$*" | tr '\n\t\r' '   ')"
+	case $task in *[![:space:]]*) ;; *) usage ;; esac
+	append "$todo_file" "(B) $(date +%Y-%m-%d) $task" || { echo "todo: cannot write $todo_file" >&2; exit 1; }
 	echo "added"
 else
-	echo 'usage: todo "task description"  |  todo ls  |  todo done N' >&2
-	exit 1
+	usage
 fi
