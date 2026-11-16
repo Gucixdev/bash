@@ -374,3 +374,33 @@ setup() {
 	[ -f "$tmp/projects/p/memory/loose.md" ]
 	rm -rf "$tmp"
 }
+
+# --- audit round 2 -------------------------------------------------------
+
+@test "trash: Path in the .trashinfo is percent-encoded, a newline in the name cannot break it" {
+	d=$BATS_TEST_TMPDIR; mkdir -p "$d/w"
+	: > "$d/w/$(printf 'a\nb c%%')"
+	XDG_DATA_HOME="$d/data" run ./trash "$d/w/$(printf 'a\nb c%%')"
+	[ "$status" -eq 0 ]
+	for info in "$d"/data/Trash/info/*; do :; done
+	[ "$(wc -l < "$info")" -eq 3 ]
+	grep -q '^Path=.*/w/a%0Ab%20c%25$' "$info"
+}
+
+@test "trash: a failed move is an error, says so, and leaves no orphan .trashinfo" {
+	d=$BATS_TEST_TMPDIR; mkdir -p "$d/w"
+	XDG_DATA_HOME="$d/data" run ./trash "$d/w/.."
+	[ "$status" -eq 1 ]
+	[[ "$output" != *"trashed:"* ]]
+	[ -z "$(ls -A "$d/data/Trash/info")" ]
+	XDG_DATA_HOME="$d/data" run ./trash "$d/w/nope"
+	[ "$status" -eq 1 ]
+}
+
+@test "trash: -- ends options and a leading-dash name works" {
+	d=$BATS_TEST_TMPDIR; mkdir -p "$d/w"; cd "$d/w"
+	: > ./-x
+	XDG_DATA_HOME="$d/data" run "$BATS_TEST_DIRNAME/../trash" -- -x
+	[ "$status" -eq 0 ]
+	[ -f "$d/data/Trash/files/-x" ]
+}

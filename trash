@@ -5,39 +5,64 @@
 # so GUI file managers see and can restore what this deletes. Does not
 # depend on trash-cli.
 #
-# usage: trash FILE...
+# usage: trash [--] FILE...
+#
+# Exit 1 when any FILE could not be trashed (missing, unwritable, "." or "..").
 
 case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 trash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
 files_dir="$trash_dir/files"
 info_dir="$trash_dir/info"
-mkdir -p "$files_dir" "$info_dir"
+mkdir -p "$files_dir" "$info_dir" || { echo "trash: cannot create $trash_dir" >&2; exit 1; }
 
-if [ -z "$1" ]; then
-	echo "usage: trash FILE..."
+[ "${1:-}" = -- ] && shift
+if [ $# -eq 0 ]; then
+	echo "usage: trash [--] FILE..."
 	exit 1
 fi
 
+# the spec wants Path= percent-encoded: a newline or % in a name must not break the file
+urlencode() {
+	LC_ALL=C awk -v s="$1" 'BEGIN {
+		for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+		n = length(s)
+		for (i = 1; i <= n; i++) {
+			c = substr(s, i, 1)
+			if (c ~ /[A-Za-z0-9._~\/-]/) printf "%s", c
+			else printf "%%%02X", ord[c]
+		}
+	}'
+}
+
+rc=0
 for f in "$@"; do
 	if [ ! -e "$f" ] && [ ! -L "$f" ]; then
-		echo "trash: no such file: $f"
+		echo "trash: no such file: $f" >&2
+		rc=1
 		continue
 	fi
-	base="$(basename "$f")"
+	base="$(basename -- "$f")"
+	case $base in . | .. | /) echo "trash: not trashing $f" >&2; rc=1; continue ;; esac
 	name="$base"
 	n=1
-	while [ -e "$files_dir/$name" ]; do
+	while [ -e "$files_dir/$name" ] || [ -L "$files_dir/$name" ] || [ -e "$info_dir/$name.trashinfo" ]; do
 		n=$((n + 1))
 		name="${base}.$n"
 	done
-	abs="$(cd "$(dirname "$f")" && pwd)/$base"
+	abs="$(cd -- "$(dirname -- "$f")" && pwd)/$base"
 	deleted_at="$(date +%Y-%m-%dT%H:%M:%S)"
 	{
 		echo "[Trash Info]"
-		echo "Path=$abs"
+		echo "Path=$(urlencode "$abs")"
 		echo "DeletionDate=$deleted_at"
-	} > "$info_dir/$name.trashinfo"
-	mv "$f" "$files_dir/$name"
-	echo "trashed: $f"
+	} > "$info_dir/$name.trashinfo" || { echo "trash: cannot write $info_dir/$name.trashinfo" >&2; rc=1; continue; }
+	if mv -- "$f" "$files_dir/$name"; then
+		echo "trashed: $f"
+	else
+		rm -f -- "$info_dir/$name.trashinfo"
+		echo "trash: could not trash $f" >&2
+		rc=1
+	fi
 done
+exit $rc
