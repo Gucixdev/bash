@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# leads - find public posts where someone asks for, or complains about, something you sell, so you can answer by hand.
+# It only READS public search endpoints. It never logs in, never posts, never contacts anyone, needs no keys.
+#
+#   leads run [-n]          ask every source for every query, append NEW hits to leads.tsv (-n: print the requests, send none)
+#   leads list [--min N]    plain table of the leads, newest first, score >= N (default 0)
+#   leads open N            print the url of lead number N (the number in the first column of `leads list`; never opens a browser)
+#   leads --help
+#
+# Queries: ./leads.queries or $LEADS_QUERIES, one per line, SOURCE<TAB>QUERY, lines starting with # are ignored:
+#   hn<TAB>need a fast sqlite viewer
+#   reddit<TAB>alternative to sqlitebrowser
+#   mastodon<TAB>sqlite viewer          first word = hashtag (#sqlite), the other words must all appear in the post
+#   rss<TAB>https://example.org/feed.xml sqlite viewer     feed URL, then the words every item must contain (none = all items)
+#
+# Sources (official/public only, no login, no scraping of HTML pages):
+#   hn        HN Algolia search API, search_by_date, stories and comments. https://hn.algolia.com/api (no auth)
+#   reddit    public search JSON, https://www.reddit.com/search.json?q=..&sort=new. Reddit's API wiki says clients must use OAuth2
+#             and a descriptive User-Agent; anonymous .json access has been reported (not verified) to answer 403 since 2026. On
+#             403/429 leads says so, skips the source and leaves that host alone for Retry-After seconds (default 1 hour). It never
+#             retries and never works around a block. Set LEADS_UA to "<platform>:<app id>:<version> (by /u/<you>)".
+#   mastodon  hashtag timeline of ONE instance, $LEADS_MASTODON (example: mastodon.social; unset = skipped).
+#             GET /api/v1/timelines/tag/:tag needs no token unless the instance disabled public preview (then it answers 401: skipped).
+#             /api/v2/search is NOT used: its status search needs a logged-in user. Boosts are ignored.
+#   rss       any RSS 2.0 or Atom feed URL. Feeds with a DOCTYPE/ENTITY are refused.
+#   x, twitter, facebook, instagram, linkedin: no free official access, a line says so and they are skipped.
+#
+# leads.tsv columns: date (UTC, ISO), source, query, author, url, title/snippet, score 0-100. Dedupe is by url. `list` shows the
+# row number, which is also the N of `leads open N` (stable while you only append).
+#
+# Score (0-100, no ML, read it in score() below):
+#   +25 per need phrase (looking for, anyone know, alternative to, how do I, recommend, is there a, I need, ...), +10 if there
+#       is a question mark, together at most 40
+#   +10 a complaint phrase (frustrated, doesn't work, sick of, too slow, can't find, ...)
+#   +30 times the share of query words found in the title or text (no usable words = 15)
+#   +20 post newer than 1 day, +15 7 days, +10 30 days, +5 90 days
+#   -40 promotional phrase (Show HN, we built, launching, discount, we're hiring, ...), -60 for two or more
+#
+# Politeness: 1 request per second per host (LEADS_DELAY seconds), raw responses cached 1 hour in ./.leads-cache/
+# (LEADS_CACHE_TTL seconds, LEADS_CACHE dir), a 403/429/503+Retry-After blocks that host until the time is up, 5 MB max per answer.
+# Env: LEADS_UA (User-Agent), LEADS_QUERIES, LEADS_TSV (default leads.tsv), LEADS_HITS (results per query, default 30),
+#   LEADS_MASTODON, and for tests/mirrors LEADS_BASE_HN, LEADS_BASE_REDDIT, LEADS_BASE_MASTODON (scheme://host[:port]).
+set -u
+case ${1:-} in -h | --help | '') awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+die() { printf 'leads: %s\n' "$*" >&2; exit 1; }
+command -v python3 > /dev/null || die "python3 is missing (install: pacman -S python / apt install python3)"
+tsv=${LEADS_TSV:-leads.tsv}
+
+read -r -d '' PY << 'PYEOF' || true
+import fcntl, hashlib, html, os, re, sys, time
+import urllib.error, urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import json
+
+E = os.environ
+UA = E.get("LEADS_UA") or "linux:leads-bash:v1 (public lead search, read only; set LEADS_UA)"
+DELAY = float(E.get("LEADS_DELAY", "1"))
+TTL = int(E.get("LEADS_CACHE_TTL", "3600"))
+CACHE = E.get("LEADS_CACHE", ".leads-cache")
+TSV = E.get("LEADS_TSV", "leads.tsv")
+QFILE = E.get("LEADS_QUERIES", "leads.queries")
+HITS = int(E.get("LEADS_HITS", "30"))
+MAXB = 5 * 1024 * 1024
+HEAD = "date\tsource\tquery\tauthor\turl\ttitle\tscore"
+NOACCESS = {"x", "twitter", "facebook", "fb", "instagram", "ig", "linkedin"}
+
+NEED = ["looking for", "anyone know", "anybody know", "does anyone", "does anybody", "alternative to", "alternatives to",
+        "how do i", "how can i", "how to", "recommend", "suggestion", "is there a", "is there any", "need a", "need an",
+        "i need", "wish there", "what do you use", "which tool", "any good", "best way to"]
+PAIN = ["frustrat", "doesn't work", "does not work", "sick of", "tired of", "fed up", "too slow", "too expensive",
+        "can't find", "cannot find", "annoying", "hate", "broken", "struggl"]
+PROMO = ["show hn", "launching", "we built", "i built", "check out my", "check out our", "sign up", "% off", "discount",
+         "use code", "giveaway", "free trial", "we're hiring", "is hiring", "our product", "introducing", "announcing",
+         "now available", "newsletter", "affiliate", "buy now", "limited time"]
+STOP = set("the and for are but not you with that this from have has any how what which can does your our about into".split())
+
+
+class Skip(Exception):
+    pass
+
+
+def clean(s):
+    s = html.unescape(re.sub(r"<[^>]*>", " ", s or ""))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def count(phrases, text):
+    return sum(1 for p in phrases if re.search(r"\b" + re.escape(p), text))
+
+
+def words_of(q):
+    return [w for w in re.findall(r"\w+", q.lower()) if len(w) > 2 and w not in STOP]
+
+
+def score(title, text, ts, words, now):
+    t = (title + " " + text).lower()
+    need = min(40, 25 * count(NEED, t) + (10 if "?" in t else 0))
+    pain = 10 if count(PAIN, t) else 0
+    cov = round(30 * sum(1 for w in words if w in t) / len(words)) if words else 15
+    age = (now - ts) / 86400
+    rec = 20 if age <= 1 else 15 if age <= 7 else 10 if age <= 30 else 5 if age <= 90 else 0
+    n = count(PROMO, t)
+    promo = 0 if n == 0 else -40 if n == 1 else -60
+    return max(0, min(100, need + pain + cov + rec + promo))
+
+
+# ---- sources: build(query) -> (url, accept); parse(body, query) -> [item]; item = dict(ts, author, url, title, text)
+def base(env, default):
+    b = E.get(env) or default
+    return b.rstrip("/")
+
+
+def hn_build(q):
+    b = base("LEADS_BASE_HN", "https://hn.algolia.com")
+    p = urllib.parse.urlencode({"query": q, "tags": "(story,comment)", "hitsPerPage": HITS})
+    return b + "/api/v1/search_by_date?" + p, "application/json"
+
+
+def hn_parse(body, q):
+    out = []
+    for h in json.loads(body)["hits"]:
+        title = h.get("title") or ("Re: " + (h.get("story_title") or ""))
+        out.append(dict(ts=int(h["created_at_i"]), author=h.get("author") or "",
+                        url="https://news.ycombinator.com/item?id=" + str(h["objectID"]),
+                        title=title, text=clean(h.get("story_text") or h.get("comment_text"))))
+    return out
+
+
+def reddit_build(q):
+    b = base("LEADS_BASE_REDDIT", "https://www.reddit.com")
+    p = urllib.parse.urlencode({"q": q, "sort": "new", "limit": min(HITS, 100)})
+    return b + "/search.json?" + p, "application/json"
+
+
+def reddit_parse(body, q):
+    out = []
+    for c in json.loads(body)["data"]["children"]:
+        d = c["data"]
+        out.append(dict(ts=int(d["created_utc"]), author=d.get("author") or "",
+                        url="https://www.reddit.com" + d["permalink"], title=clean(d.get("title")),
+                        text=clean(d.get("selftext"))))
+    return out
+
+
+def masto_tag(q):
+    parts = q.split()
+    tag = re.sub(r"\W", "", parts[0]) if parts else ""
+    if not tag:
+        raise Skip("empty hashtag")
+    return tag, [w.lower() for w in parts[1:]]
+
+
+def masto_build(q):
+    b = E.get("LEADS_BASE_MASTODON") or E.get("LEADS_MASTODON") or ""
+    if not b:
+        raise Skip("LEADS_MASTODON is not set (example: mastodon.social)")
+    if "://" not in b:
+        b = "https://" + b
+    tag, _ = masto_tag(q)
+    return b.rstrip("/") + "/api/v1/timelines/tag/" + urllib.parse.quote(tag) + "?limit=40", "application/json"
+
+
+def iso_ts(s):
+    return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+
+
+def masto_parse(body, q):
+    data = json.loads(body)
+    if not isinstance(data, list):
+        raise ValueError("not a list of statuses")
+    _, more = masto_tag(q)
+    out = []
+    for s in data:
+        if s.get("reblog"):
+            continue
+        text = clean(s.get("content"))
+        if not all(w in text.lower() for w in more):
+            continue
+        out.append(dict(ts=iso_ts(s["created_at"]), author=(s.get("account") or {}).get("acct", ""),
+                        url=s.get("url") or s["uri"], title="", text=text))
+    return out
+
+
+def rss_split(q):
+    p = q.split(None, 1)
+    return (p[0] if p else ""), [w.lower() for w in (p[1].split() if len(p) > 1 else [])]
+
+
+def rss_build(q):
+    url, _ = rss_split(q)
+    if not re.match(r"https?://", url):
+        raise Skip("rss needs a feed URL first, then optional words")
+    return url, "application/rss+xml, application/atom+xml, application/xml, text/xml"
+
+
+def rss_parse(body, q):
+    if re.search(rb"<!(DOCTYPE|ENTITY)", body, re.I):
+        raise ValueError("feed has a DOCTYPE/ENTITY, refused")
+    _, more = rss_split(q)
+    local = lambda t: t.rsplit("}", 1)[-1]
+    out = []
+    for el in ET.fromstring(body).iter():
+        if local(el.tag) not in ("item", "entry"):
+            continue
+        d = {}
+        for ch in el:
+            n = local(ch.tag)
+            if n == "link":
+                if ch.get("href"):
+                    if ch.get("rel") in (None, "alternate"):
+                        d.setdefault("link", ch.get("href"))
+                else:
+                    d.setdefault("link", (ch.text or "").strip())
+            elif n == "author":
+                d.setdefault("author", next((c.text for c in ch if local(c.tag) == "name"), ch.text) or "")
+            elif n in ("title", "description", "summary", "content", "pubDate", "published", "updated", "creator", "date"):
+                d.setdefault(n, "".join(ch.itertext()).strip())
+        raw = d.get("pubDate") or d.get("published") or d.get("updated") or d.get("date") or ""
+        try:
+            ts = int(parsedate_to_datetime(raw).timestamp())
+        except (TypeError, ValueError):
+            try:
+                ts = iso_ts(raw)
+            except ValueError:
+                ts = int(time.time())
+        title = clean(d.get("title"))
+        text = clean(d.get("description") or d.get("summary") or d.get("content"))
+        if not d.get("link") or not all(w in (title + " " + text).lower() for w in more):
+            continue
+        out.append(dict(ts=ts, author=clean(d.get("author") or d.get("creator")), url=d["link"], title=title, text=text))
+    return out
+
+
+SOURCES = {"hn": (hn_build, hn_parse), "reddit": (reddit_build, reddit_parse),
+           "mastodon": (masto_build, masto_parse), "rss": (rss_build, rss_parse)}
+
+
+# ---- cache, blocks, http
+def key(s):
+    return hashlib.sha1(s.encode()).hexdigest()
+
+
+def cache_read(url):
+    p = os.path.join(CACHE, key(url) + ".body")
+    try:
+        if time.time() - os.path.getmtime(p) < TTL:
+            with open(p, "rb") as f:
+                return f.read()
+    except OSError:
+        pass
+    return None
+
+
+def cache_write(url, body):
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(os.path.join(CACHE, key(url) + ".body"), "wb") as f:
+            f.write(body)
+    except OSError as e:
+        print("leads: cache not written: %s" % e, file=sys.stderr)
+
+
+def blocked_until(host):
+    try:
+        with open(os.path.join(CACHE, "block-" + key(host)[:16])) as f:
+            until = float(f.read().split()[0])
+        return until if until > time.time() else 0
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def block(host, secs):
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(os.path.join(CACHE, "block-" + key(host)[:16]), "w") as f:
+            f.write("%d %s\n" % (time.time() + secs, host))
+    except OSError:
+        pass
+
+
+def retry_after(h):
+    v = h.get("Retry-After") if h else None
+    if not v:
+        return None
+    try:
+        return max(0, int(float(v)))
+    except ValueError:
+        try:
+            return max(0, int(parsedate_to_datetime(v).timestamp() - time.time()))
+        except (TypeError, ValueError):
+            return None
+
+
+LAST = {}
+
+
+def http_get(url, accept):
+    host = urllib.parse.urlsplit(url).netloc
+    wait = LAST.get(host, 0) + DELAY - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            res = (r.status, r.read(MAXB + 1), r.headers, None)
+    except urllib.error.HTTPError as e:
+        res = (e.code, b"", e.headers, None)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        res = (None, b"", None, str(getattr(e, "reason", e)))
+    LAST[host] = time.monotonic()
+    return res
+
+
+# ---- run
+def read_queries():
+    try:
+        f = open(QFILE, encoding="utf-8")
+    except OSError:
+        sys.exit("leads: no queries file %s (one per line: SOURCE<TAB>QUERY, e.g. hn<TAB>need a fast sqlite viewer)" % QFILE)
+    out = []
+    with f:
+        for n, line in enumerate(f, 1):
+            line = line.rstrip("\r\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if "\t" not in line:
+                print("leads: %s line %d: need SOURCE<TAB>QUERY, skipped" % (QFILE, n), file=sys.stderr)
+                continue
+            s, q = line.split("\t", 1)
+            out.append((s.strip().lower(), q.strip()))
+    return out
+
+
+def field(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def run(dry):
+    queries = read_queries()
+    seen = set()
+    if os.path.exists(TSV):
+        with open(TSV, encoding="utf-8") as f:
+            for line in f:
+                c = line.rstrip("\n").split("\t")
+                if len(c) >= 5:
+                    seen.add(c[4])
+    if dry:
+        print("dry run: nothing is sent. User-Agent: %s; %gs between requests to one host; cache %s (%ds)" % (UA, DELAY, CACHE, TTL))
+    now = time.time()
+    rows, noted, dead, total = [], set(), set(), 0
+    for src, q in queries:
+        label = "%s %r" % (src, q)
+        if src in NOACCESS:
+            if src not in noted:
+                noted.add(src)
+                print("%s: no free official access (no public API without login or payment), skipped" % src)
+            continue
+        if src not in SOURCES:
+            print("%s: unknown source (hn, reddit, mastodon, rss), skipped" % label)
+            continue
+        build, parse = SOURCES[src]
+        try:
+            url, accept = build(q)
+        except Skip as e:
+            if (src, str(e)) not in noted:
+                noted.add((src, str(e)))
+                print("%s: %s, skipped" % (src, e))
+            continue
+        host = urllib.parse.urlsplit(url).netloc
+        until = blocked_until(host)
+        if host in dead or until:
+            why = "blocked until %s" % datetime.fromtimestamp(until, timezone.utc).strftime("%H:%M:%SZ") if until else "refused earlier in this run"
+            print("%s: %s %s, skipped (no request)" % (label, host, why))
+            continue
+        body = cache_read(url)
+        cached = body is not None
+        if dry:
+            print("GET %s%s" % (url, "   (fresh cache, no request)" if cached else ""))
+            continue
+        if not cached:
+            status, body, hdr, err = http_get(url, accept)
+            if err:
+                dead.add(host)
+                print("%s: request failed (%s), skipped" % (label, err))
+                continue
+            ra = retry_after(hdr)
+            if status in (403, 429) or (status == 503 and ra is not None):
+                secs = min(ra if ra is not None else 3600, 86400)
+                block(host, secs)
+                dead.add(host)
+                print("%s: HTTP %d%s - blocked or rate limited, skipped. Not retrying; %s left alone for %ds" % (
+                    label, status, " (Retry-After %ds)" % ra if ra is not None else "", host, secs))
+                continue
+            if status == 401:
+                dead.add(host)
+                print("%s: HTTP 401 - %s wants a login for this, skipped" % (label, host))
+                continue
+            if status != 200:
+                print("%s: HTTP %s, skipped" % (label, status))
+                continue
+            if len(body) > MAXB:
+                print("%s: answer over 5 MB, skipped" % label)
+                continue
+        try:
+            items = parse(body, q)
+        except (ValueError, KeyError, TypeError, ET.ParseError) as e:
+            print("%s: unexpected response (%s), skipped" % (label, e))
+            continue
+        if not cached:
+            cache_write(url, body)
+        w = words_of(" ".join(rss_split(q)[1]) if src == "rss" else q)
+        new = 0
+        for it in items:
+            if not it["url"] or it["url"] in seen:
+                continue
+            seen.add(it["url"])
+            sc = score(it["title"], it["text"], it["ts"], w, now)
+            shown = field(it["title"] + (" - " if it["title"] and it["text"] else "") + it["text"])[:200]
+            rows.append("\t".join([datetime.fromtimestamp(it["ts"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), src,
+                                   field(q), field(it["author"]), field(it["url"]), shown, str(sc)]))
+            new += 1
+        total += new
+        print("%s: %d hits, %d new%s" % (label, len(items), new, " (cache)" if cached else ""))
+    if dry:
+        return
+    if rows:
+        with open(TSV, "a", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            if f.tell() == 0:
+                f.write(HEAD + "\n")
+            f.write("\n".join(rows) + "\n")
+    print("%d new leads in %s" % (total, TSV))
+
+
+if sys.argv[1:2] == ["run"]:
+    run("-n" in sys.argv[2:])
+PYEOF
+
+cmd_list() {
+	local min=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--min) [[ ${2:-} =~ ^[0-9]+$ ]] || die "--min needs a number 0-100"; min=$2; shift 2 ;;
+			*) die "list: unknown option $1" ;;
+		esac
+	done
+	[ -s "$tsv" ] || { echo "no leads yet (run: leads run)"; return 0; }
+	local w=${COLUMNS:-100}
+	awk -F '\t' -v min="$min" 'NR > 1 && $7 + 0 >= min { printf "%d\t%s\n", NR - 1, $0 }' "$tsv" |
+		sort -s -t "$(printf '\t')" -k2,2r -k8,8nr |
+		awk -F '\t' -v w="$w" '
+			BEGIN { printf "%4s %5s %-10s %-8s %-14s %s\n", "N", "SCORE", "DATE", "SRC", "AUTHOR", "TITLE" ; tw = w - 47; if (tw < 20) tw = 20 }
+			{ printf "%4d %5d %-10s %-8s %-14s %s\n", $1, $8, substr($2, 1, 10), substr($3, 1, 8), substr($5, 1, 14), substr($7, 1, tw) }'
+}
+
+cmd_open() {
+	[[ ${1:-} =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] || die "open: need a lead number (first column of 'leads list')"
+	[ -s "$tsv" ] || die "no leads yet (run: leads run)"
+	awk -F '\t' -v n="$1" 'NR == n + 1 { print $5; f = 1 } END { exit !f }' "$tsv" || die "no lead number $1"
+}
+
+case ${1:-} in
+	run)
+		shift
+		case ${1:-} in '' | -n) ;; *) die "run: unknown option $1" ;; esac
+		python3 -I -c "$PY" run "$@"
+		;;
+	list) shift; cmd_list "$@" ;;
+	open) shift; cmd_open "$@" ;;
+	*) die "unknown command $1 (run, list, open, --help)" ;;
+esac
