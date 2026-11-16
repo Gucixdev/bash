@@ -216,7 +216,7 @@ git_repo() {   # a repo with one commit, in $tmp/work
 	cd "$tmp/work"
 	GH_TOKEN=t run gh grab o/r
 	[ "$status" -eq 0 ]
-	grep -qx 'clone --depth 1 https://github.com/o/r.git r' "$FAKE/gitlog"
+	grep -qx 'clone --depth 1 -- https://github.com/o/r.git r' "$FAKE/gitlog"
 	grep -qx header "$FAKE/gitenv"
 }
 
@@ -487,4 +487,46 @@ git_repo() {   # a repo with one commit, in $tmp/work
 	min_path hf
 	PATH="$tmp/min" run -127 hf auth login
 	[[ "$output" == *"not installed"* ]]
+}
+
+# --- audit round 2
+
+@test "gh grab: a #L10 / ?plain=1 tail on a blob URL is not part of the file name or the fetch" {
+	reply GET https://raw.githubusercontent.com/o/r/main/src/x.c 'int x;'
+	cd "$tmp/work"
+	run gh grab 'https://github.com/o/r/blob/main/src/x.c#L10'
+	[ "$status" -eq 0 ]
+	[ "$(cat x.c)" = 'int x;' ] && [ "$(ls -A)" = x.c ]
+}
+
+@test "gh grab: an empty file in a repo can be grabbed" {
+	reply GET https://raw.githubusercontent.com/o/r/HEAD/__init__.py ''
+	cd "$tmp/work"
+	run gh grab o/r __init__.py
+	[ "$status" -eq 0 ]
+	[ -e __init__.py ] && [ ! -s __init__.py ]
+}
+
+@test "gh grab: -o onto a folder is refused, a missing -o value says so, -- lets a path start with a dash" {
+	reply GET https://raw.githubusercontent.com/o/r/HEAD/f data
+	reply GET https://raw.githubusercontent.com/o/r/HEAD/-w.txt dash
+	cd "$tmp/work"; mkdir d
+	run gh grab o/r f -o d -f
+	[ "$status" -eq 1 ]; [[ "$output" == *folder* ]]; [ -z "$(ls -A d)" ]
+	run gh grab o/r f -o
+	[ "$status" -eq 2 ]; [[ "$output" == *"-o needs"* ]]
+	run gh grab o/r -f -- -w.txt
+	[ "$status" -eq 0 ]; [ "$(cat ./-w.txt)" = dash ]
+}
+
+@test "gh remove: a profile URL without a repo is not taken for one of your repos" {
+	GH_ME=me run sh -c 'echo someone | gh remove https://github.com/someone'
+	[ "$status" -ne 0 ]; [[ "$output" == *"names no repo"* ]]
+	! grep -q . "$FAKE/log" 2>/dev/null
+}
+
+@test "gh create: an empty or odd organisation part is refused before asking GitHub" {
+	run gh create /x; [ "$status" -eq 1 ]; [[ "$output" == *organisation* ]]
+	run gh create 'a?b/x'; [ "$status" -eq 1 ]
+	[ ! -s "$FAKE/log" ]
 }

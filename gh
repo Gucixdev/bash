@@ -407,14 +407,18 @@ me() {   # -> your login
 }
 
 full() {   # REPO, URL or NAME -> OWNER/NAME
-	_f=$1
+	_f=$1 _url=0
 	case $_f in
-		*github.com/*) _f=${_f#*github.com/} ;;
-		git@github.com:*) _f=${_f#git@github.com:} ;;
+		*github.com/*) _f=${_f#*github.com/} _url=1 ;;
+		git@github.com:*) _f=${_f#git@github.com:} _url=1 ;;
 	esac
 	_f=${_f%%[?#]*}
 	case $_f in
 		'' | /*) echo "gh: '$1' is not a repo" >&2; return 1 ;;
+		*/*) ;;
+		*) [ "$_url" = 0 ] || { echo "gh: '$1' names no repo (OWNER/NAME)" >&2; return 1; } ;;
+	esac
+	case $_f in
 		*/*) _o=${_f%%/*}; _n=${_f#*/}; _n=${_n%%/*}; printf '%s/%s\n' "$_o" "${_n%.git}" ;;
 		*) _o=$(me) || return 1; printf '%s/%s\n' "$_o" "${_f%.git}" ;;
 	esac
@@ -454,12 +458,14 @@ repo_card() {   # a repo (JSON) -> a few lines about it
 # ---- commands --------------------------------------------------------------------------------------------
 # options may come before or after the positional arguments; sets out, force, n, a1..a3
 grab_args() {
-	out= force=0 n=0 a1= a2= a3=
+	out= force=0 n=0 a1= a2= a3= _dd=0
 	while [ $# -gt 0 ]; do
 		case $1 in
-			-o) [ $# -ge 2 ] || return 2; out=$2; shift ;;
+			--) if [ "$_dd" = 0 ]; then _dd=1; shift; continue; fi; n=$((n + 1)); case $n in 1) a1=$1 ;; 2) a2=$1 ;; 3) a3=$1 ;; esac ;;
+			-o) [ $# -ge 2 ] || { echo "gh: -o needs a file name" >&2; return 2; }; out=$2; shift ;;
 			-f) force=1 ;;
-			-?*) echo "gh: unknown option $1" >&2; return 2 ;;
+			-?*) if [ "$_dd" = 1 ]; then n=$((n + 1)); case $n in 1) a1=$1 ;; 2) a2=$1 ;; 3) a3=$1 ;; esac
+			     else echo "gh: unknown option $1" >&2; return 2; fi ;;
 			*) n=$((n + 1)); case $n in 1) a1=$1 ;; 2) a2=$1 ;; 3) a3=$1 ;; esac ;;
 		esac
 		shift
@@ -475,8 +481,8 @@ grab() {
 			grabdir "$@"; return ;;
 		*github.com/*/blob/*)
 			_r=${a1#*github.com/}; _o=${_r%%/*}; _r=${_r#*/}; _n=${_r%%/*}; _r=${_r#*/blob/}
-			url="$RAW/$_o/$_n/$_r" ;;
-		https://raw.githubusercontent.com/* | https://github.com/*/raw/*) url=$a1 ;;
+			url="$RAW/$_o/$_n/${_r%%[?#]*}" ;;
+		https://raw.githubusercontent.com/* | https://github.com/*/raw/*) url=${a1%%#*} ;;
 		*)
 			r=$(full "$a1") || exit 2
 			[ -n "$a2" ] || { clone "$r" "$out"; return; }
@@ -484,6 +490,7 @@ grab() {
 	esac
 
 	[ -n "$out" ] || out=$(basename -- "${url%%\?*}")
+	case $out in -?*) out=./$out ;; esac   # a name with a leading dash is a file, not an option of mv
 	if [ "$out" != - ] && [ -e "$out" ] && [ "$force" -ne 1 ]; then
 		echo "gh: $out exists (use -f to overwrite)" >&2; exit 1
 	fi
@@ -492,7 +499,8 @@ grab() {
 		return 0
 	fi
 	tmp="$out.gh.$$"
-	if fetch "$url" >"$tmp" && [ -s "$tmp" ]; then
+	[ ! -d "$out" ] || { echo "gh: $out is a folder" >&2; exit 1; }
+	if fetch "$url" >"$tmp"; then
 		mv -f "$tmp" "$out" && echo "$out"
 	else
 		rm -f "$tmp"
@@ -505,7 +513,7 @@ clone() {   # OWNER/NAME [DEST] -> a shallow clone
 	have git || die "a whole repo needs git (pacman -S git); one file works without it: gh grab $1 PATH"
 	_d=${2:-${1##*/}}
 	[ -e "$_d" ] && die "$_d exists"
-	gitauth clone --depth 1 "$WEB/$1.git" "$_d"
+	gitauth clone --depth 1 -- "$WEB/$1.git" "$_d"
 }
 
 grabdir() {
@@ -570,7 +578,10 @@ create() {
 	[ -n "$name" ] || [ -z "$top" ] || name=$(basename -- "$top")
 	[ -n "$name" ] || usage "create NAME [--public] [-d DESCRIPTION]   (NAME defaults to the git repo you are in)"
 	path=user/repos
-	case $name in */*) path=orgs/${name%%/*}/repos; name=${name#*/} ;; esac
+	case $name in
+		*/*) _org=${name%%/*}; case $_org in '' | *[!A-Za-z0-9-]*) die "'$_org' is not an organisation name" ;; esac
+		     path=orgs/$_org/repos; name=${name#*/} ;;
+	esac
 	case $name in *[!A-Za-z0-9._-]*) die "'$name' is not a repo name (letters, digits, . _ -)" ;; esac
 	priv=true vis=private
 	[ "$pub" = 1 ] && priv=false vis=public
