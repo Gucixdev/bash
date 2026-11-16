@@ -13,10 +13,15 @@
 #   agx clean [NAME]           move the cache (or one entry) to the trash
 #   agx path NAME              the cache directory of NAME
 #   agx mcp NAME               print the line that registers NAME as an MCP server in Claude Code
+#   agx skill install NAME     link a skill (kind skill) into ~/.claude/skills; fetches it first, never overwrites a folder
+#   agx skill list|remove NAME the skills agx linked / move that link to the trash
 #
 # Kinds: npm (SOURCE = package or local dir, REF = version), pip (SOURCE = package or path, REF = version),
 #   git (SOURCE = repo URL, REF = tag/branch/commit, CMD = shell command run with AGX_DIR set, SETUP = command run once in the checkout),
 #   url (SOURCE = download, REF = sha256 REQUIRED, the file becomes the command).
+#   skill (SOURCE = repo URL, REF = commit/tag (pin it), CMD = folder of the skill inside the repo, holds SKILL.md; SETUP is
+#   only printed after install, never run: a skill's own scripts are third-party code that you start when you need them).
+#   AGX_SKILLS_DIR moves the target of `agx skill install` (default ~/.claude/skills).
 # Registry rows are tab-separated: name kind source ref cmd desc setup. Yours: ${XDG_CONFIG_HOME:-~/.config}/agx/registry.tsv
 # (first match wins, yours before the built-in ones). REF "latest" or empty = whatever is newest at the first fetch.
 # Safety: nothing is fetched or run for the first time without a "y" (-y or AGX_YES=1 skips it; without a terminal it is required).
@@ -39,6 +44,14 @@ memory	npm	@modelcontextprotocol/server-memory	latest		knowledge-graph memory
 sequential-thinking	npm	@modelcontextprotocol/server-sequential-thinking	latest		step-by-step reasoning tool
 fetch	pip	mcp-server-fetch	latest		fetch a URL as text
 git	pip	mcp-server-git	latest		git repository tools
+reanimate	skill	https://github.com/NiazMorshed2007/reanimate	3f7a55a2986a84ca2173e86ee9127eefe31d046d	skills/reanimate	skill: copy an animation from a site, video or Lottie frame by frame (needs bun; first use downloads ffmpeg and Chromium, ~250 MB)	bash skills/reanimate/scripts/setup.sh
+figma-use	skill	https://github.com/figma/mcp-server-guide	5f3024c3decd83ff6f0bfb3ef36a2c4cfbff961d	skills/figma-use	skill (Figma): required before every use_figma call; needs the Figma MCP server and an account
+figma-design-to-code	skill	https://github.com/figma/mcp-server-guide	5f3024c3decd83ff6f0bfb3ef36a2c4cfbff961d	skills/figma-design-to-code	skill (Figma): implement a Figma design as code; needs the Figma MCP server
+figma-generate-design	skill	https://github.com/figma/mcp-server-guide	5f3024c3decd83ff6f0bfb3ef36a2c4cfbff961d	skills/figma-generate-design	skill (Figma): build a design in a Figma file; needs the Figma MCP server
+firecrawl	skill	https://github.com/firecrawl/skills	1d4b0728d0f448cafef2eb8370c907fde7cb6f42	skills/core/firecrawl	skill (Firecrawl): web search, scrape, crawl, browser; needs FIRECRAWL_API_KEY
+firecrawl-scrape	skill	https://github.com/firecrawl/skills	1d4b0728d0f448cafef2eb8370c907fde7cb6f42	skills/core/firecrawl-scrape	skill (Firecrawl): scrape one page to markdown; needs FIRECRAWL_API_KEY
+firecrawl-search	skill	https://github.com/firecrawl/skills	1d4b0728d0f448cafef2eb8370c907fde7cb6f42	skills/core/firecrawl-search	skill (Firecrawl): web search with content; needs FIRECRAWL_API_KEY
+firecrawl-crawl	skill	https://github.com/firecrawl/skills	1d4b0728d0f448cafef2eb8370c907fde7cb6f42	skills/core/firecrawl-crawl	skill (Firecrawl): crawl a whole site; needs FIRECRAWL_API_KEY
 R
 }
 
@@ -99,14 +112,27 @@ fetch_pip() {
 	printf '%s\n' "$1/venv/bin/$bin" > "$1/.cmd"
 }
 
-fetch_git() {	# fetch_git DIR SOURCE REF CMD SETUP
-	need git git; [ -n "$4" ] || die "a git row needs a CMD (what to run inside the checkout)"
+git_checkout() {	# git_checkout DIR SOURCE REF: a shallow checkout of REF in DIR/src, log in DIR/.log
+	need git git
 	[ -z "${AGX_OFFLINE:-}" ] || case $2 in /* | file://*) ;; *) die "AGX_OFFLINE is set and $2 is remote" ;; esac
 	local s="$1/src"; mkdir -p "$s"
 	( cd "$s" && git init -q && git remote add origin "$2" && git fetch -q --depth 1 origin "${3:-HEAD}" && git -c advice.detachedHead=false checkout -q FETCH_HEAD ) > "$1/.log" 2>&1 \
 		|| { tail -5 "$1/.log" >&2; die "git fetch of $2 ${3:-HEAD} failed"; }
-	[ -z "${5:-}" ] || ( cd "$s" && bash -c "$5" ) >> "$1/.log" 2>&1 || { tail -5 "$1/.log" >&2; die "setup command failed (log: $1/.log)"; }
+}
+
+fetch_git() {	# fetch_git DIR SOURCE REF CMD SETUP
+	[ -n "$4" ] || die "a git row needs a CMD (what to run inside the checkout)"
+	git_checkout "$1" "$2" "$3"
+	[ -z "${5:-}" ] || ( cd "$1/src" && bash -c "$5" ) >> "$1/.log" 2>&1 || { tail -5 "$1/.log" >&2; die "setup command failed (log: $1/.log)"; }
 	printf 'bash -c %q agx\n' "$4 \"\$@\"" > "$1/.cmd"
+}
+
+fetch_skill() {	# fetch_skill DIR SOURCE REF SUBDIR: the checkout, then proof that SUBDIR/SKILL.md is there
+	[ -n "$4" ] || die "a skill row needs a CMD (the folder of the skill inside the repo)"
+	case $4 in /* | *..*) die "the skill folder '$4' must stay inside the repo" ;; esac
+	git_checkout "$1" "$2" "$3"
+	[ -f "$1/src/$4/SKILL.md" ] || die "$4/SKILL.md is not in $2 ${3:-HEAD}"
+	printf '%s\n' "$1/src/$4" > "$1/.cmd"
 }
 
 fetch_url() {
@@ -136,7 +162,8 @@ ensure() {	# ensure NAME -> prints nothing; the command line is in $home/NAME/.c
 	pip) fetch_pip "$d" "$src" "$ref" "$cmd" ;;
 	git) fetch_git "$d" "$src" "$ref" "$cmd" "$setup" ;;
 	url) fetch_url "$d" "$src" "$ref" "$cmd" ;;
-	*) die "unknown kind '$kind' in the row for $1 (npm pip git url)" ;;
+	skill) fetch_skill "$d" "$src" "$ref" "$cmd" ;;
+	*) die "unknown kind '$kind' in the row for $1 (npm pip git url skill)" ;;
 	esac
 	date +%s > "$d/.ok"
 }
@@ -144,6 +171,7 @@ ensure() {	# ensure NAME -> prints nothing; the command line is in $home/NAME/.c
 run() {
 	[ $# -ge 1 ] || die "run needs a NAME"
 	local n=$1; shift
+	[ "$(field 2 "$(row "$n")")" != skill ] || die "$n is a skill, not a program: agx skill install $n"
 	ensure "$n" || exit 1
 	export AGX_DIR=$home/$n
 	local c; c=$(cat "$AGX_DIR/.cmd")
@@ -165,7 +193,7 @@ info)
 	if cached "$2"; then printf 'cache\t%s (fetched %s)\ncommand\t%s\n' "$home/$2" "$(date -d "@$(cat "$home/$2/.ok")" '+%F %T')" "$(cat "$home/$2/.cmd")"; else printf 'cache\t-\n'; fi ;;
 add)
 	[ $# -ge 4 ] || die "usage: agx add NAME KIND SOURCE [REF [CMD [DESC [SETUP]]]]"
-	case $3 in npm | pip | git | url) ;; *) die "kind must be npm, pip, git or url" ;; esac
+	case $3 in npm | pip | git | url | skill) ;; *) die "kind must be npm, pip, git, url or skill" ;; esac
 	mkdir -p "$(dirname "$userreg")" || die "cannot make the registry directory"
 	t=$(mktemp "$userreg.XXXXXX") || die "mktemp failed"
 	{ [ -r "$userreg" ] && awk -F '\t' -v n="$2" '$1 != n' "$userreg"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "${5:-latest}" "${6:-}" "${7:-}" "${8:-}"; } > "$t" && mv -- "$t" "$userreg"
@@ -180,6 +208,29 @@ clean)
 	if [ -n "${2:-}" ]; then [ -d "$home/$2" ] || die "$2 is not cached"; totrash "$home/$2"
 	else [ -d "$home" ] && for d in "$home"/*/; do [ -d "$d" ] && totrash "${d%/}"; done; fi
 	echo "agx: cache moved to $(trashdir)" ;;
+skill)
+	sd=${AGX_SKILLS_DIR:-$HOME/.claude/skills}
+	case ${2:-} in
+	install)
+		n=${3:?skill install needs a NAME}; r=$(row "$n"); [ "$(field 2 "$r")" = skill ] || die "'$n' is not a skill row (agx list)"
+		ensure "$n" || exit 1
+		src=$(cat "$home/$n/.cmd"); t=$sd/$(basename "$src")
+		if [ -L "$t" ] && [ "$(readlink "$t")" = "$src" ]; then echo "agx: $n is already linked: $t"
+		else
+			[ ! -e "$t" ] && [ ! -L "$t" ] || die "$t exists and is not agx's link; move it away first"
+			mkdir -p "$sd" && ln -s "$src" "$t" || die "cannot link $t"
+			echo "agx: $t -> $src"
+		fi
+		[ -z "$(field 7 "$r")" ] || echo "agx: the skill needs a one-time setup, not run for you: cd $src && $(field 7 "$r")" ;;
+	list)
+		[ -d "$sd" ] || exit 0
+		for l in "$sd"/*; do [ -L "$l" ] && case $(readlink "$l") in "$home"/*) printf '%s\t%s\n' "$(basename "$l")" "$(readlink "$l")" ;; esac; done ;;
+	remove)
+		n=${3:?skill remove needs a NAME}; r=$(row "$n"); [ "$(field 2 "$r")" = skill ] || die "'$n' is not a skill row"
+		t=$sd/$(basename "$(field 5 "$r")"); [ -L "$t" ] && case $(readlink "$t") in "$home"/*) ;; *) false ;; esac || die "$t is not a link made by agx"
+		d=$(trashdir); mkdir -p "$d" && mv -- "$t" "$d/agx-skill-$(basename "$t")-$(date +%s)" && echo "agx: link $t moved to the trash (the cache stays)" ;;
+	*) die "usage: agx skill install|list|remove NAME" ;;
+	esac ;;
 path) printf '%s\n' "$home/${2:?path needs a NAME}" ;;
 mcp)
 	n=${2:?mcp needs a NAME}; [ -n "$(row "$n")" ] || die "no row for $n"

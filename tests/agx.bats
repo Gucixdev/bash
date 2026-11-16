@@ -2,7 +2,7 @@
 # agx against a real local npm package and a real local git repo (no network); pip and url against fakes.
 
 setup() {
-	cd "$BATS_TEST_DIRNAME/.."
+	cd "$BATS_TEST_DIRNAME/.." || return
 	T=$BATS_TEST_TMPDIR
 	export AGX_HOME=$T/cache AGX_REGISTRY=$T/reg.tsv XDG_DATA_HOME=$T/data HOME=$T/home
 	mkdir -p "$HOME" "$T/pkg/bin" "$T/repo"
@@ -90,7 +90,7 @@ U
 	AGX_YES=1 ./agx run hello > /dev/null
 	run ./agx clean hello
 	[ ! -e "$AGX_HOME/hello" ]
-	ls "$XDG_DATA_HOME/Trash/files" | grep -q agx-hello
+	compgen -G "$XDG_DATA_HOME/Trash/files/agx-hello*" > /dev/null
 	./agx remove hello > /dev/null
 	run ./agx info hello
 	[[ "$output" == *"no row"* ]]
@@ -100,4 +100,74 @@ U
 	run ./agx nonsense-name < /dev/null
 	[ "$status" -ne 0 ]
 	[[ "$output" == *"no registry row"* ]]
+}
+
+skillrepo() {
+	mkdir -p "$T/skrepo/skills/foo/scripts" "$T/skrepo/skills/foo/refs"
+	printf -- '---\nname: foo\ndescription: test skill\n---\nbody\n' > "$T/skrepo/skills/foo/SKILL.md"
+	printf 'echo hi\n' > "$T/skrepo/skills/foo/scripts/setup.sh"
+	git -C "$T/skrepo" init -q && git -C "$T/skrepo" add . && git -C "$T/skrepo" -c user.name=t -c user.email=t@t commit -qm skill
+	export AGX_SKILLS_DIR=$T/skills
+	./agx add foo skill "$T/skrepo" HEAD skills/foo "a skill" 'bash scripts/setup.sh' > /dev/null
+}
+
+@test "agx skill: install fetches the pinned checkout and links it, never runs the setup" {
+	skillrepo
+	run env AGX_YES=1 ./agx skill install foo
+	[ "$status" -eq 0 ]
+	[ -f "$AGX_SKILLS_DIR/foo/SKILL.md" ]
+	[ -L "$AGX_SKILLS_DIR/foo" ]
+	[[ "$output" == *"one-time setup, not run for you"* ]]
+	run ./agx skill list
+	[[ "$output" == foo* ]]
+	run env AGX_YES=1 ./agx skill install foo
+	[[ "$output" == *"already linked"* ]]
+}
+
+@test "agx skill: an existing folder is never overwritten, a wrong subfolder is refused" {
+	skillrepo
+	mkdir -p "$AGX_SKILLS_DIR/foo"; echo mine > "$AGX_SKILLS_DIR/foo/SKILL.md"
+	run env AGX_YES=1 ./agx skill install foo
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"exists and is not agx's link"* ]]
+	[ "$(cat "$AGX_SKILLS_DIR/foo/SKILL.md")" = mine ]
+	./agx add bad skill "$T/skrepo" HEAD skills/nothere > /dev/null
+	run env AGX_YES=1 ./agx skill install bad
+	[[ "$output" == *"SKILL.md is not in"* ]]
+	./agx add esc skill "$T/skrepo" HEAD ../../etc > /dev/null
+	run env AGX_YES=1 ./agx skill install esc
+	[[ "$output" == *"must stay inside the repo"* ]]
+}
+
+@test "agx skill: remove moves only agx's own link to the trash; run refuses a skill" {
+	skillrepo
+	AGX_YES=1 ./agx skill install foo > /dev/null
+	run ./agx foo
+	[[ "$output" == *"is a skill, not a program"* ]]
+	run ./agx skill remove foo
+	[ "$status" -eq 0 ]
+	[ ! -e "$AGX_SKILLS_DIR/foo" ]
+	compgen -G "$XDG_DATA_HOME/Trash/files/agx-skill-foo*" > /dev/null
+	[ -d "$AGX_HOME/foo/src/skills/foo" ]
+	run ./agx skill remove foo
+	[ "$status" -ne 0 ]
+}
+
+@test "agx skill: the built-in reanimate row is pinned to a commit" {
+	run ./agx info reanimate
+	[[ "$output" == *"kind"*"skill"* ]]
+	[[ "$output" =~ ref[[:space:]]+[0-9a-f]{40} ]]
+}
+
+@test "agx: every built-in skill row is pinned to a full commit and names a folder" {
+	run ./agx list
+	n=0
+	while IFS=$'\t' read -r name kind _; do
+		[ "$kind" = skill ] || continue
+		n=$((n + 1))
+		info=$(./agx info "$name")
+		[[ $info =~ ref[[:space:]]+[0-9a-f]{40} ]] || { echo "unpinned: $name"; false; }
+		[[ $info =~ cmd[[:space:]]+skills/ ]] || { echo "no folder: $name"; false; }
+	done <<< "$output"
+	[ "$n" -ge 8 ]
 }
