@@ -13,22 +13,25 @@
 
 case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
+# roff-safe text: backslashes doubled, a leading . or ' cannot start a request
+rq() { printf '%s\n' "$1" | sed -e 's/\\/\\\\/g' -e 's/^\./\\\&./' -e "s/^'/\\\\\\&'/"; }
+
 # page OUT NAME SECTION DESC BODYFILE [FLAG:desc]...
 page() {
 	out=$1 name=$2 section=$3 desc=$4 bodyf=$5
 	shift 5
 	upper="$(printf %s "$name" | tr '[:lower:]' '[:upper:]')"
 	{
-		printf '.TH %s %s "%s" "" ""\n' "$upper" "$section" "$(date +%Y-%m-%d)"
-		printf '.SH NAME\n%s \\- %s\n.SH SYNOPSIS\n' "$name" "$desc"
+		printf '.TH "%s" "%s" "%s" "" ""\n' "$upper" "$section" "$(date +%Y-%m-%d)"
+		printf '.SH NAME\n%s \\- %s\n.SH SYNOPSIS\n' "$(rq "$name")" "$(rq "$desc")"
 		if [ "$#" -eq 0 ]; then
-			printf '.B %s\n' "$name"
+			printf '.B %s\n' "$(rq "$name")"
 		else
 			first=1
 			for spec in "$@"; do
 				[ "$first" -eq 1 ] || printf '.br\n'
 				first=0
-				printf '.B %s %s\n' "$name" "${spec%%:*}"
+				printf '.B %s %s\n' "$(rq "$name")" "$(rq "${spec%%:*}")"
 			done
 		fi
 		printf '.SH DESCRIPTION\n'
@@ -42,7 +45,7 @@ page() {
 		if [ "$#" -gt 0 ]; then
 			printf '.SH OPTIONS\n'
 			for spec in "$@"; do
-				printf '.TP\n.B %s\n%s\n' "${spec%%:*}" "${spec#*:}"
+				printf '.TP\n.B %s\n%s\n' "$(rq "${spec%%:*}")" "$(rq "${spec#*:}")"
 			done
 		fi
 	} > "$out"
@@ -52,7 +55,13 @@ usage() {
 	awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
-if [ "$1" = new ]; then
+bad_section() { case $1 in [0-9]*) case $1 in *[!A-Za-z0-9]*) return 0 ;; esac; return 1 ;; esac; return 0; }
+write_page() { # OUT NAME SECTION DESC BODYFILE [FLAG:desc]... ; says so and fails when OUT cannot be written
+	local out=$1
+	page "$@" || { echo "manwriter: cannot write $out" >&2; return 1; }
+}
+
+if [ "${1:-}" = new ]; then
 	shift
 	if [ "$#" -lt 3 ]; then
 		echo 'usage: manwriter new NAME SECTION "description" ["FLAG:desc" ...]' >&2
@@ -60,22 +69,29 @@ if [ "$1" = new ]; then
 	fi
 	name=$1 section=$2 desc=$3
 	shift 3
-	page "$name.$section" "$name" "$section" "$desc" "" "$@"
+	case $name in '' | -* | *[!A-Za-z0-9._+-]*) echo "manwriter: bad page name '$name'" >&2; exit 2 ;; esac
+	bad_section "$section" && { echo "manwriter: bad section '$section' (1..9 plus letters, e.g. 1 or 3p)" >&2; exit 2; }
+	write_page "$name.$section" "$name" "$section" "$desc" "" "$@" || exit 1
 	echo "$name.$section"
 	exit 0
 fi
 
+# options may come before or after the files
 dir="."
 section=1
-while getopts d:s:h opt; do
-	case "$opt" in
-	d) dir="$OPTARG" ;;
-	s) section="$OPTARG" ;;
-	h) usage; exit 0 ;;
-	*) exit 2 ;;
+files=()
+while [ "$#" -gt 0 ]; do
+	case $1 in
+	-d) [ "$#" -ge 2 ] || { echo "manwriter: -d needs a directory" >&2; exit 2; }; dir=$2; shift 2 ;;
+	-s) [ "$#" -ge 2 ] || { echo "manwriter: -s needs a section" >&2; exit 2; }; section=$2; shift 2 ;;
+	-h) usage; exit 0 ;;
+	--) shift; files+=("$@"); break ;;
+	-?*) echo "manwriter: unknown option $1" >&2; exit 2 ;;
+	*) files+=("$1"); shift ;;
 	esac
 done
-shift $((OPTIND - 1))
+bad_section "$section" && { echo "manwriter: bad section '$section' (1..9 plus letters, e.g. 1 or 3p)" >&2; exit 2; }
+set -- "${files[@]}"
 
 if [ "$#" -eq 0 ]; then
 	usage >&2
@@ -84,7 +100,9 @@ fi
 
 mkdir -p "$dir" || exit 1
 tmp="$(mktemp -d)" || exit 1
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 rc=0
 for f in "$@"; do
@@ -106,7 +124,10 @@ for f in "$@"; do
 	while IFS= read -r l; do
 		set -- "$@" "$l"
 	done < "$tmp/flags"
-	page "$dir/$n.$section" "$n" "$section" "$desc" "$tmp/body" "$@"
-	echo "$dir/$n.$section"
+	if write_page "$dir/$n.$section" "$n" "$section" "$desc" "$tmp/body" "$@"; then
+		echo "$dir/$n.$section"
+	else
+		rc=1
+	fi
 done
 exit "$rc"

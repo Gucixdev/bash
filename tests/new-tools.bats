@@ -591,3 +591,52 @@ morph_path() {
 	[ ! -e "$BATS_TEST_TMPDIR/o.html" ]
 	[ -z "$(ls -A "$BATS_TEST_TMPDIR" | grep -v -e '^bin$' -e '^in.md$')" ]
 }
+
+mw_script() {
+	cat > "$BATS_TEST_TMPDIR/t1" <<'SH'
+#!/usr/bin/env bash
+# t1 - does \things
+#
+# @flag -x:.TH evil
+# @flag -y:'quoted start
+# usage: t1 [-x]
+echo
+SH
+}
+
+@test "manwriter: options after the files are honoured" {
+	mw_script
+	run ./manwriter "$BATS_TEST_TMPDIR/t1" -d "$BATS_TEST_TMPDIR/out" -s 8
+	[ "$status" -eq 0 ]
+	[ -f "$BATS_TEST_TMPDIR/out/t1.8" ]
+}
+
+@test "manwriter: a section that is not a section cannot walk out of the folder" {
+	mw_script
+	mkdir -p "$BATS_TEST_TMPDIR/out/t1.1"
+	run ./manwriter -d "$BATS_TEST_TMPDIR/out" -s '1/../../esc' "$BATS_TEST_TMPDIR/t1"
+	[ "$status" -eq 2 ]
+	[ ! -e "$BATS_TEST_TMPDIR/esc" ]
+	run ./manwriter new a/b 1 desc
+	[ "$status" -eq 2 ]
+}
+
+@test "manwriter: a folder it cannot write to is an error and prints no path" {
+	mw_script
+	mkdir "$BATS_TEST_TMPDIR/ro"; chmod 500 "$BATS_TEST_TMPDIR/ro"
+	[ -w "$BATS_TEST_TMPDIR/ro" ] && skip "running as root"
+	run ./manwriter -d "$BATS_TEST_TMPDIR/ro" "$BATS_TEST_TMPDIR/t1"
+	chmod 700 "$BATS_TEST_TMPDIR/ro"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"cannot write"* ]]
+	for l in "${lines[@]}"; do [ "$l" != "$BATS_TEST_TMPDIR/ro/t1.1" ]; done
+}
+
+@test "manwriter: option text starting with . or ' and backslashes cannot become roff requests" {
+	mw_script
+	./manwriter -d "$BATS_TEST_TMPDIR" "$BATS_TEST_TMPDIR/t1" >/dev/null
+	! grep -q '^\.TH evil' "$BATS_TEST_TMPDIR/t1.1"
+	grep -q '^\\&\.TH evil' "$BATS_TEST_TMPDIR/t1.1"
+	grep -q '^\\&'"'"'quoted start' "$BATS_TEST_TMPDIR/t1.1"
+	grep -q 'does \\\\things' "$BATS_TEST_TMPDIR/t1.1"
+}
