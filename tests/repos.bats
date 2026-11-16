@@ -203,3 +203,49 @@ here() {
 	run "$R" pull
 	[ -f "$REPOS_ROOT/b/g" ]
 }
+
+@test "-i: 0, a non-number or a number out of range chooses nothing and is a usage error" {
+	mk a
+	mk b
+	for in in 0 abc 9 '*'; do
+		run bash -c "printf '%s\n' '$in' | '$R' -i status"
+		[ "$status" -eq 2 ]
+		[[ $output != *"in sync"* ]]
+	done
+	run bash -c "printf '2\n' | '$R' -i status"
+	[ "$status" -eq 0 ]
+	[[ $output == *"b "*"in sync"* && $output != *"a "*"in sync"* ]]
+}
+
+@test "a core.sshCommand of the repo is not overridden by the tool's own GIT_SSH_COMMAND" {
+	mk a
+	unset GIT_SSH_COMMAND
+	git -C "$REPOS_ROOT/a" remote set-url origin ssh://git@127.0.0.1:1/x.git
+	printf '#!/bin/sh\necho used >> "%s/ssh.log"\nexit 255\n' "$T" > "$T/fakessh"
+	chmod +x "$T/fakessh"
+	git -C "$REPOS_ROOT/a" config core.sshCommand "$T/fakessh"
+	run "$R" fetch a
+	[ "$status" -eq 1 ]
+	grep -q used "$T/ssh.log"
+}
+
+@test "pull: a needmerge branch that cannot be moved is a failure, not silence" {
+	mk a
+	here a x x
+	elsewhere a y y
+	run "$R" pull a
+	elsewhere a z z
+	git -C "$REPOS_ROOT/a" worktree add -q "$T/wt" needmerge/main
+	run "$R" pull a
+	[ "$status" -eq 1 ]
+	[[ $output == *FAILED* ]]
+}
+
+@test "options may come before the command" {
+	mk a
+	elsewhere a g new
+	run "$R" -n pull a
+	[ "$status" -eq 0 ]
+	[[ $output == *"would fast-forward"* ]]
+	[ ! -f "$REPOS_ROOT/a/g" ]
+}

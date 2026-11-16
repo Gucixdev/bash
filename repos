@@ -25,8 +25,6 @@ case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print;
 root=${REPOS_ROOT:-/data/dev/github}
 yes=0 dry=0 pick=0 rc=0
 export GIT_TERMINAL_PROMPT=0
-: "${GIT_SSH_COMMAND:=ssh -o BatchMode=yes -o ConnectTimeout=15}"
-export GIT_SSH_COMMAND
 
 die() { printf 'repos: %s\n' "$*" >&2; exit 2; }
 say() { printf '%-18s %s\n' "$1" "$2"; }
@@ -49,12 +47,19 @@ choose_repos() {
 		if command -v fzf > /dev/null && [ -t 0 ]; then
 			all_repos | fzf --multi --prompt='repos> ' || true
 		else
-			local names i=0 line
+			local names i=0 line nums
 			mapfile -t names < <(all_repos)
 			for n in "${names[@]}"; do i=$((i + 1)); printf '%3d %s\n' "$i" "$n" >&2; done
 			printf 'numbers, space separated (empty = all): ' >&2
 			read -r line || line=""
-			if [ -z "$line" ]; then printf '%s\n' "${names[@]}"; else for i in $line; do echo "${names[$((i - 1))]:-}"; done; fi
+			read -r -a nums <<< "$line"
+			if [ ${#nums[@]} -eq 0 ]; then printf '%s\n' "${names[@]}"
+			else
+				for i in "${nums[@]}"; do
+					[[ $i =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "${#names[@]}" ] || die "'$i' is not one of the numbers 1-${#names[@]}"
+					echo "${names[$((i - 1))]}"
+				done
+			fi
 		fi
 	else
 		all_repos
@@ -63,13 +68,17 @@ choose_repos() {
 
 # net DIR GIT-ARGS... - a git command that talks to the remote: cut after 25 s, once more over port 443 for ssh remotes
 net() {
-	local d=$1 r
+	local d=$1 r e=()
 	shift
-	timeout 25 git -C "$d" "$@"
+	# never hide the user's own ssh setup (GIT_SSH_COMMAND beats core.sshCommand): add BatchMode only when there is none
+	if [ -z "${GIT_SSH_COMMAND:-}" ] && [ -z "$(git -C "$d" config --get core.sshCommand 2> /dev/null)" ]; then
+		e=(env "GIT_SSH_COMMAND=ssh -o BatchMode=yes -o ConnectTimeout=15")
+	fi
+	timeout 25 ${e[@]+"${e[@]}"} git -C "$d" "$@"
 	r=$?
 	[ $r -eq 0 ] && return 0
 	[ $r -eq 124 ] || return $r
-	timeout 25 git -C "$d" -c url."ssh://git@ssh.github.com:443/".insteadOf=git@github.com: "$@"
+	timeout 25 ${e[@]+"${e[@]}"} git -C "$d" -c url."ssh://git@ssh.github.com:443/".insteadOf=git@github.com: "$@"
 }
 
 # probe NAME - sets br up ahead behind changed new kind for the repo (kind: detached noremote synced ahead behind diverged)
@@ -117,14 +126,16 @@ needmerge_branch() {
 		if [ "$cur" = "$tip" ]; then say "$1" "$name already holds the remote's $br, merge it: repos merge $1"; return; fi
 		if git -C "$d" merge-base --is-ancestor "$cur" "$tip"; then
 			[ $dry = 1 ] && { say "$1" "would move $name forward to the remote's $br"; return; }
-			git -C "$d" branch -f "$name" "$tip" > /dev/null && say "$1" "diverged ($(sync_text)): $name moved forward, merge it: repos merge $1"
+			if git -C "$d" branch -f "$name" "$tip" > /dev/null; then say "$1" "diverged ($(sync_text)): $name moved forward, merge it: repos merge $1"
+			else fail "$1" "could not move $name forward (checked out in another worktree?)"; fi
 			return
 		fi
 		name="$name-$(git -C "$d" rev-parse --short "$tip")"
 		git -C "$d" rev-parse -q --verify "refs/heads/$name" > /dev/null && { say "$1" "$name exists, merge it: repos merge $1 $name"; return; }
 	fi
 	[ $dry = 1 ] && { say "$1" "would create $name from the remote's $br"; return; }
-	git -C "$d" branch "$name" "$tip" > /dev/null && say "$1" "diverged ($(sync_text)): the remote's $br is on $name, merge it: repos merge $1 $name"
+	if git -C "$d" branch "$name" "$tip" > /dev/null; then say "$1" "diverged ($(sync_text)): the remote's $br is on $name, merge it: repos merge $1 $name"
+	else fail "$1" "could not create $name"; fi
 }
 
 cmd_status() {
@@ -235,14 +246,14 @@ cmd_merge() {
 }
 
 # ---- arguments: the command, options anywhere, then names ----
-cmd=status
-case ${1:-} in status | fetch | pull | push | needmerge | merge | list) cmd=$1; shift ;; esac
+cmd=status seen=0
 args=()
 for a in "$@"; do
 	case $a in
 		-i) pick=1 ;; -y) yes=1 ;; -n) dry=1 ;;
 		-*) die "unknown option $a (repos --help)" ;;
-		*) args+=("$a") ;;
+		status | fetch | pull | push | needmerge | merge | list) if [ $seen = 0 ]; then cmd=$a; else args+=("$a"); fi; seen=1 ;;	# the first word is the command, wherever the options are
+		*) seen=1; args+=("$a") ;;
 	esac
 done
 [ -d "$root" ] || die "$root is not a folder (REPOS_ROOT)"
