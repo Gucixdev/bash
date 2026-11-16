@@ -484,3 +484,55 @@ setup() {
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"-x/f"* ]]
 }
+
+# a PATH holding only what metadata_cleaner needs plus the fakes a test adds (no real mat2, exiftool, ffmpeg)
+mc_path() {
+	mkdir -p "$BATS_TEST_TMPDIR/bin"
+	for t in bash env dirname basename mktemp cp mv rm file cat head; do
+		ln -sf "$(command -v $t)" "$BATS_TEST_TMPDIR/bin/$t"
+	done
+}
+
+@test "metadata_cleaner: a stripper that fails leaves no clean-NAME copy and exits 1" {
+	mc_path
+	printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/bin/exiftool"; chmod +x "$BATS_TEST_TMPDIR/bin/exiftool"
+	echo secret-gps > "$BATS_TEST_TMPDIR/in.jpg"
+	PATH="$BATS_TEST_TMPDIR/bin" run ./metadata_cleaner "$BATS_TEST_TMPDIR/in.jpg"
+	[ "$status" -eq 1 ]
+	[[ "$output" != *"wrote"* ]]
+	[ ! -e "$BATS_TEST_TMPDIR/clean-in.jpg" ]
+	[ -z "$(ls -A "$BATS_TEST_TMPDIR" | grep -v -e '^bin$' -e '^in.jpg$')" ]
+}
+
+@test "metadata_cleaner: a failing ffmpeg leaves no half-written clean-NAME that blocks the next run" {
+	mc_path
+	printf '#!/bin/sh\nfor a; do l=$a; done\necho partial > "$l"\nexit 1\n' > "$BATS_TEST_TMPDIR/bin/ffmpeg"
+	rm -f "$BATS_TEST_TMPDIR/bin/file"
+	printf '#!/bin/sh\necho video/mp4\n' > "$BATS_TEST_TMPDIR/bin/file"
+	chmod +x "$BATS_TEST_TMPDIR/bin/ffmpeg" "$BATS_TEST_TMPDIR/bin/file"
+	: > "$BATS_TEST_TMPDIR/a.mp4"
+	PATH="$BATS_TEST_TMPDIR/bin" run ./metadata_cleaner "$BATS_TEST_TMPDIR/a.mp4"
+	[ "$status" -eq 1 ]
+	[ ! -e "$BATS_TEST_TMPDIR/clean-a.mp4" ]
+	printf '#!/bin/sh\nfor a; do l=$a; done\necho good > "$l"\n' > "$BATS_TEST_TMPDIR/bin/ffmpeg"
+	PATH="$BATS_TEST_TMPDIR/bin" run ./metadata_cleaner "$BATS_TEST_TMPDIR/a.mp4"
+	[ "$status" -eq 0 ]
+	[ "$(cat "$BATS_TEST_TMPDIR/clean-a.mp4")" = good ]
+}
+
+@test "metadata_cleaner: a file called -x is handed to the stripper as ./-x" {
+	d=$BATS_TEST_TMPDIR; mkdir -p "$d/w"; cd "$d/w"
+	convert -size 4x4 xc:red ./-x.png
+	run "$BATS_TEST_DIRNAME/../metadata_cleaner" -x.png
+	[ "$status" -eq 0 ]
+	[ -s ./clean--x.png ]
+}
+
+@test "metadata_cleaner: a folder it cannot write to is an error" {
+	d=$BATS_TEST_TMPDIR; mkdir -p "$d/ro"; convert -size 4x4 xc:red "$d/ro/a.png"; chmod 500 "$d/ro"
+	[ -w "$d/ro" ] && skip "running as root"
+	run ./metadata_cleaner "$d/ro/a.png"
+	chmod 700 "$d/ro"
+	[ "$status" -eq 1 ]
+	[[ "$output" != *wrote* ]]
+}
