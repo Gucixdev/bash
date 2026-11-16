@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# repos - keep the git repos of one folder in step with GitHub: look, fetch, pull, push, merge what needs merging.
+#
+#   repos [status] [NAME...]   one line per repo: branch, changed files, ahead/behind (as of the last fetch)
+#   repos fetch [NAME...]      git fetch; only reads from the remote
+#   repos pull [NAME...]       behind only: fast-forward. Both sides have new commits: the remote's version goes to the
+#                              branch needmerge/BRANCH and nothing else changes. Tracked files changed: skipped.
+#   repos push [NAME...]       ahead only: push the branch (shows the plan, asks once; -y skips the question).
+#                              Never forced. Both sides moved: nothing is pushed, the remote's version goes to needmerge/BRANCH.
+#   repos needmerge [NAME...]  the needmerge/* branches waiting: how many commits are yours, how many theirs
+#   repos merge NAME [BRANCH]  merge needmerge/CURRENT (or the named branch) into the current branch of NAME;
+#                              on a conflict the merge is aborted and nothing is changed
+#   repos list                 the names, one per line
+#
+#   -i  choose the repos with fzf (a numbered list without it)      -y  answer yes
+#   -n  dry run: say what would happen (fetch still runs, it only reads)
+#   No NAME means every repo. A NAME is a folder of $REPOS_ROOT (default /data/dev/github) that has a .git.
+#
+# Safe by construction: no force push, no reset, no branch or file is deleted, a changed working tree is never touched,
+# a pull that cannot fast-forward only adds a branch. A fetch or push that hangs is cut after 25 s and tried once more
+# over ssh.github.com:443 (for networks where port 22 is closed). Exit status: 0 fine, 1 something failed, 2 bad usage.
+set -u
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+root=${REPOS_ROOT:-/data/dev/github}
+yes=0 dry=0 pick=0 rc=0
+export GIT_TERMINAL_PROMPT=0
+: "${GIT_SSH_COMMAND:=ssh -o BatchMode=yes -o ConnectTimeout=15}"
+export GIT_SSH_COMMAND
+
+die() { printf 'repos: %s\n' "$*" >&2; exit 2; }
+say() { printf '%-18s %s\n' "$1" "$2"; }
+fail() { rc=1; say "$1" "FAILED: $2"; }
+
+all_repos() {
+	local d
+	for d in "$root"/*/; do [ -e "${d}.git" ] && basename "$d"; done
+}
+
+# choose_repos NAME... -> names on stdout (all, or the ones fzf picked, or the given ones checked)
+choose_repos() {
+	local n
+	if [ $# -gt 0 ]; then
+		for n in "$@"; do
+			[ -e "$root/$n/.git" ] || die "no repo '$n' in $root (repos list)"
+			echo "$n"
+		done
+	elif [ $pick = 1 ]; then
+		if command -v fzf > /dev/null && [ -t 0 ]; then
+			all_repos | fzf --multi --prompt='repos> ' || true
+		else
+			local names i=0 line
+			mapfile -t names < <(all_repos)
+			for n in "${names[@]}"; do i=$((i + 1)); printf '%3d %s\n' "$i" "$n" >&2; done
+			printf 'numbers, space separated (empty = all): ' >&2
+			read -r line || line=""
+			if [ -z "$line" ]; then printf '%s\n' "${names[@]}"; else for i in $line; do echo "${names[$((i - 1))]:-}"; done; fi
+		fi
+	else
+		all_repos
+	fi
+}
+
+# net DIR GIT-ARGS... - a git command that talks to the remote: cut after 25 s, once more over port 443 for ssh remotes
+net() {
+	local d=$1 r
+	shift
+	timeout 25 git -C "$d" "$@"
+	r=$?
+	[ $r -eq 0 ] && return 0
+	[ $r -eq 124 ] || return $r
+	timeout 25 git -C "$d" -c url."ssh://git@ssh.github.com:443/".insteadOf=git@github.com: "$@"
+}
+
+# probe NAME - sets br up ahead behind changed new kind for the repo (kind: detached noremote synced ahead behind diverged)
+probe() {
+	local d="$root/$1" counts
+	br=$(git -C "$d" symbolic-ref --short -q HEAD || true)
+	up="" ahead=0 behind=0 kind=""
+	changed=$(git -C "$d" status --porcelain --untracked-files=no 2> /dev/null | grep -c . || true)
+	new=$(git -C "$d" status --porcelain 2> /dev/null | grep -c '^??' || true)
+	if [ -z "$br" ]; then br="(detached)" kind=detached; return; fi
+	up=$(git -C "$d" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2> /dev/null || true)
+	if [ -z "$up" ] && git -C "$d" rev-parse -q --verify "refs/remotes/origin/$br" > /dev/null; then up="origin/$br"; fi
+	if [ -z "$up" ]; then kind=noremote; return; fi
+	counts=$(git -C "$d" rev-list --left-right --count "HEAD...$up")
+	ahead=${counts%%[[:space:]]*} behind=${counts##*[[:space:]]}
+	if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then kind=diverged
+	elif [ "$ahead" -gt 0 ]; then kind=ahead
+	elif [ "$behind" -gt 0 ]; then kind=behind
+	else kind=synced; fi
+}
+
+sync_text() {
+	case $kind in
+		detached) echo "detached HEAD" ;;
+		noremote) echo "no remote branch" ;;
+		synced) echo "in sync" ;;
+		ahead) echo "ahead $ahead" ;;
+		behind) echo "behind $behind" ;;
+		diverged) echo "diverged: ahead $ahead, behind $behind" ;;
+	esac
+}
+
+dirty_text() {
+	if [ "$changed" -eq 0 ] && [ "$new" -eq 0 ]; then echo clean
+	else echo "${changed} changed, ${new} new"; fi
+}
+
+# needmerge_branch NAME - puts the remote's version of the current branch on needmerge/BRANCH (only adds a branch)
+needmerge_branch() {
+	local d="$root/$1" name tip cur
+	name="needmerge/$br"
+	tip=$(git -C "$d" rev-parse "$up")
+	if git -C "$d" rev-parse -q --verify "refs/heads/$name" > /dev/null; then
+		cur=$(git -C "$d" rev-parse "refs/heads/$name")
+		if [ "$cur" = "$tip" ]; then say "$1" "$name already holds the remote's $br, merge it: repos merge $1"; return; fi
+		if git -C "$d" merge-base --is-ancestor "$cur" "$tip"; then
+			[ $dry = 1 ] && { say "$1" "would move $name forward to the remote's $br"; return; }
+			git -C "$d" branch -f "$name" "$tip" > /dev/null && say "$1" "diverged ($(sync_text)): $name moved forward, merge it: repos merge $1"
+			return
+		fi
+		name="$name-$(git -C "$d" rev-parse --short "$tip")"
+		git -C "$d" rev-parse -q --verify "refs/heads/$name" > /dev/null && { say "$1" "$name exists, merge it: repos merge $1 $name"; return; }
+	fi
+	[ $dry = 1 ] && { say "$1" "would create $name from the remote's $br"; return; }
+	git -C "$d" branch "$name" "$tip" > /dev/null && say "$1" "diverged ($(sync_text)): the remote's $br is on $name, merge it: repos merge $1 $name"
+}
+
+cmd_status() {
+	local n
+	printf '%-20s %-14s %-20s %s\n' REPO BRANCH WORKTREE SYNC
+	for n in "$@"; do
+		probe "$n"
+		printf '%-20s %-14s %-20s %s\n' "$n" "$br" "$(dirty_text)" "$(sync_text)"
+	done
+	echo "(ahead/behind is as of the last fetch: repos fetch)"
+}
+
+cmd_fetch() {
+	local n
+	for n in "$@"; do
+		probe "$n"
+		if ! git -C "$root/$n" remote | grep -q .; then say "$n" "no remote"; continue; fi
+		if net "$root/$n" fetch -q --all --prune; then probe "$n"; say "$n" "fetched, $(sync_text)"; else fail "$n" "fetch (offline? no access?)"; fi
+	done
+}
+
+cmd_pull() {
+	local n
+	for n in "$@"; do
+		probe "$n"
+		case $kind in detached | noremote) say "$n" "skipped, $(sync_text)"; continue ;; esac
+		net "$root/$n" fetch -q --all --prune || { fail "$n" "fetch"; continue; }
+		probe "$n"
+		case $kind in
+			synced | ahead) say "$n" "nothing to pull, $(sync_text)" ;;
+			diverged) needmerge_branch "$n" ;;
+			behind)
+				if [ "$changed" -gt 0 ]; then say "$n" "behind $behind but $changed tracked files are changed: commit or stash first"; continue; fi
+				[ $dry = 1 ] && { say "$n" "would fast-forward $behind commits"; continue; }
+				if git -C "$root/$n" merge --ff-only -q "$up"; then say "$n" "fast-forwarded $behind commits"; else fail "$n" "fast-forward"; fi ;;
+		esac
+	done
+}
+
+cmd_push() {
+	local n plan=() ans
+	for n in "$@"; do
+		probe "$n"
+		case $kind in detached | noremote) say "$n" "skipped, $(sync_text) (first push by hand: git push -u origin $br)"; continue ;; esac
+		net "$root/$n" fetch -q --all --prune || { fail "$n" "fetch"; continue; }
+		probe "$n"
+		case $kind in
+			synced | behind) say "$n" "nothing to push, $(sync_text)" ;;
+			diverged) needmerge_branch "$n" ;;
+			ahead) plan+=("$n") ;;
+		esac
+	done
+	[ ${#plan[@]} -gt 0 ] || return 0
+	echo "to push:"
+	for n in "${plan[@]}"; do probe "$n"; say "$n" "$br -> $up, $ahead commits"; done
+	[ $dry = 1 ] && return 0
+	if [ $yes = 0 ]; then
+		[ -t 0 ] || die "push asks before it sends; no terminal, so give -y"
+		printf 'push these %d? [y/N] ' "${#plan[@]}"
+		read -r ans
+		case $ans in y | Y | yes) ;; *) echo "nothing pushed"; return 0 ;; esac
+	fi
+	for n in "${plan[@]}"; do
+		probe "$n"
+		if net "$root/$n" push -q "${up%%/*}" "refs/heads/$br:refs/heads/${up#*/}"; then say "$n" "pushed $ahead commits"; else fail "$n" "push (the remote may have moved: repos pull $n)"; fi
+	done
+}
+
+cmd_needmerge() {
+	local n b base counts
+	for n in "$@"; do
+		while read -r b; do
+			[ -n "$b" ] || continue
+			base=${b#needmerge/}
+			base=${base%-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]}
+			if git -C "$root/$n" rev-parse -q --verify "refs/heads/$base" > /dev/null; then
+				counts=$(git -C "$root/$n" rev-list --left-right --count "$base...$b")
+				say "$n" "$b: ${counts%%[[:space:]]*} commits only on $base, ${counts##*[[:space:]]} only on the remote's version"
+			else say "$n" "$b (branch $base is gone)"; fi
+		done < <(git -C "$root/$n" for-each-ref --format='%(refname:short)' refs/heads/needmerge/)
+	done
+}
+
+cmd_merge() {
+	local n=${1:-} b=${2:-} d ans
+	[ -n "$n" ] || die "merge: which repo? (repos needmerge shows them)"
+	[ -e "$root/$n/.git" ] || die "no repo '$n' in $root"
+	d="$root/$n"
+	probe "$n"
+	[ -n "$b" ] || b="needmerge/$br"
+	git -C "$d" rev-parse -q --verify "refs/heads/$b" > /dev/null || die "no branch $b in $n (repos needmerge $n)"
+	[ "$changed" -eq 0 ] || die "$n has $changed changed tracked files: commit or stash first"
+	echo "$n: merging $b into $br, what comes in:"
+	git -C "$d" log --oneline "$br..$b" | head -15
+	[ $dry = 1 ] && return 0
+	if [ $yes = 0 ]; then
+		[ -t 0 ] || die "merge asks first; no terminal, so give -y"
+		printf 'merge? [y/N] '
+		read -r ans
+		case $ans in y | Y | yes) ;; *) echo "nothing merged"; return 0 ;; esac
+	fi
+	if git -C "$d" merge --no-edit -q "$b"; then
+		say "$n" "merged $b; the branch stays, remove it when you want: git -C $d branch -d $b"
+	else
+		git -C "$d" merge --abort 2> /dev/null
+		fail "$n" "conflicts, merge aborted and nothing changed. By hand: cd $d && git merge $b"
+	fi
+}
+
+# ---- arguments: the command, options anywhere, then names ----
+cmd=status
+case ${1:-} in status | fetch | pull | push | needmerge | merge | list) cmd=$1; shift ;; esac
+args=()
+for a in "$@"; do
+	case $a in
+		-i) pick=1 ;; -y) yes=1 ;; -n) dry=1 ;;
+		-*) die "unknown option $a (repos --help)" ;;
+		*) args+=("$a") ;;
+	esac
+done
+[ -d "$root" ] || die "$root is not a folder (REPOS_ROOT)"
+command -v git > /dev/null || die "git is missing"
+
+case $cmd in
+	list) all_repos ;;
+	merge) cmd_merge "${args[@]+"${args[@]}"}" ;;
+	*)
+		mapfile -t names < <(choose_repos "${args[@]+"${args[@]}"}")
+		[ ${#names[@]} -gt 0 ] || die "no repos chosen"
+		"cmd_$cmd" "${names[@]}" ;;
+esac
+exit $rc
