@@ -84,3 +84,32 @@ setup() {
 	[ "$status" -eq 2 ]
 	[[ $output == *"download_references list"* ]]
 }
+
+@test "the last line of references.list counts without a final newline" {
+	printf 'alpha file://%s/up-alpha\nbeta file://%s/up-beta v1' "$BATS_TEST_TMPDIR" "$BATS_TEST_TMPDIR" > references.list
+	run ./download_references
+	[ "$status" -eq 0 ]; [ -f references/beta/file ]
+}
+
+@test "a .gitignore without a final newline keeps its last line apart from /references/" {
+	printf 'node_modules' > .gitignore
+	run ./download_references
+	[ "$status" -eq 0 ]
+	grep -qxF node_modules .gitignore && grep -qxF '/references/' .gitignore
+}
+
+@test "a references/NAME.part left by an interrupted run does not make every later clone fail" {
+	mkdir -p references/alpha.part/junk
+	run ./download_references
+	[ "$status" -eq 0 ]; [ -f references/alpha/file ]
+}
+
+@test "names . and .. are refused in the list and by clean" {
+	printf '.. file://%s/up-alpha\n' "$BATS_TEST_TMPDIR" > references.list
+	run ./download_references
+	[ "$status" -eq 2 ]
+	run ./download_references clean ..
+	[ "$status" -eq 2 ]
+	run ./download_references clean .
+	[ "$status" -eq 2 ]
+}
