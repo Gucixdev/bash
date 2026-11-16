@@ -197,7 +197,7 @@ proj() { # a project with ids, a place file and no key
 	grep -qx 'url = "https://apis.roblox.com/assets/v1/assets/222"' "$T/curl.cfg"
 	grep -qx 'request = "PATCH"' "$T/curl.cfg"
 	grep -qF 'form-string = "request={\"assetId\": 222, \"assetType\": \"Place\", \"published\": true}"' "$T/curl.cfg"
-	grep -q '^form = "fileContent=@.*/build/demo.rbxl;type=application/octet-stream"' "$T/curl.cfg"
+	grep -q '^form = "fileContent=@\\".*/build/demo.rbxl\\";type=application/octet-stream"' "$T/curl.cfg"
 	nokey
 }
 
@@ -251,6 +251,61 @@ proj() { # a project with ids, a place file and no key
 	run "$RB" publish --yes
 	[ "$status" -eq 3 ]
 	[ ! -e "$T/curl.argv" ]
+}
+
+@test "roblox build: a project file without a name stops before rojo runs" {
+	proj
+	fakes
+	printf '{ "tree": { "$className": "DataModel" } }\n' > default.project.json
+	run "$RB" build
+	[ "$status" -eq 3 ]
+	[ ! -e "$T/rojo.argv" ]
+	[ ! -e build/.rbxl ]
+}
+
+@test "roblox new: a dangling symlink is kept, nothing is written through it" {
+	mkdir demo
+	ln -s "$T/outside.txt" demo/selene.toml
+	run "$RB" new demo
+	[ "$status" -eq 0 ]
+	[ ! -e "$T/outside.txt" ]
+	[ -L demo/selene.toml ]
+}
+
+@test "roblox new: a path that cannot be created is an error, not a ready message" {
+	mkdir demo
+	: > demo/src
+	run "$RB" new demo
+	[ "$status" -eq 1 ]
+	[[ $output != *"ready:"* ]]
+}
+
+@test "roblox publish --yes: the key file is removed even when TMPDIR has a quote in it" {
+	proj
+	fakes
+	export ROBLOX_API_KEY=$KEY
+	mkdir -p "$T/it's tmp"
+	TMPDIR="$T/it's tmp" run "$RB" publish --yes
+	[ "$status" -eq 0 ]
+	[ -z "$(ls -A "$T/it's tmp")" ]
+}
+
+@test "roblox publish --yes --api assets: a comma or space in the place file path is one file" {
+	proj
+	fakes
+	export ROBLOX_API_KEY=$KEY
+	cp build/demo.rbxl "$T/a, b.rbxl"
+	run "$RB" publish --yes --api assets --file "$T/a, b.rbxl"
+	[ "$status" -eq 0 ]
+	grep -qF "form = \"fileContent=@\\\"$T/a, b.rbxl\\\";type=application/octet-stream\"" "$T/curl.cfg"
+}
+
+@test "roblox check: two \"\$path\" entries on one line are both checked" {
+	proj
+	printf '{ "name": "demo", "tree": { "$className": "DataModel", "A": { "$path": "nowhere" }, "B": { "$path": "src/ServerScriptService" } } }\n' > default.project.json
+	run "$RB" check
+	[ "$status" -eq 1 ]
+	[[ $output == *"nowhere"* ]]
 }
 
 @test "roblox: shellcheck clean" {

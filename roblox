@@ -93,11 +93,12 @@ api_key() {
 
 # put FILE: write stdin to FILE unless it already exists (so 'new' can be run again safely).
 put() {
-	if [ -e "$1" ]; then
+	if [ -e "$1" ] || [ -L "$1" ]; then	# -L: a dangling symlink must not be written through
 		say "kept $1"
 		cat > /dev/null
 	else
-		mkdir -p -- "$(dirname -- "$1")" && cat > "$1" && say "created $1"
+		{ mkdir -p -- "$(dirname -- "$1")" && cat > "$1"; } || die 1 "cannot write $1"
+		say "created $1"
 	fi
 }
 
@@ -219,7 +220,7 @@ cmd_check() {
 			warn "$PROJECT points at $p, which does not exist"
 			rc=1
 		fi
-	done < <(sed -n 's/.*"\$path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PROJECT")
+	done < <(grep -o '"\$path"[[:space:]]*:[[:space:]]*"[^"]*"' "$PROJECT" | sed 's/^"[^"]*"[[:space:]]*:[[:space:]]*"//; s/"$//')
 	grep -q '"tree"' "$PROJECT" || { warn "$PROJECT has no \"tree\""; rc=1; }
 	[ "$rc" -eq 0 ] && say "project file: ok"
 
@@ -255,8 +256,9 @@ cmd_build() {
 	[ $# -eq 0 ] || die 2 "usage: roblox build"
 	need_project
 	have rojo || die 3 "rojo is not installed. Get it with: rokit add rojo-rbx/rojo  |  cargo install rojo --version ^7  |  a release binary from https://github.com/rojo-rbx/rojo/releases  |  an agx download row (agx add). Nothing was installed."
-	local out
-	out=build/$(project_name).rbxl
+	local out name
+	name=$(project_name) || exit $?	# project_name dies inside $(): without this the build went on as build/.rbxl
+	out=build/$name.rbxl
 	mkdir -p build || die 1 "cannot create build/"
 	if rojo build -o "$out"; then say "built $out"; else die 1 "rojo build failed"; fi
 }
@@ -284,11 +286,11 @@ cmd_publish() {
 	case $api in universes | assets) ;; *) die 2 "api must be universes or assets, not: $api" ;; esac
 	need_project
 
-	local universe place key
+	local universe place key name
 	universe=$(conf ROBLOX_UNIVERSE_ID)
 	place=$(conf ROBLOX_PLACE_ID)
 	key=$(api_key)
-	[ -n "$file" ] || file=build/$(project_name).rbxl
+	if [ -z "$file" ]; then name=$(project_name) || exit $?; file=build/$name.rbxl; fi
 	[ -f "$file" ] || die 3 "place file $file not found; run 'roblox build' first (or pass --file PATH)"
 	case $place in '' | *[!0-9]*) die 3 "ROBLOX_PLACE_ID missing or not a number (environment or roblox.conf)" ;; esac
 	if [ "$api" = universes ]; then
@@ -327,10 +329,8 @@ cmd_publish() {
 
 	[ -n "$key" ] || die 3 "no API key: set ROBLOX_API_KEY or add ROBLOX_API_KEY=... to ~/.secrets"
 	have curl || die 3 "curl is missing"
-	local cfg
 	cfg=$(umask 077 && mktemp "${TMPDIR:-/tmp}/roblox-curl.XXXXXX") || die 1 "cannot create a temporary file"
-	# shellcheck disable=SC2064
-	trap "rm -f -- '$cfg'" EXIT
+	trap 'rm -f -- "$cfg"' EXIT	# cfg is global on purpose: a quote in TMPDIR must not break the trap
 	chmod 600 "$cfg"
 	{
 		printf 'url = "%s"\nrequest = "%s"\n' "$url" "$method"
@@ -339,7 +339,7 @@ cmd_publish() {
 			printf 'header = "Content-Type: application/octet-stream"\ndata-binary = "@%s"\n' "$file"
 		else
 			printf 'form-string = "request={\\"assetId\\": %s, \\"assetType\\": \\"Place\\", \\"published\\": %s}"\n' "$place" "$published"
-			printf 'form = "fileContent=@%s;type=application/octet-stream"\n' "$file"
+			printf 'form = "fileContent=@\\"%s\\";type=application/octet-stream"\n' "$file"	# quoted: curl splits an unquoted @a,b into two files
 		fi
 		printf 'silent\nshow-error\nfail-with-body\nwrite-out = "\\nHTTP %%{http_code}\\n"\n'
 	} > "$cfg"
