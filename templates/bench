@@ -14,13 +14,15 @@ command -v "$1" > /dev/null 2>&1 || [ -x "$1" ] || { echo "bench: $1 is not runn
 
 tmp=$(mktemp) || exit 1
 trap 'rm -f "$tmp"' EXIT
-i=0
+i=0 bad=0
 while [ "$i" -lt "$RUNS" ]; do
 	a=$(date +%s%N)
-	"$@" > /dev/null 2>&1
+	"$@" > /dev/null 2>&1 || bad=$((bad + 1))
 	b=$(date +%s%N)
 	echo $(((b - a) / 1000000)) >> "$tmp"
 	i=$((i + 1))
 done
 sort -n "$tmp" | awk '{ v[NR] = $1; s += $1 }
 	END { printf "runs\t%d\nmin\t%d\nmedian\t%d\nmean\t%.1f\nmax\t%d\n", NR, v[1], v[int((NR + 1) / 2)], s / NR, v[NR] }'
+# a command that fails (a typo in the arguments, a missing file) is not worth timing
+[ "$bad" -eq 0 ] || { echo "bench: $bad of $RUNS runs exited non-zero: the numbers above time a failure" >&2; exit 1; }

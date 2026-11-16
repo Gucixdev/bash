@@ -6,7 +6,8 @@
 # Exit 0 = identical, 1 = different, 2 = usage / missing input. Read-only: it changes nothing.
 set -u
 case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
-cd "$(dirname "$(readlink -f "$0")")" || exit 1
+orig=$PWD
+cd "$(dirname "$(readlink -f "$0")")" || exit 1   # -c commands run from the project root, like ./run does
 
 tmp=$(mktemp -d) || exit 2
 trap 'rm -rf "$tmp"' EXIT
@@ -18,6 +19,10 @@ if [ "${1:-}" = -c ]; then
 	set -- "$tmp/a" "$tmp/b"
 fi
 [ $# -eq 2 ] || { echo "usage: compare A B | compare -c CMD1 CMD2" >&2; exit 2; }
+for _i in 1 2; do	# A and B are named relative to where the user stands, not to the project root
+	case $1 in /*) ;; *) set -- "$orig/$1" "${@:2}" ;; esac
+	set -- "${@:2}" "$1"
+done
 [ -e "$1" ] || { echo "compare: no such path: $1" >&2; exit 2; }
 [ -e "$2" ] || { echo "compare: no such path: $2" >&2; exit 2; }
 

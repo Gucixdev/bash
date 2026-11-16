@@ -4,28 +4,38 @@
 set -u
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 
-# EDIT: one line per dependency: command|package on pacman|apt|dnf|xbps (use - when the package has the same name everywhere)
+# EDIT: one line per dependency: command|package on pacman|apt|dnf|xbps. One package column is enough when the name is the same
+# everywhere (cc|gcc); a - or an empty column means the first column, and a - there means the command itself.
 DEPS='git|git
 make|make
 cc|gcc
 shellcheck|shellcheck'
 
-yes_all=0; [ "${1:-}" = -y ] && yes_all=1
+yes_all=0
+for a in "$@"; do case $a in -y) yes_all=1 ;; *) echo "usage: setup [-y]" >&2; exit 2 ;; esac; done
+
+if   command -v pacman    >/dev/null; then inst='sudo pacman -S --needed' col=2
+elif command -v apt-get   >/dev/null; then inst='sudo apt-get install' col=3
+elif command -v dnf       >/dev/null; then inst='sudo dnf install' col=4
+elif command -v xbps-install >/dev/null; then inst='sudo xbps-install -S' col=5
+else inst='' col=2; fi
 
 missing=''
-while IFS='|' read -r cmd pkg; do
-	command -v "$cmd" >/dev/null 2>&1 || missing="$missing $pkg"
+while IFS='|' read -r cmd c2 c3 c4 c5; do
+	[ -n "$cmd" ] || continue
+	command -v "$cmd" >/dev/null 2>&1 && continue
+	# the column of this system's package manager; empty or - falls back to the first package column, then to the command
+	case $col in 2) pkg=$c2 ;; 3) pkg=${c3:-} ;; 4) pkg=${c4:-} ;; *) pkg=${c5:-} ;; esac
+	case $pkg in '' | -) pkg=$c2 ;; esac
+	case $pkg in '' | -) pkg=$cmd ;; esac
+	missing="$missing $pkg"
 done <<EOT
 $DEPS
 EOT
 missing=${missing# }
 [ -n "$missing" ] || { echo "setup: everything is installed"; exit 0; }
 
-if   command -v pacman    >/dev/null; then inst='sudo pacman -S --needed'
-elif command -v apt-get   >/dev/null; then inst='sudo apt-get install'
-elif command -v dnf       >/dev/null; then inst='sudo dnf install'
-elif command -v xbps-install >/dev/null; then inst='sudo xbps-install -S'
-else echo "setup: unknown package manager; install by hand: $missing"; exit 1; fi
+[ -n "$inst" ] || { echo "setup: unknown package manager; install by hand: $missing"; exit 1; }
 
 echo "setup: will run: $inst $missing"
 if [ "$yes_all" -eq 0 ]; then
