@@ -224,3 +224,30 @@ PY
 	[[ $output == *"--long"* ]]
 	[ ! -e "$T/long.out.mp4" ]
 }
+
+@test "textswap: --seed may start with a dash" {
+	run "$TS" "$T/in.png" -o "$T/o.png" --boxes "$T/boxes.tsv" --seed -x
+	[ "$status" -eq 0 ]
+	[ -f "$T/o.png" ]
+}
+
+@test "textswap: an input without extension in a folder with a dot gets its default name next to it" {
+	mkdir "$T/my.dir"
+	cp "$T/in.png" "$T/my.dir/shot"
+	run "$TS" "$T/my.dir/shot" --boxes "$T/boxes.tsv"
+	[ "$status" -eq 0 ]
+	[ -f "$T/my.dir/shot.swapped.png" ]
+}
+
+@test "textswap: a webm without a duration (screen recorder, pipe) is read, and still limited to 120 s" {
+	command -v ffmpeg > /dev/null && command -v ffprobe > /dev/null || skip "ffmpeg missing"
+	ffmpeg -nostdin -v error -y -f lavfi -i testsrc=size=64x64:rate=5:duration=2 -c:v libvpx -f webm pipe:1 > "$T/nodur.webm"
+	[ "$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$T/nodur.webm")" = "N/A" ]
+	run "$TS" "$T/nodur.webm" -o "$T/nodur.out.webm" --boxes "$T/boxes.tsv"
+	[ "$status" -eq 0 ]
+	[ -s "$T/nodur.out.webm" ]
+	ffmpeg -nostdin -v error -y -f lavfi -i testsrc=size=16x16:rate=1:duration=121 -c:v libvpx -g 121 -f webm pipe:1 > "$T/nodurlong.webm"
+	run "$TS" "$T/nodurlong.webm" -o "$T/nodurlong.out.webm" --boxes "$T/boxes.tsv"
+	[ "$status" -eq 1 ]
+	[[ $output == *"--long"* ]]
+}

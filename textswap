@@ -348,10 +348,10 @@ swap_one() {
 			"$ocr" "$in" - tsv > "$bf" 2> "$TMP/ocr.err" < /dev/null
 		fi || { echo "textswap: OCR failed on $in: $(head -c 300 "$TMP/ocr.err")" >&2; return 1; }
 	fi
-	args=(--boxes-file "$bf" --kind "$kind" --ratio "$ratio" --seed "$seed" --font "$font" --pad "$pad" --quant "$q" --min-conf "$minconf")
+	args=(--boxes-file="$bf" --kind="$kind" --ratio="$ratio" --seed="$seed" --font="$font" --pad="$pad" --quant="$q" --min-conf="$minconf")
 	[ "$verbose" -eq 1 ] && args+=(-v)
 	[ "$q" -ne 1 ] && args+=(--quiet)
-	python3 -c "$PY" "$in" "$o" "${args[@]}"
+	python3 -c "$PY" "${args[@]}" -- "$in" "$o"	# = and -- : a seed, font or file name starting with a dash is a value, not an option
 }
 
 is_video() {
@@ -359,10 +359,22 @@ is_video() {
 	return 1
 }
 
+# video_duration FILE: seconds; a recording written to a pipe (browser screen recorders) has no duration in the header,
+# then the stream is decoded once and the last timestamp is taken
+video_duration() {
+	local d
+	d=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$1" 2> /dev/null | head -n 1)
+	if ! isnum "${d:-x}"; then
+		d=$(ffmpeg -nostdin -v error -stats -i "$1" -map 0:v:0 -f null - 2>&1 | tr '\r' '\n' | grep -o 'time=[0-9:.]*' | tail -n 1 |
+			awk -F'[=:]' 'NF == 4 { printf "%.3f", $2 * 3600 + $3 * 60 + $4 }')
+	fi
+	printf '%s' "$d"
+}
+
 swap_video() {
 	local in=$1 o=$2 dur srcfps f n i vf acodec vcodec
 	have ffmpeg && have ffprobe || die 3 "video needs ffmpeg and ffprobe (pacman -S ffmpeg)"
-	dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$in" 2> /dev/null | head -n 1)
+	dur=$(video_duration "$in")
 	isnum "${dur:-x}" || { echo "textswap: $in: ffprobe cannot read it as a video" >&2; return 1; }
 	if [ "$long" -eq 0 ] && awk -v d="$dur" 'BEGIN { exit !(d > 120) }'; then
 		echo "textswap: $in is $(awk -v d="$dur" 'BEGIN { printf "%.0f", d }') s long; the limit is 120 s, --long lifts it" >&2
@@ -396,8 +408,10 @@ swap_video() {
 rc=0
 for in in "${files[@]}"; do
 	[ -f "$in" ] || { echo "textswap: no such file: $in" >&2; rc=1; continue; }
-	if is_video "$in"; then dflt=${in%.*}.swapped.mp4; case ${in##*.} in webm) dflt=${in%.*}.swapped.webm ;; esac
-	else dflt=${in%.*}.swapped.${in##*.}; [ "$dflt" = "${in}.swapped.${in}" ] && dflt=$in.swapped.png; fi
+	bn=${in##*/}	# the extension is the one of the file name, not of a folder with a dot
+	case $bn in ?*.*) stem=${in%.*} ext=${bn##*.} ;; *) stem=$in ext=png ;; esac
+	if is_video "$in"; then dflt=$stem.swapped.mp4; case $ext in webm) dflt=$stem.swapped.webm ;; esac
+	else dflt=$stem.swapped.$ext; fi
 	o=${out:-$dflt}
 	if [ "$in" -ef "$o" ]; then echo "textswap: refusing to overwrite the input $in" >&2; rc=1; continue; fi
 	if [ -e "$o" ] && [ "$force" -eq 0 ]; then echo "textswap: $o exists (-f overwrites it)" >&2; rc=1; continue; fi
