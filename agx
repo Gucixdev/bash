@@ -44,6 +44,7 @@ memory	npm	@modelcontextprotocol/server-memory	latest		knowledge-graph memory
 sequential-thinking	npm	@modelcontextprotocol/server-sequential-thinking	latest		step-by-step reasoning tool
 fetch	pip	mcp-server-fetch	latest		fetch a URL as text
 git	pip	mcp-server-git	latest		git repository tools
+bun	npm	bun	latest	bun	Bun runtime, in the cache not on the system (needs AGX_SCRIPTS=1 once: the npm package fetches the binary in its postinstall)
 reanimate	skill	https://github.com/NiazMorshed2007/reanimate	3f7a55a2986a84ca2173e86ee9127eefe31d046d	skills/reanimate	skill: copy an animation from a site, video or Lottie frame by frame (needs bun; first use downloads ffmpeg and Chromium, ~250 MB)	bash skills/reanimate/scripts/setup.sh
 figma-use	skill	https://github.com/figma/mcp-server-guide	5f3024c3decd83ff6f0bfb3ef36a2c4cfbff961d	skills/figma-use	skill (Figma): required before every use_figma call; needs the Figma MCP server and an account
 figma-design-to-code	skill	https://github.com/figma/mcp-server-guide	5f3024c3decd83ff6f0bfb3ef36a2c4cfbff961d	skills/figma-design-to-code	skill (Figma): implement a Figma design as code; needs the Figma MCP server
@@ -221,7 +222,7 @@ skill)
 			mkdir -p "$sd" && ln -s "$src" "$t" || die "cannot link $t"
 			echo "agx: $t -> $src"
 		fi
-		[ -z "$(field 7 "$r")" ] || echo "agx: the skill needs a one-time setup, not run for you: cd $src && $(field 7 "$r")" ;;
+		[ -z "$(field 7 "$r")" ] || echo "agx: the skill needs a one-time setup, not run for you: cd $home/$n/src && $(field 7 "$r")" ;;
 	list)
 		[ -d "$sd" ] || exit 0
 		for l in "$sd"/*; do [ -L "$l" ] && case $(readlink "$l") in "$home"/*) printf '%s\t%s\n' "$(basename "$l")" "$(readlink "$l")" ;; esac; done ;;
