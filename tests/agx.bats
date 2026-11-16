@@ -171,3 +171,125 @@ skillrepo() {
 	done <<< "$output"
 	[ "$n" -ge 8 ]
 }
+
+@test "agx: -y is accepted in front of a command, AGX_YES=0 is not a yes" {
+	run env AGX_YES= ./agx -y run hello a < /dev/null
+	[ "$output" = "hello a" ]
+	./agx clean hello > /dev/null
+	run env AGX_YES=0 ./agx run hello a < /dev/null
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"needs your yes"* ]]
+}
+
+@test "agx: AGX_SCRIPTS=0 and AGX_OFFLINE=0 do not switch anything on" {
+	mkdir -p "$T/pkg3/bin"
+	printf '{"name":"post3","version":"1.0.0","bin":{"post3":"bin/p.js"},"scripts":{"postinstall":"touch %s/ran3"}}\n' "$T" > "$T/pkg3/package.json"
+	printf '#!/usr/bin/env node\nconsole.log("p");\n' > "$T/pkg3/bin/p.js"
+	chmod +x "$T/pkg3/bin/p.js"
+	(cd "$T/pkg3" && npm pack --silent > /dev/null)
+	./agx add post3 npm "$T/pkg3/post3-1.0.0.tgz" latest post3 > /dev/null
+	AGX_YES=1 AGX_SCRIPTS=0 ./agx run post3 > /dev/null
+	[ ! -e "$T/ran3" ]
+	AGX_YES=1 AGX_OFFLINE=0 ./agx run hello > /dev/null
+}
+
+@test "agx: a git row without a REF (registry default 'latest') fetches HEAD" {
+	./agx add nr git "$T/repo" "" 'sh "$AGX_DIR/src/tool.sh"' > /dev/null
+	grep -q $'^nr\tgit\t.*\tlatest\t' "$AGX_REGISTRY"
+	run env AGX_YES=1 ./agx run nr 7
+	[ "$output" = "git-tool 7 in $AGX_HOME/nr" ]
+}
+
+@test "agx: a registry file without a final newline does not swallow the next row" {
+	printf 'foo\tnpm\tx\tlatest\t\tmine' > "$AGX_REGISTRY"
+	run ./agx list
+	[[ "$output" == *$'foo\tnpm\t-\tmine'* ]]
+	[[ "$output" == *$'context7\tnpm\t-\t'* ]]
+	[[ "$output" != *"minecontext7"* ]]
+}
+
+@test "agx: a name or path with quotes never reaches a shell in list" {
+	printf 'a"; touch %s/PWNED; "\tnpm\tx\tlatest\t\td\n' "$T" > "$AGX_REGISTRY"
+	run ./agx list
+	[ ! -e "$T/PWNED" ]
+	[[ "$output" == *'d'* ]]
+	run env AGX_HOME="$T/ca\"; touch $T/PWNED2; \"che" ./agx list
+	[ ! -e "$T/PWNED2" ]
+}
+
+@test "agx: names that point outside the cache are refused by clean, update, path, info, add" {
+	mkdir -p "$AGX_HOME/../outside"
+	for n in .. ../outside . a/b; do
+		run ./agx clean "$n"
+		[ "$status" -ne 0 ]
+		run ./agx update "$n"
+		[ "$status" -ne 0 ]
+		run ./agx path "$n"
+		[ "$status" -ne 0 ]
+		run ./agx add "$n" npm x
+		[ "$status" -ne 0 ]
+	done
+	[ -d "$AGX_HOME/../outside" ]
+	[ -z "$(ls "$XDG_DATA_HOME/Trash/files" 2> /dev/null)" ]
+}
+
+@test "agx: add and remove keep a registry that is a symlink (dotfiles) a symlink" {
+	mkdir "$T/dot"; : > "$T/dot/reg.tsv"; mv -- "$AGX_REGISTRY" "$T/oldreg"; ln -s "$T/dot/reg.tsv" "$AGX_REGISTRY"
+	./agx add z npm zpkg > /dev/null
+	[ -L "$AGX_REGISTRY" ]
+	grep -q '^z	npm	zpkg' "$T/dot/reg.tsv"
+	./agx remove z > /dev/null
+	[ -L "$AGX_REGISTRY" ]
+	! grep -q '^z' "$T/dot/reg.tsv"
+}
+
+@test "agx: add refuses a tab or newline inside an argument" {
+	run ./agx add t npm "a"$'\t'"b"
+	[ "$status" -ne 0 ]
+	run ./agx add t npm pkg latest "" "two"$'\n'"lines"
+	[ "$status" -ne 0 ]
+	run ./agx info t
+	[[ "$output" == *"no row"* ]]
+}
+
+@test "agx: update keeps the cache when the fetch is refused, and a running tool does not hold the lock" {
+	AGX_YES=1 ./agx run hello > /dev/null
+	run env AGX_OFFLINE=1 AGX_YES=1 ./agx update hello
+	[ "$status" -ne 0 ]
+	run env AGX_YES= ./agx update hello < /dev/null
+	[ "$status" -ne 0 ]
+	[ -f "$AGX_HOME/hello/.ok" ]
+	[ -z "$(ls "$XDG_DATA_HOME/Trash/files" 2> /dev/null)" ]
+	./agx clean hello > /dev/null
+	printf '#!/bin/sh\nsleep 5\n' > "$T/repo/slow.sh"
+	git -C "$T/repo" add slow.sh; git -C "$T/repo" -c user.name=t -c user.email=t@t commit -qm slow
+	./agx add slow git "$T/repo" HEAD 'sh "$AGX_DIR/src/slow.sh"' > /dev/null
+	AGX_YES=1 ./agx run slow &
+	pid=$!
+	sleep 1
+	run flock -n -E 77 "$AGX_HOME/.lock-slow" true
+	kill "$pid" 2> /dev/null; wait "$pid" 2> /dev/null || true
+	[ "$status" -eq 0 ]
+}
+
+@test "agx: mcp quotes a path with spaces, skill remove only takes its own skill's link, sha256 may be upper case" {
+	mkdir -p "$T/a b"; cp agx "$T/a b/agx"
+	run "$T/a b/agx" mcp hello
+	[[ "$output" == *'a\ b/agx run hello' ]]
+	printf '#!/bin/sh\necho u\n' > "$T/u.sh"
+	sum=$(sha256sum "$T/u.sh" | cut -d' ' -f1)
+	./agx add up url "file://$T/u.sh" "${sum^^}" u.sh > /dev/null
+	run env AGX_YES=1 ./agx run up
+	[ "$output" = "u" ]
+	skillrepo
+	mkdir -p "$AGX_SKILLS_DIR"; ln -s "$AGX_HOME/elsewhere/foo" "$AGX_SKILLS_DIR/foo"
+	run ./agx skill remove foo
+	[ "$status" -ne 0 ]
+	[ -L "$AGX_SKILLS_DIR/foo" ]
+}
+
+@test "agx: search treats the word literally" {
+	run ./agx search '['
+	[ "$status" -eq 1 ]
+	[[ "$output" != *"Unmatched"* ]]
+}

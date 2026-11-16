@@ -27,13 +27,18 @@
 # Safety: nothing is fetched or run for the first time without a "y" (-y or AGX_YES=1 skips it; without a terminal it is required).
 #   npm lifecycle scripts stay off unless AGX_SCRIPTS=1. AGX_OFFLINE=1 never touches the network. AGX_HOME moves the cache.
 set -u
+yes=${AGX_YES:-}
+while :; do case ${1:-} in -y | --yes) yes=1; shift ;; *) break ;; esac; done
 case ${1:-} in -h | --help | '') awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
 
 die() { printf 'agx: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" > /dev/null 2>&1 || die "$1 is missing (install: $2)"; }
 home=${AGX_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/agx}
 userreg=${AGX_REGISTRY:-${XDG_CONFIG_HOME:-$HOME/.config}/agx/registry.tsv}
-yes=${AGX_YES:-}
+
+flag() { case ${1:-} in 1 | y | yes | true) return 0 ;; esac; return 1; }	# AGX_SCRIPTS=0 must not mean "on"
+offline() { flag "${AGX_OFFLINE:-}"; }
+valid_name() { case $1 in '' | . | .. | -* | */* | *[[:space:]]*) die "'$1' is not a usable name (no slash, space or leading dash)" ;; esac; }
 
 builtin_registry() {	# names are the packages' published names, as remembered: `agx info NAME` and a first run show if one is wrong
 	cat << 'R'
@@ -56,7 +61,7 @@ firecrawl-crawl	skill	https://github.com/firecrawl/skills	1d4b0728d0f448cafef2eb
 R
 }
 
-registry() { { [ -r "$userreg" ] && cat "$userreg"; builtin_registry; } | grep -v '^#' ; }
+registry() { { [ -r "$userreg" ] && awk 1 "$userreg"; builtin_registry; } | grep -v -e '^#' -e '^$'; }
 row() { registry | awk -F '\t' -v n="$1" '$1 == n { print; exit }'; }
 field() { printf '%s' "$2" | awk -F '\t' -v i="$1" '{ print $i }'; }
 
@@ -68,7 +73,7 @@ totrash() {	# move, never delete
 }
 
 confirm() {	# confirm "text"
-	[ -n "$yes" ] && return 0
+	flag "$yes" && return 0
 	[ -t 0 ] && [ -t 2 ] || die "$1 - needs your yes: run it once on a terminal, or pass -y / AGX_YES=1"
 	printf 'agx: %s. Continue? [y/N] ' "$1" >&2
 	local a; read -r a; case $a in y | Y | yes) return 0 ;; *) die "cancelled" ;; esac
@@ -86,10 +91,10 @@ fetch_npm() {	# fetch_npm DIR SOURCE REF CMD
 	local spec=$2
 	case $2 in /* | ./* | ../*) ;; *) case ${3:-latest} in latest | '') ;; *) spec=$2@$3 ;; esac ;; esac
 	local flags=(--no-audit --no-fund --prefix "$1")
-	if [ -z "${AGX_SCRIPTS:-}" ]; then flags+=(--ignore-scripts)
+	if ! flag "${AGX_SCRIPTS:-}"; then flags+=(--ignore-scripts)
 	elif npm config list -l 2> /dev/null | grep -q '^dangerously-allow-all-scripts'; then flags+=(--dangerously-allow-all-scripts)	# npm 12 blocks them unless told
 	fi
-	[ -z "${AGX_OFFLINE:-}" ] || flags+=(--offline)
+	! offline || flags+=(--offline)
 	npm install "${flags[@]}" "$spec" > "$1/.log" 2>&1 || { tail -5 "$1/.log" >&2; die "npm install $spec failed (log: $1/.log)"; }
 	local bin=$4
 	if [ -z "$bin" ]; then
@@ -102,7 +107,7 @@ fetch_npm() {	# fetch_npm DIR SOURCE REF CMD
 fetch_pip() {
 	local spec=$2
 	case ${3:-latest} in latest | '') ;; *) spec="$2==$3" ;; esac
-	local off=; [ -z "${AGX_OFFLINE:-}" ] || off=--offline
+	local off=; ! offline || off=--offline
 	if command -v uv > /dev/null 2>&1; then
 		uv venv -q "$1/venv" > "$1/.log" 2>&1 && uv pip install -q $off --python "$1/venv/bin/python" "$spec" >> "$1/.log" 2>&1
 	else
@@ -115,10 +120,11 @@ fetch_pip() {
 
 git_checkout() {	# git_checkout DIR SOURCE REF: a shallow checkout of REF in DIR/src, log in DIR/.log
 	need git git
-	[ -z "${AGX_OFFLINE:-}" ] || case $2 in /* | file://*) ;; *) die "AGX_OFFLINE is set and $2 is remote" ;; esac
+	! offline || case $2 in /* | file://*) ;; *) die "AGX_OFFLINE is set and $2 is remote" ;; esac
+	local ref=$3; case $ref in latest | '') ref=HEAD ;; esac	# the registry default REF is "latest"
 	local s="$1/src"; mkdir -p "$s"
-	( cd "$s" && git init -q && git remote add origin "$2" && git fetch -q --depth 1 origin "${3:-HEAD}" && git -c advice.detachedHead=false checkout -q FETCH_HEAD ) > "$1/.log" 2>&1 \
-		|| { tail -5 "$1/.log" >&2; die "git fetch of $2 ${3:-HEAD} failed"; }
+	( cd "$s" && git init -q && git remote add origin "$2" && git fetch -q --depth 1 origin "$ref" && git -c advice.detachedHead=false checkout -q FETCH_HEAD ) > "$1/.log" 2>&1 \
+		|| { tail -5 "$1/.log" >&2; die "git fetch of $2 $ref failed"; }
 }
 
 fetch_git() {	# fetch_git DIR SOURCE REF CMD SETUP
@@ -142,20 +148,21 @@ fetch_url() {
 	mkdir -p "$1/bin"
 	local f; f=$1/bin/${4:-$(basename "${2%%\?*}")}
 	curl -fsSL -o "$f" "$2" || die "download of $2 failed"
-	[ "$(sha256sum "$f" | cut -d' ' -f1)" = "$3" ] || { mv -- "$f" "$f.bad"; die "sha256 of $2 does not match the registry (moved to $f.bad)"; }
+	[ "$(sha256sum "$f" | cut -d' ' -f1)" = "${3,,}" ] || { mv -- "$f" "$f.bad"; die "sha256 of $2 does not match the registry (moved to $f.bad)"; }
 	chmod +x "$f"; printf '%s\n' "$f" > "$1/.cmd"
 }
 
-ensure() {	# ensure NAME -> prints nothing; the command line is in $home/NAME/.cmd
+ensure() {	# ensure NAME [force] -> prints nothing; the command line is in $home/NAME/.cmd. force = fetch again (update)
+	valid_name "$1"
 	local r; r=$(row "$1"); [ -n "$r" ] || die "no registry row for '$1' (agx list; agx add ...)"
-	cached "$1" && return 0
-	[ -z "${AGX_OFFLINE:-}" ] || [ "$(field 2 "$r")" = git ] || die "$1 is not cached and AGX_OFFLINE is set"
+	[ -n "${2:-}" ] || ! cached "$1" || return 0
+	! offline || [ "$(field 2 "$r")" = git ] || die "$1 is not cached and AGX_OFFLINE is set"
 	local kind src ref cmd setup; kind=$(field 2 "$r"); src=$(field 3 "$r"); ref=$(field 4 "$r"); cmd=$(field 5 "$r"); setup=$(field 7 "$r")
 	confirm "first run of '$1': fetch $kind $src@${ref:-latest} into $home/$1 and run it"
 	mkdir -p "$home" || die "cannot make $home"
 	need flock util-linux
 	exec 9> "$home/.lock-$1"; flock 9
-	cached "$1" && return 0	# somebody else finished while we waited
+	[ -n "${2:-}" ] || ! cached "$1" || { exec 9>&-; return 0; }	# somebody else finished while we waited
 	local d=$home/$1; [ ! -e "$d" ] || totrash "$d"
 	mkdir -p "$d"
 	case $kind in
@@ -167,6 +174,7 @@ ensure() {	# ensure NAME -> prints nothing; the command line is in $home/NAME/.c
 	*) die "unknown kind '$kind' in the row for $1 (npm pip git url skill)" ;;
 	esac
 	date +%s > "$d/.ok"
+	exec 9>&-	# the lock must not follow into the tool we exec afterwards
 }
 
 run() {
@@ -182,31 +190,42 @@ run() {
 	esac
 }
 
-cmd_list() { registry | awk -F '\t' -v h="$home" 'BEGIN { OFS = "\t" } !seen[$1]++ { c = system("test -f \"" h "/" $1 "/.ok\"") == 0 ? "cached" : "-"; print $1, $2, c, $6 }'; }
+cmd_list() {	# the cache test is done here, not inside awk: a name or a path with a quote must not reach a shell
+	local l n rest k d c
+	registry | awk -F '\t' '!seen[$1]++ { print $1 "\t" $2 "\t" $6 }' | while IFS= read -r l; do
+		n=${l%%$'\t'*}; rest=${l#*$'\t'}; k=${rest%%$'\t'*}; d=${rest#*$'\t'}
+		c=-; cached "$n" && c=cached
+		printf '%s\t%s\t%s\t%s\n' "$n" "$k" "$c" "$d"
+	done
+}
 
 case $1 in
 run) shift; run "$@" ;;
 list) cmd_list ;;
-search) shift; cmd_list | grep -i -- "${1:?search needs a word}" ;;
+search) shift; cmd_list | grep -i -F -- "${1:?search needs a word}" ;;
 info)
-	r=$(row "${2:?info needs a NAME}"); [ -n "$r" ] || die "no row for $2"
+	valid_name "${2:?info needs a NAME}"; r=$(row "$2"); [ -n "$r" ] || die "no row for $2"
 	printf 'name\t%s\nkind\t%s\nsource\t%s\nref\t%s\ncmd\t%s\ndesc\t%s\nsetup\t%s\n' "$(field 1 "$r")" "$(field 2 "$r")" "$(field 3 "$r")" "$(field 4 "$r")" "$(field 5 "$r")" "$(field 6 "$r")" "$(field 7 "$r")"
 	if cached "$2"; then printf 'cache\t%s (fetched %s)\ncommand\t%s\n' "$home/$2" "$(date -d "@$(cat "$home/$2/.ok")" '+%F %T')" "$(cat "$home/$2/.cmd")"; else printf 'cache\t-\n'; fi ;;
 add)
 	[ $# -ge 4 ] || die "usage: agx add NAME KIND SOURCE [REF [CMD [DESC [SETUP]]]]"
+	valid_name "$2"
 	case $3 in npm | pip | git | url | skill) ;; *) die "kind must be npm, pip, git, url or skill" ;; esac
-	mkdir -p "$(dirname "$userreg")" || die "cannot make the registry directory"
-	t=$(mktemp "$userreg.XXXXXX") || die "mktemp failed"
-	{ [ -r "$userreg" ] && awk -F '\t' -v n="$2" '$1 != n' "$userreg"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "${5:-latest}" "${6:-}" "${7:-}" "${8:-}"; } > "$t" && mv -- "$t" "$userreg"
+	for a in "${@:2}"; do case $a in *$'\t'* | *$'\n'*) die "a tab or newline in an argument would corrupt the registry" ;; esac; done
+	reg=$(readlink -m -- "$userreg")	# a registry kept as a symlink (dotfiles) stays a symlink
+	mkdir -p "$(dirname "$reg")" || die "cannot make the registry directory"
+	t=$(mktemp "$reg.XXXXXX") || die "mktemp failed"
+	{ [ -r "$reg" ] && awk 1 "$reg" | awk -F '\t' -v n="$2" '$1 != n'; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "${5:-latest}" "${6:-}" "${7:-}" "${8:-}"; } > "$t" && mv -- "$t" "$reg"
 	echo "agx: $2 saved in $userreg" ;;
 remove)
 	[ -r "$userreg" ] && awk -F '\t' -v n="${2:?remove needs a NAME}" '$1 == n { f = 1 } END { exit !f }' "$userreg" || die "'$2' is not in your registry ($userreg)"
-	t=$(mktemp "$userreg.XXXXXX") && awk -F '\t' -v n="$2" '$1 != n' "$userreg" > "$t" && mv -- "$t" "$userreg" && echo "agx: $2 removed from your registry" ;;
+	reg=$(readlink -m -- "$userreg")
+	t=$(mktemp "$reg.XXXXXX") && awk -F '\t' -v n="$2" '$1 != n' "$reg" > "$t" && mv -- "$t" "$reg" && echo "agx: $2 removed from your registry" ;;
 update)
-	n=${2:?update needs a NAME}; [ -d "$home/$n" ] && totrash "$home/$n"
-	ensure "$n" && echo "agx: $n fetched again" ;;
+	n=${2:?update needs a NAME}
+	ensure "$n" force && echo "agx: $n fetched again" ;;
 clean)
-	if [ -n "${2:-}" ]; then [ -d "$home/$2" ] || die "$2 is not cached"; totrash "$home/$2"
+	if [ -n "${2:-}" ]; then valid_name "$2"; [ -d "$home/$2" ] || die "$2 is not cached"; totrash "$home/$2"
 	else [ -d "$home" ] && for d in "$home"/*/; do [ -d "$d" ] && totrash "${d%/}"; done; fi
 	echo "agx: cache moved to $(trashdir)" ;;
 skill)
@@ -228,14 +247,14 @@ skill)
 		for l in "$sd"/*; do [ -L "$l" ] && case $(readlink "$l") in "$home"/*) printf '%s\t%s\n' "$(basename "$l")" "$(readlink "$l")" ;; esac; done ;;
 	remove)
 		n=${3:?skill remove needs a NAME}; r=$(row "$n"); [ "$(field 2 "$r")" = skill ] || die "'$n' is not a skill row"
-		t=$sd/$(basename "$(field 5 "$r")"); [ -L "$t" ] && case $(readlink "$t") in "$home"/*) ;; *) false ;; esac || die "$t is not a link made by agx"
+		t=$sd/$(basename "$(field 5 "$r")"); [ -L "$t" ] && case $(readlink "$t") in "$home/$n"/*) ;; *) false ;; esac || die "$t is not a link made by agx"
 		d=$(trashdir); mkdir -p "$d" && mv -- "$t" "$d/agx-skill-$(basename "$t")-$(date +%s)" && echo "agx: link $t moved to the trash (the cache stays)" ;;
 	*) die "usage: agx skill install|list|remove NAME" ;;
 	esac ;;
-path) printf '%s\n' "$home/${2:?path needs a NAME}" ;;
+path) valid_name "${2:?path needs a NAME}"; printf '%s\n' "$home/$2" ;;
 mcp)
 	n=${2:?mcp needs a NAME}; [ -n "$(row "$n")" ] || die "no row for $n"
-	printf 'claude mcp add %s -- %s run %s\n' "$n" "$(readlink -f "$0")" "$n" ;;
+	printf 'claude mcp add %s -- %q run %s\n' "$n" "$(readlink -f "$0")" "$n" ;;
 -*) die "unknown option $1 (agx --help)" ;;
 *) run "$@" ;;
 esac
