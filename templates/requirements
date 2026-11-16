@@ -31,7 +31,7 @@ run() { # run a step: shown, skipped in dry mode, failure counted
 	[ "$dry" -eq 1 ] || "$@" || { say FAILED "$*"; failed=1; }
 }
 
-while read -r kind name rest; do
+while read -r kind name rest <&3 || [ -n "$kind" ]; do	# fd 3: a step must not eat the list from stdin; || : the last line may lack its newline
 	case $kind in '' | '#'*) continue ;; esac
 	case $kind in
 	cmd)
@@ -40,7 +40,7 @@ while read -r kind name rest; do
 		if command -v "$name" > /dev/null 2>&1; then [ "$mode" != list ] || say have "cmd $name"
 		else missing=1; say missing "cmd $name (package $pkg)"; syspk="$syspk $pkg"; fi ;;
 	pip)
-		base=${name%%[=<>~!]*}
+		base=${name%%[=<>~!;]*}; base=${base%%\[*}
 		if [ -x .venv/bin/pip ] && .venv/bin/pip show -q "$base" > /dev/null 2>&1; then [ "$mode" != list ] || say have "pip $name"
 		else missing=1; say missing "pip $name"; [ "$mode" != install ] || pips="${pips:-} $name"; fi ;;
 	npm)
@@ -48,10 +48,10 @@ while read -r kind name rest; do
 		if [ -d "node_modules/$base" ]; then [ "$mode" != list ] || say have "npm $name"
 		else missing=1; say missing "npm $name"; [ "$mode" != install ] || npms="${npms:-} $name"; fi ;;
 	cargo)
-		if [ -x ".local/bin/$name" ]; then [ "$mode" != list ] || say have "cargo $name"
+		if [ -x ".local/bin/$name" ] || grep -qF "\"$name " .local/.crates.toml 2> /dev/null; then [ "$mode" != list ] || say have "cargo $name"
 		else missing=1; say missing "cargo $name"; [ "$mode" != install ] || run cargo install --locked --root .local "$name" ${rest:+--version "$rest"}; fi ;;
 	go)
-		bin=$(basename "${name%@*}")
+		bin=$(basename "${name%@*}"); case $bin in v[0-9]*) bin=$(basename "$(dirname "${name%@*}")") ;; esac
 		if [ -x ".local/bin/$bin" ]; then [ "$mode" != list ] || say have "go $name"
 		else missing=1; say missing "go $name"; [ "$mode" != install ] || run env GOBIN="$PWD/.local/bin" go install "$name"; fi ;;
 	refs)
@@ -60,7 +60,7 @@ while read -r kind name rest; do
 		else missing=1; say missing refs; [ "$mode" != install ] || run ./download_references; fi ;;
 	*) echo "requirements: $list: unknown kind '$kind'" >&2; exit 2 ;;
 	esac
-done < "$list"
+done 3< "$list"
 
 case $mode in
 list) exit 0 ;;

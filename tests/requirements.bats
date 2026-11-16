@@ -85,3 +85,43 @@ setup() {
 	run ./requirements --nope
 	[ "$status" -eq 2 ]
 }
+
+@test "the last line of requirements.list counts without a final newline" {
+	printf 'cmd sh\ncmd last-line-missing' > requirements.list
+	run ./requirements check
+	[ "$status" -eq 1 ]
+	[[ $output == *"missing cmd last-line-missing"* ]]
+}
+
+@test "pip extras and version markers are recognised as installed" {
+	mkdir -p .venv/bin
+	printf '#!/bin/sh\necho "pip $*" >> "%s"\n[ "$1" = show ] && [ "$3" = requests ] && exit 0\nexit 1\n' "$PWD/calls.log" > .venv/bin/pip
+	chmod +x .venv/bin/pip
+	printf 'pip requests[security]>=2.0\n' > requirements.list
+	run ./requirements check
+	[ "$status" -eq 0 ]
+}
+
+@test "a step that reads stdin does not eat the rest of requirements.list" {
+	printf '#!/bin/sh\ncat > /dev/null\nmkdir -p references/x\n' > download_references; chmod +x download_references
+	printf 'refs\ncmd after-refs-missing\n' > requirements.list
+	run ./requirements < /dev/null
+	[[ $output == *"missing cmd after-refs-missing"* ]]
+	grep -q 'sudo pacman -S --needed --noconfirm after-refs-missing' calls.log
+}
+
+@test "a crate whose binary has another name is found through cargo's own record" {
+	mkdir -p .local/bin
+	printf '"ripgrep 14.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = ["rg"]\n' > .local/.crates.toml
+	: > .local/bin/rg; chmod +x .local/bin/rg
+	printf 'cargo ripgrep 14.0.0\n' > requirements.list
+	run ./requirements check
+	[ "$status" -eq 0 ]
+}
+
+@test "a go module with a /vN suffix installs a binary named after the path before it" {
+	mkdir -p .local/bin; : > .local/bin/tool; chmod +x .local/bin/tool
+	printf 'go example.com/x/tool/v2@v2.1.0\n' > requirements.list
+	run ./requirements check
+	[ "$status" -eq 0 ]
+}
