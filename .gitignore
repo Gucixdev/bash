@@ -9,3 +9,11 @@ installer/.tos/
 comfy/data/
 comfy/ComfyUI/
 comfy/venv/
+
+# comfylauncher runtime data (models, nodes, venv) after the move into src/
+src/launchers/comfylauncher/data/
+src/launchers/comfylauncher/ComfyUI/
+src/launchers/comfylauncher/venv/
+src/launchers/.reqhash
+src/launchers/templeos/*.ISO
+src/launchers/templeos/disk.img

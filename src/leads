@@ -24,6 +24,22 @@
 #             /api/v2/search is NOT used: its status search needs a logged-in user. Boosts are ignored.
 #   rss       any RSS 2.0 or Atom feed URL. Feeds with a DOCTYPE/ENTITY are refused.
 #   x, twitter, facebook, instagram, linkedin: no free official access, a line says so and they are skipped.
+
+
+
+
+#  dodac nw nextdoor linkedin totaljobs etc wiecej 
+
+
+
+
+
+
+
+
+
+
+
 #
 # leads.tsv columns: date (UTC, ISO), source, query, author, url, title/snippet, score 0-100. Dedupe is by url. `list` shows the
 # row number, which is also the N of `leads open N` (stable while you only append).

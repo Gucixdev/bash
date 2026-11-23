@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# roblox - make a Roblox game from the command line and publish it: a Rojo project, checks, a place file, Open Cloud.
+# roblox - make a Roblox game from the command line: a Rojo project, checks, a place file. Publishing is roblox_publish.
 #
 #   roblox new NAME        scaffold ./NAME: default.project.json, src/ (server script, shared module, client script),
 #                          selene.toml, roblox.conf, .gitignore, README. Existing files are never overwritten.
@@ -9,33 +9,11 @@
 #                          reports globals such as `game` as unknown; the scaffold marks its scripts `--!nocheck`
 #                          (syntax errors still show), remove that line to get type checking.
 #   roblox build           rojo build -o build/NAME.rbxl (NAME is the "name" in default.project.json)
-#   roblox publish [--yes] [--saved] [--api universes|assets] [--file PATH]
-#                          upload the place file with Open Cloud. A DRY RUN unless --yes: prints the request with the
-#                          key masked and calls nothing. --saved stores the version without publishing it.
+#   roblox publish ...     runs roblox_publish, its own file: the Open Cloud upload (a dry run unless --yes) and its key
+#                          live only there, so building and checking never touch them.
 #   roblox -h | --help
 #
 # Run these inside the project folder. Nothing asks a question.
-#
-# Publishing
-#   api universes (default)  POST https://apis.roblox.com/universes/v1/UNIVERSE/places/PLACE/versions?versionType=
-#                            Published|Saved, Content-Type application/octet-stream, the .rbxl as the body.
-#                            API key permission: universe-places:write for the experience.
-#   api assets               PATCH https://apis.roblox.com/assets/v1/assets/PLACE, multipart: request={assetId,
-#                            assetType:Place, published:true|false} and fileContent=the .rbxl. This is the call the
-#                            current "Usage guide for place publishing" documents. It answers with an operation
-#                            path (operations/ID) because Roblox processes the upload afterwards; check it with
-#                            GET https://apis.roblox.com/assets/v1/operations/ID. Key permission: assets, read and
-#                            write on the experience. Places with EditableImage, EditableMesh, PartOperation,
-#                            SurfaceAppearance or BaseWrap cannot be updated this way (publish from Studio).
-#   The key is sent through a private temporary curl config file (mode 600, removed on exit), never on the command
-#   line, so it does not show in ps.
-#
-# Settings (environment first, then roblox.conf in the project, lines KEY=value)
-#   ROBLOX_API_KEY       env, or a line ROBLOX_API_KEY=... in ~/.secrets (never read from roblox.conf, never printed)
-#   ROBLOX_UNIVERSE_ID   number, needed for api universes
-#   ROBLOX_PLACE_ID      number
-#   ROBLOX_API           universes (default) or assets
-#   ROBLOX_VERSION_TYPE  Published (default) or Saved
 #
 # Getting the tools (nothing is installed by this script)
 #   rojo           rokit add rojo-rbx/rojo   |   cargo install rojo --version ^7   |  binary from
@@ -43,10 +21,10 @@
 #   luau-analyze   release archive of https://github.com/luau-lang/luau (put it on PATH)
 #   selene, stylua cargo install selene stylua   (or the GitHub releases)
 #
-# Exit status: 0 done (a dry run, or checks skipped because no checker is installed); 1 a check, build or upload
-# failed; 2 bad usage; 3 something needed is missing (project file, rojo, curl, place file, ids, API key).
+# Exit status: 0 done (or checks skipped because no checker is installed); 1 a check or the build failed; 2 bad
+# usage; 3 something needed is missing (project file, rojo).
 #
-# Verified against the docs on 2026-11-16: both publish endpoints and their headers/fields, rojo build -o, the
+# Verified against the docs on 2026-11-16: rojo build -o, the
 # .luau script suffixes (Rojo 7.2+), stylua --check, luau-analyze FILE. Not verified: selene's exact CLI and
 # `std = "roblox"` in selene.toml (written from memory), rojo's default.project.json for this layout.
 
@@ -70,25 +48,6 @@ project_name() {
 	n=$(sed -n 's/^[[:space:]]*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PROJECT" | head -n 1)
 	[ -n "$n" ] || die 3 "no \"name\" in $PROJECT"
 	printf '%s\n' "$n" | tr -c 'A-Za-z0-9_.\n-' '_'
-}
-
-# conf KEY: the environment wins, then the last KEY=value line of ./roblox.conf (quotes stripped, never sourced).
-conf() {
-	local v=${!1:-}
-	if [ -z "$v" ] && [ -f roblox.conf ]; then
-		v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" roblox.conf | tail -n 1 | sed -E "s/[[:space:]]+\$//; s/^([\"'])(.*)\1\$/\2/")
-	fi
-	printf '%s' "$v"
-}
-
-# api_key: ROBLOX_API_KEY from the environment, else from ~/.secrets (KEY=value or export KEY=value).
-api_key() {
-	local v=${ROBLOX_API_KEY:-}
-	if [ -z "$v" ] && [ -f "${HOME:-/nonexistent}/.secrets" ]; then
-		v=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?ROBLOX_API_KEY=//p' "$HOME/.secrets" | tail -n 1 |
-			sed -E "s/[[:space:]]+\$//; s/^([\"'])(.*)\1\$/\2/")
-	fi
-	printf '%s' "$v"
 }
 
 # put FILE: write stdin to FILE unless it already exists (so 'new' can be run again safely).
@@ -172,7 +131,7 @@ EOF
 std = "roblox"
 EOF
 	put roblox.conf << 'EOF'
-# Open Cloud ids for 'roblox publish' (environment variables of the same name win). No API key here:
+# Open Cloud ids for roblox_publish (environment variables of the same name win). No API key here:
 # it comes from ROBLOX_API_KEY or ~/.secrets.
 # ROBLOX_UNIVERSE_ID=
 # ROBLOX_PLACE_ID=
@@ -192,8 +151,8 @@ A Roblox game built with Rojo and the \`roblox\` helper.
 
     roblox check      lint and format-check src/ with whatever is installed
     roblox build      build/$name.rbxl (needs rojo)
-    roblox publish    DRY RUN: shows the Open Cloud request, key masked
-    roblox publish --yes   really upload
+    roblox_publish    DRY RUN: shows the Open Cloud request, key masked
+    roblox_publish --yes   really upload
 
 Layout: src/ServerScriptService (*.server.luau), src/ReplicatedStorage (*.luau
 modules), src/StarterPlayer/StarterPlayerScripts (*.client.luau).
@@ -263,100 +222,12 @@ cmd_build() {
 	if rojo build -o "$out"; then say "built $out"; else die 1 "rojo build failed"; fi
 }
 
-# safe_path PATH: curl config values sit in double quotes; refuse a path that would need escaping.
-safe_path() {
-	case $1 in *[\"\\\;]* | *$'\n'*) die 1 "refusing a place file path with quote, backslash, ; or newline: $1" ;; esac
-}
-
-cmd_publish() {
-	local yes=0 version api file='' arg
-	version=$(conf ROBLOX_VERSION_TYPE); version=${version:-Published}
-	api=$(conf ROBLOX_API); api=${api:-universes}
-	while [ $# -gt 0 ]; do
-		arg=$1
-		case $arg in
-		--yes) yes=1; shift ;;
-		--saved) version=Saved; shift ;;
-		--api) [ $# -ge 2 ] || die 2 "--api needs universes or assets"; api=$2; shift 2 ;;
-		--file) [ $# -ge 2 ] || die 2 "--file needs a path"; file=$2; shift 2 ;;
-		*) die 2 "unknown argument: $arg (see roblox --help)" ;;
-		esac
-	done
-	case $version in Published | Saved) ;; *) die 2 "ROBLOX_VERSION_TYPE must be Published or Saved, not: $version" ;; esac
-	case $api in universes | assets) ;; *) die 2 "api must be universes or assets, not: $api" ;; esac
-	need_project
-
-	local universe place key name
-	universe=$(conf ROBLOX_UNIVERSE_ID)
-	place=$(conf ROBLOX_PLACE_ID)
-	key=$(api_key)
-	if [ -z "$file" ]; then name=$(project_name) || exit $?; file=build/$name.rbxl; fi
-	[ -f "$file" ] || die 3 "place file $file not found; run 'roblox build' first (or pass --file PATH)"
-	case $place in '' | *[!0-9]*) die 3 "ROBLOX_PLACE_ID missing or not a number (environment or roblox.conf)" ;; esac
-	if [ "$api" = universes ]; then
-		case $universe in '' | *[!0-9]*) die 3 "ROBLOX_UNIVERSE_ID missing or not a number (environment or roblox.conf)" ;; esac
-	fi
-	file=$(cd -- "$(dirname -- "$file")" && printf '%s/%s' "$PWD" "$(basename -- "$file")")
-	safe_path "$file"
-	if [ -n "$key" ]; then
-		case $key in *[!A-Za-z0-9+/=_.-]*) die 3 "ROBLOX_API_KEY has unexpected characters (not shown)" ;; esac
-	fi
-
-	local url method published
-	if [ "$api" = universes ]; then
-		method=POST
-		url="https://apis.roblox.com/universes/v1/$universe/places/$place/versions?versionType=$version"
-	else
-		method=PATCH
-		url="https://apis.roblox.com/assets/v1/assets/$place"
-		published=false; [ "$version" = Published ] && published=true
-	fi
-	local size
-	size=$(wc -c < "$file" | tr -d ' ')
-
-	if [ "$yes" -eq 0 ]; then
-		say "DRY RUN: nothing is sent. Add --yes to upload."
-		printf '%s %s\n' "$method" "$url"
-		if [ -n "$key" ]; then printf 'x-api-key: ********\n'; else printf 'x-api-key: (no key found: set ROBLOX_API_KEY or put it in ~/.secrets)\n'; fi
-		if [ "$api" = universes ]; then
-			printf 'Content-Type: application/octet-stream\nbody: %s (%s bytes)\n' "$file" "$size"
-		else
-			printf 'form request={"assetId": %s, "assetType": "Place", "published": %s}\n' "$place" "$published"
-			printf 'form fileContent=@%s;type=application/octet-stream (%s bytes)\n' "$file" "$size"
-		fi
-		exit 0
-	fi
-
-	[ -n "$key" ] || die 3 "no API key: set ROBLOX_API_KEY or add ROBLOX_API_KEY=... to ~/.secrets"
-	have curl || die 3 "curl is missing"
-	cfg=$(umask 077 && mktemp "${TMPDIR:-/tmp}/roblox-curl.XXXXXX") || die 1 "cannot create a temporary file"
-	trap 'rm -f -- "$cfg"' EXIT	# cfg is global on purpose: a quote in TMPDIR must not break the trap
-	chmod 600 "$cfg"
-	{
-		printf 'url = "%s"\nrequest = "%s"\n' "$url" "$method"
-		printf 'header = "x-api-key: %s"\n' "$key"
-		if [ "$api" = universes ]; then
-			printf 'header = "Content-Type: application/octet-stream"\ndata-binary = "@%s"\n' "$file"
-		else
-			printf 'form-string = "request={\\"assetId\\": %s, \\"assetType\\": \\"Place\\", \\"published\\": %s}"\n' "$place" "$published"
-			printf 'form = "fileContent=@\\"%s\\";type=application/octet-stream"\n' "$file"	# quoted: curl splits an unquoted @a,b into two files
-		fi
-		printf 'silent\nshow-error\nfail-with-body\nwrite-out = "\\nHTTP %%{http_code}\\n"\n'
-	} > "$cfg"
-	say "uploading $file ($size bytes) as $version via $api API"
-	if curl --config "$cfg"; then
-		say "done"
-	else
-		die 1 "upload failed (response above); 401/403: key or its permission, 404: ids, 409: place not in universe"
-	fi
-}
-
 [ $# -ge 1 ] || die 2 "usage: roblox new|check|build|publish (roblox --help)"
 cmd=$1; shift
 case $cmd in
 new) cmd_new "$@" ;;
 check) cmd_check "$@" ;;
 build) cmd_build "$@" ;;
-publish) cmd_publish "$@" ;;
+publish) exec "$(dirname -- "$(readlink -f -- "$0")")/roblox_publish" "$@" ;;
 *) die 2 "unknown command: $cmd (roblox --help)" ;;
 esac

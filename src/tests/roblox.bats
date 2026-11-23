@@ -135,124 +135,6 @@ proj() { # a project with ids, a place file and no key
 	[[ $output == *"cargo install rojo"* ]]
 }
 
-@test "roblox publish: dry run prints the request, masks the key, never calls curl" {
-	proj
-	fakes
-	export ROBLOX_API_KEY=$KEY
-	run "$RB" publish
-	[ "$status" -eq 0 ]
-	[[ $output == *"DRY RUN"* ]]
-	[[ $output == *"POST https://apis.roblox.com/universes/v1/111/places/222/versions?versionType=Published"* ]]
-	[[ $output == *"x-api-key: ********"* ]]
-	[[ $output == *"application/octet-stream"* ]]
-	[[ $output != *"$KEY"* ]]
-	[ ! -e "$T/curl.argv" ]
-}
-
-@test "roblox publish: --saved changes versionType; ids from roblox.conf" {
-	proj
-	fakes
-	unset ROBLOX_UNIVERSE_ID ROBLOX_PLACE_ID
-	printf 'ROBLOX_UNIVERSE_ID=5\nROBLOX_PLACE_ID="6"\n' > roblox.conf
-	run "$RB" publish --saved
-	[ "$status" -eq 0 ]
-	[[ $output == *"universes/v1/5/places/6/versions?versionType=Saved"* ]]
-}
-
-@test "roblox publish --yes: curl gets the URL, headers and body file; key is not in argv" {
-	proj
-	fakes
-	export ROBLOX_API_KEY=$KEY
-	run "$RB" publish --yes
-	[ "$status" -eq 0 ]
-	[[ $output == *"versionNumber"* ]]
-	nokey
-	[[ $output != *"$KEY"* ]]
-	grep -qx 'url = "https://apis.roblox.com/universes/v1/111/places/222/versions?versionType=Published"' "$T/curl.cfg"
-	grep -qx 'request = "POST"' "$T/curl.cfg"
-	grep -qx "header = \"x-api-key: $KEY\"" "$T/curl.cfg"
-	grep -qx 'header = "Content-Type: application/octet-stream"' "$T/curl.cfg"
-	grep -q "^data-binary = \"@.*/build/demo.rbxl\"" "$T/curl.cfg"
-	[ "$(cat "$T/curl.mode")" = 600 ]
-	[ ! -e "$(cat "$T/curl.cfgpath")" ]
-}
-
-@test "roblox publish --yes: key from ~/.secrets" {
-	proj
-	fakes
-	printf 'OTHER=1\nexport ROBLOX_API_KEY="%s"\n' "$KEY" > "$HOME/.secrets"
-	run "$RB" publish --yes
-	[ "$status" -eq 0 ]
-	grep -qx "header = \"x-api-key: $KEY\"" "$T/curl.cfg"
-	nokey
-}
-
-@test "roblox publish --yes --api assets: PATCH with the multipart form, no universe id needed" {
-	proj
-	fakes
-	unset ROBLOX_UNIVERSE_ID
-	export ROBLOX_API_KEY=$KEY
-	run "$RB" publish --yes --api assets
-	[ "$status" -eq 0 ]
-	grep -qx 'url = "https://apis.roblox.com/assets/v1/assets/222"' "$T/curl.cfg"
-	grep -qx 'request = "PATCH"' "$T/curl.cfg"
-	grep -qF 'form-string = "request={\"assetId\": 222, \"assetType\": \"Place\", \"published\": true}"' "$T/curl.cfg"
-	grep -q '^form = "fileContent=@\\".*/build/demo.rbxl\\";type=application/octet-stream"' "$T/curl.cfg"
-	nokey
-}
-
-@test "roblox publish --yes: no key is exit 3 and curl is not called" {
-	proj
-	fakes
-	run "$RB" publish --yes
-	[ "$status" -eq 3 ]
-	[[ $output == *"no API key"* ]]
-	[ ! -e "$T/curl.argv" ]
-}
-
-@test "roblox publish: dry run without a key still shows the request and says the key is missing" {
-	proj
-	fakes
-	run "$RB" publish
-	[ "$status" -eq 0 ]
-	[[ $output == *"no key found"* ]]
-}
-
-@test "roblox publish: missing ids or place file are exit 3" {
-	proj
-	fakes
-	unset ROBLOX_PLACE_ID
-	run "$RB" publish
-	[ "$status" -eq 3 ]
-	[[ $output == *"ROBLOX_PLACE_ID"* ]]
-	export ROBLOX_PLACE_ID=222
-	mv build/demo.rbxl "$T/moved.rbxl"
-	run "$RB" publish
-	[ "$status" -eq 3 ]
-	[[ $output == *"roblox build"* ]]
-}
-
-@test "roblox publish --yes: a failing upload is exit 1 and the temp file is gone" {
-	proj
-	fakes
-	export ROBLOX_API_KEY=$KEY
-	CURL_RC=22 run "$RB" publish --yes
-	[ "$status" -eq 1 ]
-	[ ! -e "$(cat "$T/curl.cfgpath")" ]
-}
-
-@test "roblox publish: bad ids or key characters are refused" {
-	proj
-	fakes
-	export ROBLOX_PLACE_ID='1;2'
-	run "$RB" publish
-	[ "$status" -eq 3 ]
-	export ROBLOX_PLACE_ID=222 ROBLOX_API_KEY='a"b'
-	run "$RB" publish --yes
-	[ "$status" -eq 3 ]
-	[ ! -e "$T/curl.argv" ]
-}
-
 @test "roblox build: a project file without a name stops before rojo runs" {
 	proj
 	fakes
@@ -280,32 +162,21 @@ proj() { # a project with ids, a place file and no key
 	[[ $output != *"ready:"* ]]
 }
 
-@test "roblox publish --yes: the key file is removed even when TMPDIR has a quote in it" {
-	proj
-	fakes
-	export ROBLOX_API_KEY=$KEY
-	mkdir -p "$T/it's tmp"
-	TMPDIR="$T/it's tmp" run "$RB" publish --yes
-	[ "$status" -eq 0 ]
-	[ -z "$(ls -A "$T/it's tmp")" ]
-}
-
-@test "roblox publish --yes --api assets: a comma or space in the place file path is one file" {
-	proj
-	fakes
-	export ROBLOX_API_KEY=$KEY
-	cp build/demo.rbxl "$T/a, b.rbxl"
-	run "$RB" publish --yes --api assets --file "$T/a, b.rbxl"
-	[ "$status" -eq 0 ]
-	grep -qF "form = \"fileContent=@\\\"$T/a, b.rbxl\\\";type=application/octet-stream\"" "$T/curl.cfg"
-}
-
 @test "roblox check: two \"\$path\" entries on one line are both checked" {
 	proj
 	printf '{ "name": "demo", "tree": { "$className": "DataModel", "A": { "$path": "nowhere" }, "B": { "$path": "src/ServerScriptService" } } }\n' > default.project.json
 	run "$RB" check
 	[ "$status" -eq 1 ]
 	[[ $output == *"nowhere"* ]]
+}
+
+@test "roblox publish: runs roblox_publish (same dry run)" {
+	fakes
+	proj
+	run "$RB" publish
+	[ "$status" -eq 0 ]
+	[[ $output == *"DRY RUN"* ]]
+	[[ $output == *"roblox_publish:"* ]]
 }
 
 @test "roblox: shellcheck clean" {
