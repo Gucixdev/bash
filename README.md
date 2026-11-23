@@ -11,7 +11,7 @@ git clone https://github.com/Gucixdev/bash && cd bash
 ln -s "$PWD/logcollector" ~/.local/bin/    # put any tool on PATH
 ```
 
-`bats tests/` runs the tests. Scripts are also kept clean under
+`bats src/tests/` runs the tests. Scripts are also kept clean under
 `shellcheck -S warning`.
 
 ## Interactive managers
@@ -43,10 +43,8 @@ the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 | `claude_maintain` | Checks `~/.claude` for rot: broken skill links, memory index drift, bad settings JSON, hooks that point nowhere, what weighs most. Reports only; `-f` trashes broken skill links, nothing is deleted. |
 | `agx` | Runs tools for AI agents (MCP servers, CLIs) without installing them, like npx: a registry row says npm, pip, git, a checked download or a Claude Code skill (`agx skill install`, pinned commit, links into ~/.claude/skills), the first run fetches into a cache after a yes, later runs work offline. `agx mcp NAME` prints the `claude mcp add` line. | npm, uv or python3, git, curl |
 | `bake` | Describe an image once in a small `NAME.bake` file (base, pkg, `git URL REF DEST`, run, `check CMD => TEXT`, port/mount/gpu), then build a container, export a rootfs tarball, or run a QEMU VM (`kind vm`, ISO + disk). Git sources and ISOs follow upstream: `bake build` refetches, `bake outdated` says what moved. Ready-made `bakes/comfyui.bake` and `bakes/templeos.bake`. | podman or docker, qemu, git |
-| `roblox` | Roblox games from the command line: `roblox new NAME` scaffolds a Rojo project, `check` runs luau-analyze/selene/stylua when installed, `build` runs rojo. |
-| `roblox_publish` | Uploads the built place through Open Cloud: a dry run unless `--yes`, key from env or ~/.secrets, never on the command line. `roblox publish` still runs it. |
-| `godot` | The real godot CLI plus project commands: `new`, `run`, `editor`, `import`, `check` (parse every .gd), `test`, `bench`, `export`, `mcp`, `iso` (run in a throwaway copy beside an open editor), `doctor`; any other argument goes to the real godot unchanged. |
-| `godot_publish` | Sends an export to itch.io (butler), a GitHub release (gh) or a zip: a dry run unless `--yes`, key from env or ~/.secrets. |
+| `roblox` | Roblox games from the command line: `roblox new NAME` scaffolds a Rojo project, `check` runs luau-analyze/selene/stylua when installed, `build` runs rojo. `roblox_publish` uploads the built place through Open Cloud: a dry run unless `--yes`, key from env or ~/.secrets. |
+| `godot` | The real godot CLI plus project commands: `new`, `run`, `editor`, `import`, `check` (parse every .gd), `test`, `bench`, `export`, `mcp`, `iso` (run in a throwaway copy beside an open editor), `doctor`; any other argument goes to the real godot unchanged. `godot_publish` sends an export to itch.io (butler), a GitHub release (gh) or a zip, dry run unless `--yes`. |
 | `leads` | Finds public posts where someone asks for or complains about what you sell: `leads.queries` (SOURCE, TAB, QUERY) over HN Algolia, Reddit search JSON, a Mastodon instance's hashtag timeline and RSS/Atom; X, Facebook and LinkedIn are skipped (no free official API). `run` appends new hits to `leads.tsv` with a 0-100 score, `list --min N`, `open N` prints the url. Read-only, no keys, 1 request/s per host, 1 h cache, stops on 403/429. | python3 |
 | `repos` | Keeps every git repo of one folder (`$REPOS_ROOT`, default `/data/dev/github`) in step with GitHub: `status`, `fetch`, `pull`, `push`, `needmerge`, `merge`. Never forces, never resets, never deletes; when both sides moved, the remote's version goes to the branch `needmerge/BRANCH` and nothing else changes. | git, fzf optional |
 | `lean4/` | Proofs next to the tools they describe: `lean4/repos.lean` models `repos` (pull and push never lose a commit, a fast-forward only on a clean tree). `lean4/check` compiles every file and fails on `sorry`, an error or an unusual axiom. | lean (elan, no default needed) |
@@ -66,12 +64,10 @@ the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 
 | path | what |
 |---|---|
-| `comfy/comfylauncher` | ComfyUI in one folder (venv, no container): `install update start stop status models nodes logs doctor`, plus `gen flow loop qa card window` for the asset helpers in `comfy/helpers/`. No arguments: a menu. Data (models, nodes, output) in `comfy/data`, git-ignored. Adds `--lowvram` under 6 GB of VRAM. |
-| `protonlauncher` | run a Windows exe through Proton (GE-Proton from Steam's `compatibilitytools.d`), one prefix per game, env presets, gamemode/mangohud/gamescope when present: `tools list run presets prefix winecfg winetricks doctor`. |
-| `installer/blenderlauncher` | clone, build and run Blender. |
-| `installer/templeos` | TempleOS in QEMU. |
-
-`installer/` holds only real one-shot installers; long-lived tools sit at the top level or in their own folder.
+| `src/launchers/comfylauncher/comfylauncher` | ComfyUI in one folder (venv, no container): `install update start stop status models nodes logs doctor`, plus `gen flow loop qa card window` for the asset helpers in `comfy/helpers/`. No arguments: a menu. Data (models, nodes, output) in `comfy/data`, git-ignored. Adds `--lowvram` under 6 GB of VRAM. |
+| `src/launchers/protonlauncher/protonlauncher` | run a Windows exe through Proton (GE-Proton from Steam's `compatibilitytools.d`), one prefix per game, env presets, gamemode/mangohud/gamescope when present: `tools list run presets prefix winecfg winetricks doctor`. |
+| `src/launchers/blenderlauncher/blenderlauncher` | clone, build and run Blender. |
+| `src/launchers/templeos/templeos` | TempleOS in QEMU. |
 
 ## More
 
@@ -85,10 +81,8 @@ lib/lazytui      reference copy of the lt_* UI helpers tools carry
 lib/settings     per-app KEY=VALUE settings: get, set, unset, list, export
 lib/wizard       ask a list of questions, print answers as eval-able assignments
 lib/dspq, evq    download queue and event queue for shell scripts
-comfy/           comfylauncher + helpers (asset generation), one folder
-installer/       one-shot clone, build, run scripts
+src/             the newer tools, moved here: launchers/, distro/, gamedev/, lean4/, tests/ (bats)
 templates/       run, build, setup, requirements, wizard, bench, compare, test, download_references: starting points
-tests/           bats: libs, every tool's offline behaviour, --help, shellcheck
 ```
 
 ## Status
