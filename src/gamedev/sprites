@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# sprites - layered image -> sprite PNGs -> one sprite sheet, in one tool.
+#
+#   sprites split [-o DIR] [-t] [-a] FILE.xcf      every layer becomes DIR/NN-name.png + DIR/layers.tsv
+#   sprites grid  [-c COLS] [-p PAD] [-o grid.png] SPRITE.png...   many sprites -> one sheet + FILE.tsv map
+#   sprites sheet [-o DIR] [-t] [-a] [-c COLS] [-p PAD] FILE.xcf    both: split, then DIR.sheet.png from the sprites
+#
+# split: -o DIR where the sprites go (default: a folder named like the file), -t trim transparent borders (layers.tsv
+#   keeps the true position), -a also hidden layers. NN = stacking order, bottom layer 00; layers.tsv has one line per
+#   sprite: index, file, layer name, x, y, w, h (where it sat on the canvas). A layer group is one sprite. Needs GIMP 3
+#   (gimp-console, or the flatpak org.gimp.GIMP; headless) and, for -t, ImageMagick.
+# grid: -c COLS columns (default as square as possible), -p PAD transparent pixels between cells and around the sheet,
+#   -o FILE output (default grid.png). Every cell has the size of the biggest sprite, smaller ones sit top-left. FILE.tsv:
+#   index, file, column, row, x, y, w, h, so a game engine can cut the sheet again. Needs ImageMagick.
+# sheet: the sheet is DIR.sheet.png with DIR.sheet.tsv; the sprites stay in DIR.
+# Exit: 0 fine, 1 failed, 2 bad usage.
+set -u
+case ${1:-} in -h | --help | '') awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; [ -n "${1:-}" ]; exit $(($? * 2)) ;; esac
+
+die() { printf 'sprites: %s\n' "$*" >&2; exit "${2:-2}"; }
+cleanup=()
+# shellcheck disable=SC2154
+trap 'for p in "${cleanup[@]}"; do mv "$p" "${TMPDIR:-/tmp}/sprites.$$.${p##*/}" 2> /dev/null; done' EXIT   # kept for a look, never deleted
+q() { python3 -c 'import sys; print(repr(sys.argv[1]))' "$1"; }
+
+# split TRIM HIDDEN OUT FILE
+split() {
+	local trim=$1 hidden=$2 out=$3 in=$4 work job log gimp i fn name x y w h box
+	[ -f "$in" ] || die "no such file: $in" 1
+	in=$(readlink -f "$in")
+	[ -n "$out" ] || out="${in%.*}"
+	mkdir -p "$out" || die "cannot create $out" 1
+	out=$(readlink -f "$out")
+	[ "$trim" -eq 0 ] || command -v magick > /dev/null || die "-t needs ImageMagick (magick)" 1
+	work=$(mktemp -d) || die "no temp dir" 1
+	cleanup+=("$work")
+	job="$work/job.py"
+	{
+		printf 'IN = %s\nOUT = %s\nHIDDEN = %s\n' "$(q "$in")" "$(q "$work")" "$([ "$hidden" -eq 1 ] && echo True || echo False)"
+		cat << 'PY'
+import gi, re
+gi.require_version('Gimp', '3.0')
+from gi.repository import Gimp, Gio
+img = Gimp.file_load(Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(IN))
+layers = list(img.get_layers())      # top first
+layers.reverse()                     # bottom first = 00
+rows = []
+for i, l in enumerate(layers):
+    if not HIDDEN and not l.get_visible():
+        continue
+    ok, x, y = l.get_offsets()
+    name = l.get_name() or "layer"
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', name).strip('_') or "layer"
+    fn = "%02d-%s.png" % (i, safe)
+    Gimp.edit_copy([l])
+    tmp = Gimp.edit_paste_as_new_image()
+    Gimp.file_save(Gimp.RunMode.NONINTERACTIVE, tmp, Gio.File.new_for_path(OUT + "/" + fn), None)
+    tmp.delete()
+    rows.append("%s\t%s\t%d\t%d\t%d\t%d" % (fn, name.replace("\t", " ").replace("\n", " "), x, y, l.get_width(), l.get_height()))
+open(OUT + "/layers.raw", "w").write("\n".join(rows) + ("\n" if rows else ""))
+img.delete()
+print("sprites: %d layers" % len(rows))
+PY
+	} > "$job"
+	if command -v gimp-console > /dev/null; then
+		gimp=(gimp-console)
+	elif command -v flatpak > /dev/null && flatpak info org.gimp.GIMP > /dev/null 2>&1; then
+		gimp=(flatpak run --filesystem="$work" --filesystem="$(dirname "$in")" --command=gimp-console org.gimp.GIMP)
+	else
+		die "GIMP 3 not found (gimp-console or flatpak org.gimp.GIMP)" 1
+	fi
+	log="$work/gimp.log"
+	"${gimp[@]}" -i --batch-interpreter=python-fu-eval -b "exec(open($(q "$job")).read())" --quit > "$log" 2>&1
+	if [ ! -s "$work/layers.raw" ] && ! grep -q 'sprites: 0 layers' "$log"; then
+		grep -v '^GIMP-Message\|stray image' "$log" | tail -8 >&2
+		die "GIMP could not export the layers of $in" 1
+	fi
+	: > "$out/layers.tsv"
+	i=0
+	while IFS=$'\t' read -r fn name x y w h; do
+		if [ "$trim" -eq 1 ]; then
+			# a 1 px transparent frame first: -trim cuts by the corner colour, so a layer with no transparent border must not vanish
+			box=$(magick "$work/$fn" -bordercolor none -border 1 -format '%@' info: 2> /dev/null) || box=
+			if [[ $box =~ ^([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)$ ]]; then
+				w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]}
+				x=$((x + BASH_REMATCH[3] - 1)) y=$((y + BASH_REMATCH[4] - 1))
+				magick "$work/$fn" -bordercolor none -border 1 -trim +repage "$work/$fn.trim" && mv "$work/$fn.trim" "$work/$fn"
+			fi
+		fi
+		cp "$work/$fn" "$out/$fn" || die "cannot write $out/$fn" 1
+		printf '%d\t%s\t%s\t%d\t%d\t%d\t%d\n' "$i" "$fn" "$name" "$x" "$y" "$w" "$h" >> "$out/layers.tsv"
+		i=$((i + 1))
+	done < "$work/layers.raw"
+	printf '%s: %d sprites, map %s/layers.tsv\n' "$out" "$i" "$out"
+	split_out=$out
+}
+
+# grid COLS PAD OUT SPRITE...
+grid() {
+	local cols=$1 pad=$2 out=$3 f n rows sizes cw ch W H tsv i c r x y w h part
+	shift 3
+	[ $# -gt 0 ] || die "grid: no sprites"
+	command -v magick > /dev/null || die "ImageMagick (magick) is not installed" 1
+	local files=()
+	for f in "$@"; do
+		[ -f "$f" ] || die "no such file: $f" 1
+		case $f in -*) files+=("./$f") ;; *) files+=("$f") ;; esac   # a name starting with - is not an option
+	done
+	set -- "${files[@]}"
+	n=$#
+	[ "$cols" -gt 0 ] || cols=$(awk -v n="$n" 'BEGIN { c = int(sqrt(n)); if (c * c < n) c++; print c }')
+	[ "$cols" -le "$n" ] || cols=$n
+	rows=$(((n + cols - 1) / cols))
+	# sizes of every sprite (first frame only), then the biggest one is the cell
+	sizes=$(magick identify -format '%[fx:w] %[fx:h]\n' "${@/%/[0]}" 2> /dev/null) || die "cannot read one of the images" 1
+	[ "$(printf '%s\n' "$sizes" | wc -l)" -eq "$n" ] || die "cannot read one of the images" 1
+	cw=$(printf '%s\n' "$sizes" | awk '$1 > m { m = $1 } END { print m }')
+	ch=$(printf '%s\n' "$sizes" | awk '$2 > m { m = $2 } END { print m }')
+	W=$((cols * cw + (cols + 1) * pad))
+	H=$((rows * ch + (rows + 1) * pad))
+	local args=(-size "${W}x${H}" xc:none)
+	tsv=$(mktemp) || die "no temp file" 1
+	cleanup+=("$tsv")
+	i=0
+	for f in "$@"; do
+		c=$((i % cols)) r=$((i / cols))
+		x=$((pad + c * (cw + pad))) y=$((pad + r * (ch + pad)))
+		read -r w h <<< "$(printf '%s\n' "$sizes" | sed -n "$((i + 1))p")"
+		args+=("${f}[0]" -geometry "+${x}+${y}" -composite)
+		printf '%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\n' "$i" "$f" "$c" "$r" "$x" "$y" "$w" "$h" >> "$tsv"
+		i=$((i + 1))
+	done
+	# write to a temp name first so a failed run never leaves a half sheet under the real name
+	part="$out.part.$$"
+	cleanup+=("$part")
+	magick "${args[@]}" "png:$part" || die "ImageMagick failed" 1
+	if ! { mv "$part" "$out" && cp "$tsv" "${out%.*}.tsv"; }; then die "cannot write $out" 1; fi
+	printf '%s: %d sprites, %d x %d cells of %dx%d, sheet %dx%d, map %s\n' "$out" "$n" "$cols" "$rows" "$cw" "$ch" "$W" "$H" "${out%.*}.tsv"
+}
+
+num() { [[ $2 =~ ^[0-9]+$ ]] || die "-$1 needs a number"; }
+
+cmd=$1
+shift
+case $cmd in
+split)
+	out='' trim=0 hidden=0
+	while getopts o:ta o; do
+		case $o in o) out=$OPTARG ;; t) trim=1 ;; a) hidden=1 ;; *) die "usage: sprites split [-o DIR] [-t] [-a] FILE.xcf" ;; esac
+	done
+	shift $((OPTIND - 1))
+	[ $# -eq 1 ] || die "usage: sprites split [-o DIR] [-t] [-a] FILE.xcf"
+	split "$trim" "$hidden" "$out" "$1"
+	;;
+grid)
+	cols=0 pad=0 out=grid.png
+	while getopts c:p:o: o; do
+		case $o in c) num c "$OPTARG"; cols=$OPTARG ;; p) num p "$OPTARG"; pad=$OPTARG ;; o) out=$OPTARG ;; *) die "usage: sprites grid [-c COLS] [-p PAD] [-o grid.png] SPRITE.png..." ;; esac
+	done
+	shift $((OPTIND - 1))
+	[ $# -gt 0 ] || die "usage: sprites grid [-c COLS] [-p PAD] [-o grid.png] SPRITE.png..."
+	grid "$cols" "$pad" "$out" "$@"
+	;;
+sheet)
+	out='' trim=0 hidden=0 cols=0 pad=0
+	while getopts o:tac:p: o; do
+		case $o in o) out=$OPTARG ;; t) trim=1 ;; a) hidden=1 ;; c) num c "$OPTARG"; cols=$OPTARG ;; p) num p "$OPTARG"; pad=$OPTARG ;; *) die "usage: sprites sheet [-o DIR] [-t] [-a] [-c COLS] [-p PAD] FILE.xcf" ;; esac
+	done
+	shift $((OPTIND - 1))
+	[ $# -eq 1 ] || die "usage: sprites sheet [-o DIR] [-t] [-a] [-c COLS] [-p PAD] FILE.xcf"
+	split_out=''
+	split "$trim" "$hidden" "$out" "$1"
+	shopt -s nullglob
+	pngs=("$split_out"/*.png)
+	[ "${#pngs[@]}" -gt 0 ] || die "no layers to put on a sheet" 1
+	grid "$cols" "$pad" "$split_out.sheet.png" "${pngs[@]}"
+	;;
+*) die "unknown command: $cmd (split, grid, sheet; -h for help)" ;;
+esac

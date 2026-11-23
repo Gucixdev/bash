@@ -57,7 +57,7 @@ the cursor on its row when a view refreshes. An older fzf gets a numbered list.
 | `fixmedia` | Find why a video, song, subtitle or picture misbehaves (cuts out, no or silent sound, DTS/AC3, 10-bit, subtitle garbage) and write `fixed-NAME`; VLC is the judge. `-c` only checks, `--sync`, `--shift`, `--embed`. |
 | `manwriter` | Turn a script's header comment into a man page: `manwriter -d man tool...`. `manwriter new` writes a skeleton. |
 | `textswap` | Privacy filter for a screenshot, photo or clip: swaps a fraction of the words (`--ratio`, default half) for random Chinese characters in the text's own colour on its own background; `--seed` repeats it exactly. Words from tesseract or `--boxes FILE`; videos at `--fps`, no flicker, audio kept ([container recipe](docs/textswap.md)). |
-| `layer2sprite`, `sprite2grid` | GIMP/OpenRaster layers -> one PNG each + `layers.tsv` (`-t` trims; GIMP 3 headless); many sprites -> one sheet + `.tsv` map (`-c`, `-p`). |
+| `sprites` | `split` GIMP/OpenRaster layers -> one PNG each + `layers.tsv` (`-t` trims; GIMP 3 headless); `grid` many sprites -> one sheet + `.tsv` map (`-c`, `-p`); `sheet` both in one step. |
 
 ## Installers, launchers
 
