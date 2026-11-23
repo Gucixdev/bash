@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# todoq - run a todo list through free/paid LLMs in parallel, each item WITH the context of the repo it is about.
+# Every open line of FILE becomes one question; the repo it names (a folder next to FILE's repo) is read first (git status, last commits,
+# file list, README head, a few grep hits), so the answer uses real paths instead of invented ones. The asking is done by `openapi ask`
+# (its failover: free first, paid last). Answers are drafts and plans: nothing here touches your files.
+#
+#   todoq FILE                 answer every open item, 4 at a time, print the answers in list order
+#   todoq -n FILE              dry run: list what would be asked and which repo each item maps to (asks nothing)
+#   todoq -j N FILE            N at a time (default 4)
+#   todoq -a FILE              also ask the lines that look like status notes (default: skipped)
+#   todoq -f FILE              ask again even where an answer is already saved
+#   todoq -m MODEL FILE        model for openapi: auto (default), a provider, or provider/model
+#   todoq -o DIR FILE          where answers are saved, one NNNN.md per line (default ~/.cache/todoq/<FILE name>)
+#   todoq -r DIR FILE          folder holding the repos (default: the folder that holds FILE's own git repo)
+#
+# Skipped: blank lines, # headings, and status notes ("-> zrobione", "(blocked", "done", "GOTOWE", "zielone", "<date>: ... commit/lokalnie").
+# Resumes by itself: a line with a saved non-empty answer is not asked again (-f overrides). An empty answer is not saved.
+# Sent to the model: the item and the repo context. Keys and tokens in that context are masked first; nothing else is filtered,
+# so keep private repos out of -r if you do not want their file names and README heads to leave the machine.
+# Env: TODOQ_ASK = the openapi command (default: openapi), TODOQ_CTX = max context characters per item (default 3000).
+# Exit: 0 = every asked item answered, 1 = some failed (they are retried on the next run), 2 = bad usage.
+set -u
+case ${1:-} in -h | --help | '') awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+die() { printf 'todoq: %s\n' "$*" >&2; exit 2; }
+
+par=4 dry='' all='' force='' model=auto out='' root=''
+while getopts 'nafj:m:o:r:' o; do
+	case $o in
+	n) dry=1 ;; a) all=1 ;; f) force=1 ;; j) par=$OPTARG ;; m) model=$OPTARG ;; o) out=$OPTARG ;; r) root=$OPTARG ;;
+	*) die "unknown option (todoq -h)" ;;
+	esac
+done
+shift $((OPTIND - 1))
+file=${1:-}
+[ -f "$file" ] || die "no such file: ${file:-(none)}"
+case $par in '' | *[!0-9]* | 0) die "-j wants a number above 0" ;; esac
+
+abs() { (cd "$(dirname "$1")" && printf '%s/%s\n' "$PWD" "$(basename "$1")"); }
+file=$(abs "$file")
+if [ -z "$root" ]; then
+	top=$(git -C "$(dirname "$file")" rev-parse --show-toplevel 2> /dev/null) || top=$(dirname "$file")
+	root=$(dirname "$top")
+fi
+[ -d "$root" ] || die "no such folder: $root"
+[ -n "$out" ] || out=${XDG_CACHE_HOME:-$HOME/.cache}/todoq/$(basename "$file")
+ask=${TODOQ_ASK:-openapi}
+ctxmax=${TODOQ_CTX:-3000}
+if [ -z "$dry" ]; then
+	command -v "${ask%% *}" > /dev/null 2>&1 || die "${ask%% *} is missing (set TODOQ_ASK to the openapi command)"
+	mkdir -p "$out" || die "cannot create $out"
+fi
+
+# status notes are history, not work
+status='zrobion|-> *(done|czesciowo|w toku|\(?blocked)|\(blocked|\bGOTOWE\b|\bdone\b|zielon|[0-9]{4}-[0-9]{2}-[0-9]{2}:.*(commit|lokalnie)'
+
+# repo names: the folders in $root, minus generic ones that are no project
+mapfile -t repos < <(for d in "$root"/*/; do n=${d%/}; n=${n##*/}; case $n in unused | docs | tools | src | review | public | trash | archive | tests | .*) continue ;; esac; [ ${#n} -ge 3 ] && printf '%s\n' "$n"; done)
+
+repo_of() { # line -> the repo named EARLIEST in it (the subject of a todo line comes first); on a tie the longer name
+	local r best='' pos bestpos=999999 low
+	low=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+	for r in "${repos[@]}"; do
+		printf '%s\n' "$1" | grep -qiFw -- "$r" || continue
+		pos=$(awk -v s="$low" -v t="$(printf '%s' "$r" | tr '[:upper:]' '[:lower:]')" 'BEGIN { print index(s, t) }')
+		if [ "$pos" -lt "$bestpos" ] || { [ "$pos" -eq "$bestpos" ] && [ ${#r} -gt ${#best} ]; }; then best=$r bestpos=$pos; fi
+	done
+	[ -n "$best" ] && printf '%s\n' "$best"
+}
+
+mask() { sed -E 's/\b(sk|gsk|ghp|gho|AKIA|xox[bap])[-_A-Za-z0-9]{12,}/<secret>/g; s/((password|passwd|token|secret|api_?key)[A-Za-z_]*[=:] *)[^ ]+/\1<secret>/Ig'; }
+
+context() { # repo name, item text -> what the model gets to see about the repo (capped)
+	local d=$root/$1 k
+	{
+		printf 'Repo %s (folder %s):\n' "$1" "$1"
+		git -C "$d" status -sb 2> /dev/null | head -8
+		git -C "$d" log --oneline -5 2> /dev/null
+		printf 'Files:\n'
+		# shellcheck disable=SC2012
+		ls "$d" 2> /dev/null | head -40
+		if [ -f "$d/README.md" ]; then printf 'README.md (head):\n'; head -20 "$d/README.md"; fi
+		for k in $(printf '%s\n' "$2" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_\n' ' ' | tr ' ' '\n' | awk 'length($0) >= 6 && !seen[$0]++' | head -3); do
+			printf 'grep %s:\n' "$k"
+			(cd "$d" && grep -rIn -m2 -iF --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules -- "$k" . 2> /dev/null | head -5 | cut -c1-160)
+		done
+	} | mask | head -c "$ctxmax"
+}
+
+ask_one() { # n, item -> writes $out/NNNN.md if the model answered
+	local n=$1 item=$2 repo ctx prompt ans f
+	f=$out/$(printf '%04d' "$n").md
+	if [ -z "$force" ] && [ -s "$f" ]; then return 0; fi
+	repo=$(repo_of "$item") || repo=''
+	[ -n "$repo" ] && ctx=$(context "$repo" "$item") || ctx='(no repo named in the item; no context)'
+	prompt=$(printf '%s\n\nItem from a developer'"'"'s todo list (terse, Polish/English, "xD" is a smiley):\n%s\n\nContext read from the repo:\n%s\n\nAnswer in the language of the item, at most 6 lines: (1) the first concrete step; use ONLY paths and names that appear in the context, and where one is missing write "not in context" instead of guessing; (2) what you would need to know first; (3) one real risk. Do not restate the item. If the item is a finished status note and not a task, answer only: STATUS NOTE.' \
+		'You help plan work on real repositories.' "$item" "$ctx")
+	ans=$(printf '%s' "$prompt" | $ask ask - -m "$model" -t reason --max-tokens 800 2> /dev/null) || ans=''
+	[ -n "${ans//[[:space:]]/}" ] || { printf 'todoq: line %s: no answer\n' "$n" >&2; return 1; }
+	printf '## line %s: %s\n[%s]\n%s\n' "$n" "$(printf '%s' "$item" | cut -c1-100)" "${repo:-no repo}" "$ans" > "$f"
+}
+
+# ---- read the list
+nums=() items=()
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+	n=$((n + 1))
+	case ${line#"${line%%[![:space:]]*}"} in '' | '#'*) continue ;; esac
+	[ -z "$all" ] && printf '%s\n' "$line" | grep -qiE -- "$status" && continue
+	item=$(printf '%s\n' "$line" | sed -E 's/^[[:space:]]*([-*+][[:space:]]+(\[[ xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+)//; s/[[:space:]]+$//')
+	nums+=("$n") items+=("$item")
+done < "$file"
+[ ${#nums[@]} -gt 0 ] || { echo "nothing to ask" >&2; exit 0; }
+
+if [ -n "$dry" ]; then
+	for i in "${!nums[@]}"; do printf '%s\t%s\t%s\n' "${nums[$i]}" "$(repo_of "${items[$i]}" || printf -- '-')" "$(printf '%s' "${items[$i]}" | cut -c1-90)"; done
+	exit 0
+fi
+
+printf 'todoq: %s items, %s at a time, answers in %s\n' "${#nums[@]}" "$par" "$out" >&2
+for i in "${!nums[@]}"; do
+	while [ "$(jobs -rp | wc -l)" -ge "$par" ]; do wait -n; done
+	ask_one "${nums[$i]}" "${items[$i]}" &
+done
+wait
+
+bad=0
+for i in "${!nums[@]}"; do
+	f=$out/$(printf '%04d' "${nums[$i]}").md
+	if [ -s "$f" ]; then cat "$f"; printf '\n'; else bad=$((bad + 1)); fi
+done
+[ "$bad" -eq 0 ] || { printf 'todoq: %s item(s) got no answer, run again to retry them\n' "$bad" >&2; exit 1; }
