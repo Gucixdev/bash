@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# distrohopper - try another distro or desktop in a window, without a reboot, and hop to the next one the same way.
+# Each hop is a live ISO in QEMU (KVM when /dev/kvm is usable): nothing is installed and nothing is kept unless you say --keep.
+# Hopping stops the one that is running first, so switching desktops is one command. A folder ~/Hop is shared with every guest
+# (inside it: `sudo mount -t 9p -o trans=virtio hop /mnt`).
+#
+#   distrohopper ls                    the catalog, with what is downloaded, kept and running
+#   distrohopper hop NAME [--keep] [--ram 4G] [--cpus 4] [--dry]
+#                                      stop the running guest, fetch the newest ISO (cached, resumed), boot it live.
+#                                      --keep adds a 32G disk that survives, so a hop can become an install you come back to
+#                                      --dry prints the QEMU command and starts nothing
+#   distrohopper url NAME              the ISO address the newest release resolves to
+#   distrohopper now | stop            what runs / stop it
+#   distrohopper rm NAME               forget the kept disk of NAME (the ISO stays cached)
+#
+# The catalog is the CATALOG block below and also ~/.config/distrohopper/catalog (same lines, yours win): `name | what | dir | regex`.
+# `dir` is a web directory and `regex` picks the newest matching file name in it; a `dir` that already ends in .iso is used as is.
+# Env: DISTROHOPPER_HOME (state, default $XDG_STATE_HOME/distrohopper), DISTROHOPPER_SHARE (default ~/Hop). Needs curl, qemu-system-x86_64.
+set -euo pipefail
+
+home=${DISTROHOPPER_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/distrohopper}
+share=${DISTROHOPPER_SHARE:-$HOME/Hop}
+mkdir -p "$home/iso" "$home/disk" "$home/run"
+
+catalog() {
+	sed -n '/^#CATALOG$/,/^#END$/p' "$0" | grep -v '^#'
+	[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/distrohopper/catalog" ] && cat "${XDG_CONFIG_HOME:-$HOME/.config}/distrohopper/catalog"
+	return 0
+}
+
+row() { catalog | awk -F' *\\| *' -v n="$1" '$1 == n { print; exit }'; }
+
+resolve() { # NAME -> ISO address
+	local line dir re base page v
+	line=$(row "$1")
+	[ -n "$line" ] || { echo "distrohopper: no such distro: $1 (distrohopper ls)" >&2; return 1; }
+	IFS='|' read -r _ _ dir re <<< "$line"
+	dir=$(echo "$dir" | xargs) re=$(echo "$re" | xargs)
+	case $dir in
+	*.iso) echo "$dir"; return ;;
+	FEDORA) # newest release number, then the Spins folder of it
+		base=https://dl.fedoraproject.org/pub/fedora/linux/releases/
+		v=$(curl -fsL --max-time 30 "$base" | grep -oE '>[0-9]+/' | tr -d '>/' | sort -n | tail -1)
+		dir=$base$v/Spins/x86_64/iso/ ;;
+	esac
+	page=$(curl -fsL --max-time 30 "$dir") || { echo "distrohopper: cannot read $dir" >&2; return 1; }
+	v=$(echo "$page" | grep -oE "$re" | sort -uV | tail -1)
+	[ -n "$v" ] || { echo "distrohopper: nothing matching $re in $dir" >&2; return 1; }
+	echo "$dir$v"
+}
+
+pidfile=$home/run/qemu.pid
+running() { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2> /dev/null; }
+stop() {
+	running || return 0
+	kill "$(cat "$pidfile")" 2> /dev/null || true
+	for _ in 1 2 3 4 5 6 7 8 9 10; do running || break; sleep 0.3; done
+	running && kill -9 "$(cat "$pidfile")" 2> /dev/null
+	rm -f "$pidfile" "$home/run/name"
+	return 0
+}
+
+hop() {
+	local name=$1 keep=0 ram=4G cpus=4 dry=0 iso url disk accel
+	shift
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--keep) keep=1 ;;
+		--dry) dry=1 ;;
+		--ram) ram=$2; shift ;;
+		--cpus) cpus=$2; shift ;;
+		*) echo "distrohopper: unknown option $1" >&2; return 2 ;;
+		esac
+		shift
+	done
+	url=$(resolve "$name")
+	iso=$home/iso/$(basename "$url")
+	if [ ! -f "$iso" ] && [ $dry = 0 ]; then
+		echo "fetching $url"
+		curl -fL -C - --progress-bar -o "$iso.part" "$url" && mv "$iso.part" "$iso"
+	fi
+	[ -w /dev/kvm ] && accel=(-enable-kvm -cpu host) || accel=(-cpu max)
+	mkdir -p "$share"
+	# shellcheck disable=SC2054
+	local q=(qemu-system-x86_64 "${accel[@]}" -m "$ram" -smp "$cpus" -cdrom "$iso" -boot order=dc
+		-device virtio-vga-gl -display gtk,gl=on
+		-device qemu-xhci -device usb-tablet -nic user
+		-virtfs "local,path=$share,mount_tag=hop,security_model=none,id=hop"
+		-name "hop: $name" -pidfile "$pidfile")
+	if [ $keep = 1 ]; then
+		disk=$home/disk/$name.qcow2
+		[ -f "$disk" ] || { [ $dry = 1 ] || qemu-img create -q -f qcow2 "$disk" 32G; }
+		q+=(-drive "file=$disk,if=virtio,format=qcow2")
+	fi
+	if [ $dry = 1 ]; then
+		printf '%s\n' "${q[*]}"
+		return 0
+	fi
+	command -v qemu-system-x86_64 > /dev/null || { echo "distrohopper: qemu-system-x86_64 is not installed" >&2; return 1; }
+	stop
+	echo "$name" > "$home/run/name"
+	setsid -f "${q[@]}" > "$home/run/$name.log" 2>&1 < /dev/null
+	echo "hopped to $name (log: $home/run/$name.log)"
+}
+
+case ${1:-} in
+ls)
+	while IFS='|' read -r n what _; do
+		n=$(echo "$n" | xargs)
+		[ -n "$n" ] || continue
+		st=''
+		[ -f "$home/disk/$n.qcow2" ] && st="$st kept"
+		running && [ "$(cat "$home/run/name" 2> /dev/null)" = "$n" ] && st="$st running"
+		printf '%-16s %-34s%s\n' "$n" "$(echo "$what" | xargs)" "$st"
+	done < <(catalog)
+	;;
+hop) [ -n "${2:-}" ] || { echo "usage: distrohopper hop NAME [--keep] [--ram 4G] [--cpus 4] [--dry]" >&2; exit 2; }
+	hop "${@:2}" ;;
+url) resolve "${2:?usage: distrohopper url NAME}" ;;
+now) if running; then cat "$home/run/name"; else echo "nothing is running"; fi ;;
+stop) stop ;;
+rm) rm_name=${2:?usage: distrohopper rm NAME}; mv "$home/disk/$rm_name.qcow2" "${TMPDIR:-/tmp}/distrohopper-$rm_name.qcow2" 2> /dev/null && echo "moved to ${TMPDIR:-/tmp}" || echo "no kept disk for $rm_name" ;;
+-h | --help | help | '') sed -n '2,/^set -euo/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//' ;;
+*) echo "distrohopper: unknown command $1 (distrohopper help)" >&2; exit 2 ;;
+esac
+exit 0
+
+: << '#END'
+#CATALOG
+# name | what | dir or .iso address | regex of the file name (newest wins)
+arch | Arch, no desktop (archinstall) | https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso |
+void | Void, xfce | https://repo-default.voidlinux.org/live/current/ | void-live-x86_64-[0-9]+-xfce\.iso
+ubuntu | Ubuntu, GNOME | https://releases.ubuntu.com/noble/ | ubuntu-[0-9.]+-desktop-amd64\.iso
+kubuntu | Kubuntu, KDE Plasma | https://cdimage.ubuntu.com/kubuntu/releases/noble/release/ | kubuntu-[0-9.]+-desktop-amd64\.iso
+fedora-cinnamon | Fedora, Cinnamon | FEDORA | Fedora-Cinnamon-Live-[0-9.-]+\.x86_64\.iso
+fedora-kde | Fedora, KDE Plasma | FEDORA | Fedora-KDE-(Desktop-)?Live-[0-9.-]+\.x86_64\.iso
+#END
