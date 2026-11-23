@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# godot - the real godot CLI plus the project commands around it: scaffold, run, editor, import, check, test, bench,
+# export, the editor MCP server and a disposable copy to test in. Shipping is godot_publish.
+#
+#   godot new NAME         scaffold ./NAME: project.godot, scenes/main.tscn, scripts/main.gd, tests/test_main.gd,
+#                          tests/bench_main.gd, run/test/check/bench entry scripts, godot.conf, .gitignore, README.
+#                          Existing files are never overwritten.
+#   godot run [SCENE] [-- ARGS]
+#                          run the project in a window (SCENE is a res:// path or a file below the project)
+#   godot editor           open the project in the editor
+#   godot import           godot --headless --import: build .godot/ (needed once after a clone, and in CI)
+#   godot check            parse every .gd with --check-only, then load the project headless; names each bad file
+#   godot test [PATTERN]   run tests/test_*.gd headless, one process per file, then a summary. GUT or gdUnit4 under
+#                          addons/ is run instead when present. PATTERN filters by file name.
+#   godot bench [PATTERN]  run tests/bench_*.gd headless GODOT_BENCH_RUNS times each (default 3), print the best time
+#   godot export PRESET [OUT] [--debug]
+#                          godot --headless --export-release PRESET OUT (OUT defaults to build/PRESET). Uploading
+#                          is godot_publish.
+#   godot mcp [status|bridge]
+#                          status: which of the editor MCP server ports (9090-9094) listen. bridge: run the
+#                          project's godot-mcp-bridge.mjs with node (the file the MCP client starts).
+#   godot iso CMD [ARGS]   run any command above in a throwaway copy of the project (symlinks, its own .godot/), so
+#                          an import or a test never fights the editor for the real one. --keep leaves the copy.
+#   godot doctor           the binary and its version, the project, running editors, MCP ports, test frameworks
+#   godot raw ARGS         the real godot, untouched (godot raw --help is Godot's own help)
+#   godot ARGS             anything that is not a command above goes to the real godot unchanged, so
+#                          `godot --version`, `godot --headless -s x.gd` and `godot --path P -e` all work as before
+#   godot -h | --help
+#
+# Test files: tests/test_*.gd extend SceneTree, do the work in _init() and end with quit(0) or quit(1). A test fails
+# when its process exits non-zero or prints SCRIPT ERROR / Parse Error (a script that does not compile can still
+# exit 0). Bench files are the same shape and print their own numbers; this only adds the wall time.
+#
+# Settings (environment first, then godot.conf in the project root, lines KEY=value)
+#   GODOT_BIN          path of the real godot. Otherwise: godot.conf, then every `godot` on PATH that is not this
+#                      script, then ~/.local/share/godot/*/, ~/Downloads/Godot_v*_linux.x86_64 (newest wins)
+#   GODOT_BENCH_RUNS   runs per bench file (default 3)
+#   GODOT_FORCE=1      run a headless command although an editor has the same project open
+#
+# Running next to an open editor: two Godot processes on one project fight over .godot/ and its lock, and the crash
+# looks like a code bug. import, check, test, bench and export refuse (exit 3) while an editor is open on the
+# project; use `godot iso ...` or close it. GODOT_FORCE=1 overrides.
+#
+# Getting godot (nothing is installed by this script)
+#   an official build from https://godotengine.org/download or github.com/godotengine/godot/releases (a zip with one
+#   binary), or your distribution's package. Put it on PATH or point GODOT_BIN at it. Export also needs the export
+#   templates (Editor > Manage Export Templates, or the .tpz from the same releases page).
+#
+# Exit status: 0 done; 1 a check, test, bench, import or export failed; 2 bad usage; 3 something needed is missing
+# (godot, a project, tests, export presets, node) or an editor has the project open.
+#
+# Verified: the argument shapes of the commands against the fake godot in tests/godot.bats. Not verified against a
+# real godot yet: --check-only exit codes, GUT/gdUnit4 command lines, export flags.
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+set -u
+
+say() { printf 'godot: %s\n' "$*"; }
+warn() { printf 'godot: %s\n' "$*" >&2; }
+die() { local rc=$1; shift; printf 'godot: %s\n' "$*" >&2; exit "$rc"; }
+have() { command -v "$1" > /dev/null 2>&1; }
+
+SELF=$(readlink -f -- "$0")
+ROOT=''
+
+# find_root: the folder holding project.godot, here or above. Sets ROOT, empty when there is none.
+find_root() {
+	local d=$PWD
+	while [ -n "$d" ]; do
+		if [ -f "$d/project.godot" ]; then ROOT=$d; return 0; fi
+		[ "$d" = / ] && break
+		d=$(dirname -- "$d")
+	done
+	ROOT=''
+	return 1
+}
+
+need_project() {
+	find_root || die 3 "no project.godot here or above; run inside a project or 'godot new NAME' first"
+	cd -- "$ROOT" || die 1 "cannot enter $ROOT"
+}
+
+# conf KEY: the environment wins, then the last KEY=value line of godot.conf in the project root (never sourced).
+conf() {
+	local v=${!1:-}
+	if [ -z "$v" ] && [ -n "$ROOT" ] && [ -f "$ROOT/godot.conf" ]; then
+		v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$ROOT/godot.conf" | tail -n 1 | sed -E "s/[[:space:]]+\$//; s/^([\"'])(.*)\1\$/\2/")
+	fi
+	printf '%s' "$v"
+}
+
+# real_godot: print the path of the real binary, or return 1. This script may itself be named godot on PATH.
+real_godot() {
+	local c p
+	c=$(conf GODOT_BIN)
+	if [ -n "$c" ]; then
+		[ -x "$c" ] && [ "$(readlink -f -- "$c")" != "$SELF" ] && { printf '%s\n' "$c"; return 0; }
+		return 1
+	fi
+	while IFS= read -r p; do
+		[ -n "$p" ] && [ -x "$p" ] && [ "$(readlink -f -- "$p")" != "$SELF" ] && [ -f "$(readlink -f -- "$p")" ] && { printf '%s\n' "$p"; return 0; }
+	done < <(type -ap godot 2> /dev/null)
+	p=$(for c in "${HOME:-/nonexistent}"/.local/share/godot/*/Godot* "${HOME:-/nonexistent}"/Downloads/Godot_v*_linux.x86_64; do
+		case $c in *.zip | *.tpz) continue ;; esac
+		[ -f "$c" ] && printf '%s\n' "$c"
+	done | sort -V | tail -n 1)
+	if [ -n "$p" ] && [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
+	return 1
+}
+
+GODOT=''
+need_godot() {
+	GODOT=$(real_godot) || die 3 "no godot binary found. Set GODOT_BIN, or put one on PATH (official build from https://godotengine.org/download). Nothing was installed. 'godot doctor' shows what was looked at."
+}
+
+# editor_open: succeed when an editor process runs on this project (cwd or --path is the root).
+editor_open() {
+	local d cmd cwd
+	for d in /proc/[0-9]*; do
+		[ -r "$d/cmdline" ] || continue
+		cmd=$(tr '\0' ' ' < "$d/cmdline" 2> /dev/null) || continue
+		[[ $cmd =~ godot[^\ ]*\ .*(\ -e|\ --editor)(\ |$) ]] || continue
+		[ "${d#/proc/}" = "$$" ] && continue
+		cwd=$(readlink "$d/cwd" 2> /dev/null)
+		if [ "$cwd" = "$ROOT" ] || [[ $cmd == *"--path $ROOT "* ]]; then return 0; fi
+	done
+	return 1
+}
+
+# guard: a command that touches .godot/ refuses to run beside an open editor.
+guard() {
+	[ "${GODOT_FORCE:-}" = 1 ] && return 0
+	if editor_open; then
+		die 3 "an editor has $ROOT open; two Godot processes on one project fight over .godot/. Close it, run 'godot iso $1', or set GODOT_FORCE=1"
+	fi
+}
+
+# put FILE: write stdin to FILE unless it already exists (so 'new' can be run again safely).
+put() {
+	if [ -e "$1" ] || [ -L "$1" ]; then	# -L: a dangling symlink must not be written through
+		say "kept $1"
+		cat > /dev/null
+	else
+		{ mkdir -p -- "$(dirname -- "$1")" && cat > "$1"; } || die 1 "cannot write $1"
+		say "created $1"
+	fi
+}
+
+cmd_new() {
+	[ $# -eq 1 ] || die 2 "usage: godot new NAME"
+	local name=$1 feat=4.7 v
+	case $name in '' | *[!A-Za-z0-9_.-]* | -*) die 2 "NAME may hold letters, digits, _ . - and must not start with -: $name" ;; esac
+	if GODOT=$(real_godot) && v=$("$GODOT" --version 2> /dev/null | sed -n 's/^\([0-9]*\.[0-9]*\).*/\1/p' | head -n 1) && [ -n "$v" ]; then feat=$v; fi
+	mkdir -p -- "$name" || die 1 "cannot create $name"
+	cd -- "$name" || die 1 "cannot enter $name"
+	put project.godot << EOF
+config_version=5
+
+[application]
+
+config/name="$name"
+run/main_scene="res://scenes/main.tscn"
+config/features=PackedStringArray("$feat")
+EOF
+	put scenes/main.tscn << 'EOF'
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/main.gd" id="1"]
+
+[node name="Main" type="Node"]
+script = ExtResource("1")
+EOF
+	put scripts/main.gd << 'EOF'
+extends Node
+
+func greeting(who: String) -> String:
+	return "hello, " + who
+
+func _ready() -> void:
+	print(greeting("world"))
+EOF
+	put tests/test_main.gd << 'EOF'
+extends SceneTree
+
+# godot test: end with quit(0) on success or quit(1) on failure.
+
+func _init() -> void:
+	var main = load("res://scripts/main.gd").new()
+	var ok: bool = main.greeting("x") == "hello, x"
+	main.free()
+	print("test_main: ", "ok" if ok else "FAILED")
+	quit(0 if ok else 1)
+EOF
+	put tests/bench_main.gd << 'EOF'
+extends SceneTree
+
+# godot bench: print your own numbers, godot bench adds the wall time of the whole process.
+
+func _init() -> void:
+	var main = load("res://scripts/main.gd").new()
+	var t := Time.get_ticks_usec()
+	for i in 100000:
+		main.greeting("x")
+	print("greeting x100000: ", (Time.get_ticks_usec() - t) / 1000.0, " ms")
+	main.free()
+	quit(0)
+EOF
+	local e
+	for e in run test check bench; do
+		put "$e" << EOF
+#!/bin/sh
+exec godot $e
+EOF
+		[ -f "$e" ] && chmod +x "$e"
+	done
+	put godot.conf << 'EOF'
+# Settings for the godot helper (environment variables of the same name win).
+# GODOT_BIN=/path/to/godot
+# GODOT_BENCH_RUNS=3
+EOF
+	put .gitignore << 'EOF'
+.godot/
+build/
+*.translation
+godot.conf
+EOF
+	put README.md << EOF
+# $name
+
+A Godot project made with the \`godot\` helper.
+
+    godot run       run the project
+    godot editor    open it in the editor
+    godot test      tests/test_*.gd, headless
+    godot bench     tests/bench_*.gd, best of 3
+    godot check     parse every script, load the project
+    godot export PRESET   a build in build/
+EOF
+	say "ready: cd $name && godot run"
+}
+
+cmd_run() {
+	need_project
+	need_godot
+	local scene='' args=()
+	if [ $# -gt 0 ] && [ "$1" != -- ]; then scene=$1; shift; fi
+	[ "${1:-}" = -- ] && shift
+	args=("$@")
+	if [ -n "$scene" ]; then
+		case $scene in res://*) ;; *) scene=res://${scene#./} ;; esac
+		exec "$GODOT" --path "$ROOT" "$scene" "${args[@]}"
+	fi
+	exec "$GODOT" --path "$ROOT" "${args[@]}"
+}
+
+cmd_editor() {
+	[ $# -eq 0 ] || die 2 "usage: godot editor"
+	need_project
+	need_godot
+	exec "$GODOT" --path "$ROOT" --editor
+}
+
+cmd_import() {
+	[ $# -eq 0 ] || die 2 "usage: godot import"
+	need_project
+	need_godot
+	guard import
+	if "$GODOT" --headless --path "$ROOT" --import; then say "imported"; else die 1 "import failed"; fi
+}
+
+# gd_files DIR...: every .gd under the given folders, sorted, NUL separated.
+gd_files() {
+	find -L "$@" -name '*.gd' -type f -not -path '*/.godot/*' -print0 2> /dev/null | sort -z
+}
+
+cmd_check() {
+	[ $# -eq 0 ] || die 2 "usage: godot check"
+	need_project
+	need_godot
+	guard check
+	local rc=0 n=0 f out
+	while IFS= read -r -d '' f; do
+		n=$((n + 1))
+		if ! out=$("$GODOT" --headless --path "$ROOT" --check-only --script "res://${f#./}" 2>&1) || [[ $out == *"SCRIPT ERROR"* ]] || [[ $out == *"Parse Error"* ]]; then
+			warn "$f"
+			printf '%s\n' "$out" | sed 's/^/    /' >&2
+			rc=1
+		fi
+	done < <(cd "$ROOT" && gd_files . | sed -z 's|^\./||')
+	if [ "$n" -eq 0 ]; then say "no .gd files"; else [ "$rc" -eq 0 ] && say "scripts: $n ok"; fi
+	if "$GODOT" --headless --path "$ROOT" --quit > /dev/null 2>&1; then say "project loads"; else warn "the project does not load headless (run: godot --headless --path . --quit)"; rc=1; fi
+	exit "$rc"
+}
+
+# run_script FILE: run one script headless; prints its output, returns 0 only on a clean exit.
+run_script() {
+	local out rc=0
+	out=$("$GODOT" --headless --path "$ROOT" --script "res://$1" 2>&1) || rc=$?
+	if [ "$rc" -eq 0 ] && { [[ $out == *"SCRIPT ERROR"* ]] || [[ $out == *"Parse Error"* ]]; }; then rc=1; fi
+	LAST_OUT=$out
+	return "$rc"
+}
+
+cmd_test() {
+	[ $# -le 1 ] || die 2 "usage: godot test [PATTERN]"
+	need_project
+	need_godot
+	guard test
+	local pat=${1:-} pass=0 fail=0 f t0 ms rc
+	if [ -d addons/gut ]; then
+		say "GUT found: running it"
+		exec "$GODOT" --headless --path "$ROOT" -s addons/gut/gut_cmdln.gd -gdir=res://tests -gexit
+	elif [ -d addons/gdUnit4 ]; then
+		say "gdUnit4 found: running it"
+		exec "$GODOT" --headless --path "$ROOT" -s -d res://addons/gdUnit4/bin/GdUnitCmdTool.gd -a res://tests -c
+	fi
+	[ -d tests ] || die 3 "no tests/ folder (godot new writes an example)"
+	while IFS= read -r -d '' f; do
+		case $(basename -- "$f") in test_*.gd) ;; *) continue ;; esac
+		[ -z "$pat" ] || [[ $f == *"$pat"* ]] || continue
+		t0=$(date +%s%N)
+		rc=0; run_script "$f" || rc=$?
+		ms=$((($(date +%s%N) - t0) / 1000000))
+		if [ "$rc" -eq 0 ]; then
+			pass=$((pass + 1)); printf 'ok    %s (%d ms)\n' "$f" "$ms"
+		else
+			fail=$((fail + 1)); printf 'FAIL  %s (%d ms, exit %d)\n' "$f" "$ms" "$rc"
+			printf '%s\n' "$LAST_OUT" | sed 's/^/      /'
+		fi
+	done < <(gd_files tests)
+	[ $((pass + fail)) -gt 0 ] || die 3 "no tests/test_*.gd${pat:+ matching $pat}"
+	printf '%d passed, %d failed\n' "$pass" "$fail"
+	[ "$fail" -eq 0 ]
+}
+
+cmd_bench() {
+	[ $# -le 1 ] || die 2 "usage: godot bench [PATTERN]"
+	need_project
+	need_godot
+	guard bench
+	local pat=${1:-} runs n=0 f i t0 ms best rc bad=0 first
+	runs=$(conf GODOT_BENCH_RUNS); runs=${runs:-3}
+	case $runs in '' | *[!0-9]* | 0) die 2 "GODOT_BENCH_RUNS must be a positive number, not: $runs" ;; esac
+	[ -d tests ] || die 3 "no tests/ folder"
+	while IFS= read -r -d '' f; do
+		case $(basename -- "$f") in bench_*.gd) ;; *) continue ;; esac
+		[ -z "$pat" ] || [[ $f == *"$pat"* ]] || continue
+		n=$((n + 1)); best=''; first=''
+		for ((i = 0; i < runs; i++)); do
+			t0=$(date +%s%N)
+			rc=0; run_script "$f" || rc=$?
+			ms=$((($(date +%s%N) - t0) / 1000000))
+			[ "$i" -eq 0 ] && first=$LAST_OUT
+			if [ "$rc" -ne 0 ]; then bad=1; first=$LAST_OUT; break; fi
+			if [ -z "$best" ] || [ "$ms" -lt "$best" ]; then best=$ms; fi
+		done
+		if [ "$rc" -ne 0 ]; then printf 'FAIL  %s\n' "$f"; else printf 'bench %s  best %d ms of %d\n' "$f" "$best" "$runs"; fi
+		[ -n "$first" ] && printf '%s\n' "$first" | sed 's/^/      /'
+	done < <(gd_files tests)
+	[ "$n" -gt 0 ] || die 3 "no tests/bench_*.gd${pat:+ matching $pat}"
+	[ "$bad" -eq 0 ]
+}
+
+cmd_export() {
+	local preset='' out='' mode=--export-release arg
+	while [ $# -gt 0 ]; do
+		arg=$1
+		case $arg in
+		--debug) mode=--export-debug; shift ;;
+		-*) die 2 "unknown option: $arg (godot --help)" ;;
+		*) if [ -z "$preset" ]; then preset=$arg; elif [ -z "$out" ]; then out=$arg; else die 2 "usage: godot export PRESET [OUT] [--debug]"; fi; shift ;;
+		esac
+	done
+	[ -n "$preset" ] || die 2 "usage: godot export PRESET [OUT] [--debug]"
+	need_project
+	need_godot
+	guard export
+	[ -f export_presets.cfg ] || die 3 "no export_presets.cfg; make a preset in the editor (Project > Export) first"
+	grep -q "^name=\"$preset\"" export_presets.cfg || die 3 "no preset named $preset in export_presets.cfg ($(sed -n 's/^name="\(.*\)"/\1/p' export_presets.cfg | paste -sd, -))"
+	[ -n "$out" ] || out=build/$(printf '%s' "$preset" | tr -c 'A-Za-z0-9_.-' '_')
+	mkdir -p -- "$(dirname -- "$out")" || die 1 "cannot create the folder of $out"
+	if "$GODOT" --headless --path "$ROOT" "$mode" "$preset" "$out"; then say "exported $out"; else die 1 "export failed (are the export templates installed? see --help)"; fi
+}
+
+cmd_mcp() {
+	local sub=${1:-status}
+	case $sub in
+	status)
+		local p up=0
+		for p in 9090 9091 9092 9093 9094; do
+			if (exec 3<> "/dev/tcp/127.0.0.1/$p") 2> /dev/null; then printf '%s listening\n' "$p"; up=$((up + 1)); else printf '%s closed\n' "$p"; fi
+		done
+		say "$up editor MCP server(s) up (the toolbox godot_mcp_server tool starts one per open editor)"
+		;;
+	bridge)
+		find_root || true
+		local f=${GODOT_MCP_BRIDGE:-${ROOT:+$ROOT/godot-mcp-bridge.mjs}}
+		[ -n "$f" ] && [ -f "$f" ] || die 3 "no godot-mcp-bridge.mjs in the project (or set GODOT_MCP_BRIDGE)"
+		have node || die 3 "node is not installed"
+		exec node "$f"
+		;;
+	*) die 2 "usage: godot mcp [status|bridge]" ;;
+	esac
+}
+
+cmd_iso() {
+	local keep=0
+	if [ "${1:-}" = --keep ]; then keep=1; shift; fi
+	[ $# -ge 1 ] || die 2 "usage: godot iso [--keep] CMD [ARGS]"
+	case $1 in iso | new | mcp | raw | doctor) die 2 "iso is for commands that use the project: run import check test bench export" ;; esac
+	need_project
+	local tmp e rc=0
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/godot-iso.XXXXXX") || die 1 "cannot create a temporary folder"
+	for e in "$ROOT"/* "$ROOT"/.[!.]*; do
+		[ -e "$e" ] || [ -L "$e" ] || continue
+		case $(basename -- "$e") in .godot | .git) continue ;; esac
+		ln -s -- "$e" "$tmp/$(basename -- "$e")"
+	done
+	say "copy in $tmp"
+	(cd -- "$tmp" && exec "$SELF" "$@") || rc=$?
+	if [ "$keep" -eq 1 ]; then say "kept $tmp"; else rm -rf -- "$tmp"; fi
+	exit "$rc"
+}
+
+cmd_doctor() {
+	local g v p up=0
+	if g=$(real_godot); then
+		v=$("$g" --version 2> /dev/null | head -n 1)
+		say "godot: $g (${v:-version unknown})"
+	else
+		say "godot: none found. Looked at GODOT_BIN, godot.conf, every godot on PATH except this script, ~/.local/share/godot/, ~/Downloads/Godot_v*_linux.x86_64"
+		for p in $(type -ap godot 2> /dev/null); do [ -e "$p" ] || say "  dangling: $p"; done
+		[ -L "${HOME:-/nonexistent}/.local/bin/godot" ] && [ ! -e "${HOME:-/nonexistent}/.local/bin/godot" ] && say "  ~/.local/bin/godot is a symlink to a missing file: $(readlink "$HOME/.local/bin/godot")"
+	fi
+	if find_root; then
+		say "project: $ROOT ($(sed -n 's/^config\/name="\(.*\)"/\1/p' "$ROOT/project.godot" | head -n 1))"
+		if editor_open; then say "editor: open on this project (headless commands will refuse)"; else say "editor: not open on this project"; fi
+		[ -d "$ROOT/addons/gut" ] && say "tests: GUT"
+		[ -d "$ROOT/addons/gdUnit4" ] && say "tests: gdUnit4"
+		[ -d "$ROOT/addons/toolbox" ] && say "addons: toolbox"
+	else
+		say "project: none here"
+	fi
+	for p in 9090 9091 9092 9093 9094; do
+		if (exec 3<> "/dev/tcp/127.0.0.1/$p") 2> /dev/null; then up=$((up + 1)); fi
+	done
+	say "mcp: $up of 5 ports listening"
+}
+
+cmd_raw() {
+	need_godot
+	exec "$GODOT" "$@"
+}
+
+[ $# -ge 1 ] || { find_root || true; cmd_doctor; exit 0; }
+cmd=$1
+case $cmd in
+new | run | editor | import | check | test | bench | export | mcp | iso | doctor | raw)
+	shift
+	find_root || true
+	"cmd_$cmd" "$@"
+	;;
+*) # not ours: the real godot, untouched
+	need_godot
+	exec "$GODOT" "$@"
+	;;
+esac

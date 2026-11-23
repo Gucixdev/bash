@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# runall - run every check of every project in holyc and print one table: each project's tests, its lean4/run (the
+# proofs, their axiom audit and the differential tests against the C code), and with --full the rest: benchmarks.
+# Nothing is installed and nothing interactive starts: nnn/build (it installs to ~/.local/bin) is replaced by plain make.
+#
+#   tools/runall                    tests and proofs of every project
+#   tools/runall --full             everything, including benchmarks
+#   tools/runall core nnn           only these projects (with or without --full)
+#   STEP_TIMEOUT=7200 tools/runall          per-step limit in seconds (default 3600)
+#
+# Each step's output goes to .runall/STAMP/PROJECT-STEP.log, the table also to .runall/STAMP/summary.tsv. Exit 0
+# when every step passed. Needs what the projects need: gcc, clang, make, python3, the X11/Wayland headers for
+# the desktop, ncurses for nnn, elan for lean4/.
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 2
+root=$PWD
+
+full=0
+[[ ${1:-} == --full ]] && { full=1; shift; }
+[[ ${1:-} == -h || ${1:-} == --help ]] && { sed -n '2,18s/^# \{0,1\}//p' "$0"; exit 0; }
+want=" $* "
+timeout_s=${STEP_TIMEOUT:-3600}
+logs=$root/.runall/$(date +%Y%m%d-%H%M%S)
+mkdir -p "$logs"
+export PATH="$HOME/.elan/bin:$PATH"
+fail=0
+
+# PROJECT STEP CMD... : run CMD in PROJECT with the step timeout, one table row
+step() {
+    local proj=$1 name=$2 log rc t0 t1 note status
+    shift 2
+    log=$logs/$proj-$name.log
+    t0=$(date +%s)
+    (cd "$root/$proj" && timeout "$timeout_s" "$@") > "$log" 2>&1
+    rc=$?
+    t1=$(date +%s)
+    note=$(grep -v '^[[:space:]]*$' "$log" | tail -1 | tr -s ' \t' ' ' | cut -c1-70)
+    case $rc in
+        0) status=ok ;;
+        124) status=TIMEOUT; fail=1 ;;
+        *) status=FAIL; fail=1 ;;
+    esac
+    printf '%-13s %-8s %-7s %6ss  %s\n' "$proj" "$name" "$status" "$((t1 - t0))" "$note"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$proj" "$name" "$status" "$((t1 - t0))" "$note" >> "$logs/summary.tsv"
+}
+
+picked() { [[ $want == "  " || $want == *" $1 "* ]]; }
+
+printf '%-13s %-8s %-7s %7s  %s\n' PROJECT STEP RESULT TIME 'LAST LINE OF THE LOG'
+for proj in lean4 core desktop nnn notcoreutils; do
+    picked "$proj" || continue
+    case $proj in
+        lean4)        step lean4 lib ./run ;;  # the shared Lean library every lean4/ builds on
+        core)         step core tests sh tests/run
+                      (( full )) && step core bench make bench ;;
+        desktop|nnn)
+                      step "$proj" build make ;;
+        notcoreutils)
+                      step "$proj" tests make test ;;
+    esac
+    [[ -x $root/$proj/lean4/run ]] && step "$proj" lean4 lean4/run
+done
+echo "logs: $logs"
+exit "$fail"

@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# godot_publish - send a Godot export somewhere: itch.io with butler, a GitHub release with gh, or a zip.
+#
+#   godot_publish itch   [DIR] [--yes]            butler push DIR USER/GAME:CHANNEL
+#   godot_publish github [DIR] [--yes] [--create] zip DIR, then gh release upload TAG ZIP --clobber
+#                                                 (--create: gh release create TAG ZIP --generate-notes)
+#   godot_publish zip    [DIR] [--yes]            only build/NAME-PRESET.zip, nothing leaves the machine
+#   godot_publish -h | --help
+#
+# DIR is the folder `godot export PRESET` filled, default build/ (or $GODOT_PUBLISH_DIR). Every target is a DRY RUN
+# unless --yes: it prints the command it would run, with the key masked, and runs nothing. Split from `godot` so
+# exporting and testing never carry an upload key around. Run inside the project folder. Nothing asks a question.
+#
+# Settings (environment first, then godot.conf in the project root, lines KEY=value)
+#   GODOT_ITCH_TARGET    user/game on itch.io (itch)
+#   GODOT_ITCH_CHANNEL   butler channel, default linux (itch)
+#   GODOT_RELEASE_TAG    tag of the GitHub release, e.g. v0.3.0 (github)
+#   GODOT_PUBLISH_DIR    default DIR
+#   BUTLER_API_KEY       env, or a line BUTLER_API_KEY=... in ~/.secrets; given to butler through its environment,
+#                        never on the command line, never printed. gh uses its own login (gh auth login).
+#
+# Getting the tools (nothing is installed by this script)
+#   butler   https://itch.io/docs/butler/ (a zip with one binary)    gh   https://cli.github.com/    zip   zip(1)
+#
+# Exit status: 0 done (or a dry run); 1 the upload failed; 2 bad usage; 3 something needed is missing (project,
+# export folder, settings, key, tool).
+#
+# Not verified against the real services: the command lines follow butler's and gh's documented syntax.
+
+case ${1:-} in -h | --help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+
+set -u
+
+say() { printf 'godot_publish: %s\n' "$*"; }
+die() { local rc=$1; shift; printf 'godot_publish: %s\n' "$*" >&2; exit "$rc"; }
+have() { command -v "$1" > /dev/null 2>&1; }
+
+ROOT=''
+find_root() {
+	local d=$PWD
+	while [ -n "$d" ]; do
+		if [ -f "$d/project.godot" ]; then ROOT=$d; return 0; fi
+		[ "$d" = / ] && break
+		d=$(dirname -- "$d")
+	done
+	return 1
+}
+
+conf() {
+	local v=${!1:-}
+	if [ -z "$v" ] && [ -n "$ROOT" ] && [ -f "$ROOT/godot.conf" ]; then
+		v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$ROOT/godot.conf" | tail -n 1 | sed -E "s/[[:space:]]+\$//; s/^([\"'])(.*)\1\$/\2/")
+	fi
+	printf '%s' "$v"
+}
+
+butler_key() {
+	local v=${BUTLER_API_KEY:-}
+	if [ -z "$v" ] && [ -f "${HOME:-/nonexistent}/.secrets" ]; then
+		v=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?BUTLER_API_KEY=//p' "$HOME/.secrets" | tail -n 1 |
+			sed -E "s/[[:space:]]+\$//; s/^([\"'])(.*)\1\$/\2/")
+	fi
+	printf '%s' "$v"
+}
+
+[ $# -ge 1 ] || die 2 "usage: godot_publish itch|github|zip [DIR] [--yes] (godot_publish --help)"
+target=$1; shift
+case $target in itch | github | zip) ;; *) die 2 "unknown target: $target (itch, github or zip)" ;; esac
+
+yes=0 create=0 dir=''
+while [ $# -gt 0 ]; do
+	case $1 in
+	--yes) yes=1 ;;
+	--create) create=1 ;;
+	-*) die 2 "unknown option: $1 (godot_publish --help)" ;;
+	*) [ -z "$dir" ] || die 2 "one DIR only"; dir=$1 ;;
+	esac
+	shift
+done
+
+find_root || die 3 "no project.godot here or above; run inside a project"
+cd -- "$ROOT" || die 1 "cannot enter $ROOT"
+name=$(sed -n 's/^config\/name="\(.*\)"/\1/p' project.godot | head -n 1)
+name=$(printf '%s' "${name:-game}" | tr -c 'A-Za-z0-9_.-' '_')
+[ -n "$dir" ] || dir=$(conf GODOT_PUBLISH_DIR)
+[ -n "$dir" ] || dir=build
+[ -d "$dir" ] || die 3 "no export folder $dir; run 'godot export PRESET' first (or pass DIR)"
+[ -n "$(find "$dir" -mindepth 1 -type f -print -quit)" ] || die 3 "$dir is empty; run 'godot export PRESET' first"
+zipfile=$(dirname -- "$dir")/$name-$(basename -- "$dir").zip
+[ "$(dirname -- "$dir")" = . ] && zipfile=$name-$(basename -- "$dir").zip
+
+do_zip() {
+	have zip || die 3 "zip is not installed"
+	rm -f -- "$zipfile"	# zip -r would add to an old archive
+	(cd -- "$dir" && zip -q -r "$OLDPWD/$zipfile" .) || die 1 "zip failed"
+	say "wrote $zipfile"
+}
+
+case $target in
+zip)
+	if [ "$yes" -eq 0 ]; then say "DRY RUN: nothing is written. Add --yes."; printf '  zip -r %s %s\n' "$zipfile" "$dir"; exit 0; fi
+	do_zip
+	;;
+itch)
+	itch=$(conf GODOT_ITCH_TARGET)
+	chan=$(conf GODOT_ITCH_CHANNEL); chan=${chan:-linux}
+	case $itch in */?*) ;; *) die 3 "GODOT_ITCH_TARGET must be user/game (environment or godot.conf), not: ${itch:-empty}" ;; esac
+	case $itch$chan in *[!A-Za-z0-9_./:-]*) die 3 "GODOT_ITCH_TARGET or GODOT_ITCH_CHANNEL has unexpected characters" ;; esac
+	key=$(butler_key)
+	if [ "$yes" -eq 0 ]; then
+		say "DRY RUN: nothing is sent. Add --yes to upload."
+		printf '  butler push %s %s:%s\n' "$dir" "$itch" "$chan"
+		if [ -n "$key" ]; then printf '  BUTLER_API_KEY=********\n'; else printf '  BUTLER_API_KEY: (no key found: set it or put it in ~/.secrets)\n'; fi
+		exit 0
+	fi
+	[ -n "$key" ] || die 3 "no key: set BUTLER_API_KEY or add BUTLER_API_KEY=... to ~/.secrets"
+	have butler || die 3 "butler is not installed (https://itch.io/docs/butler/). Nothing was installed."
+	say "pushing $dir to $itch:$chan"
+	BUTLER_API_KEY=$key butler push "$dir" "$itch:$chan" || die 1 "butler push failed"
+	say "done"
+	;;
+github)
+	tag=$(conf GODOT_RELEASE_TAG)
+	case $tag in '' | *[!A-Za-z0-9_.+-]*) die 3 "GODOT_RELEASE_TAG missing or has unexpected characters (environment or godot.conf)" ;; esac
+	if [ "$yes" -eq 0 ]; then
+		say "DRY RUN: nothing is sent. Add --yes to upload."
+		printf '  zip -r %s %s\n' "$zipfile" "$dir"
+		if [ "$create" -eq 1 ]; then printf '  gh release create %s %s --generate-notes\n' "$tag" "$zipfile"
+		else printf '  gh release upload %s %s --clobber\n' "$tag" "$zipfile"; fi
+		exit 0
+	fi
+	have gh || die 3 "gh is not installed (https://cli.github.com/). Nothing was installed."
+	do_zip
+	if [ "$create" -eq 1 ]; then
+		gh release create "$tag" "$zipfile" --generate-notes || die 1 "gh release create failed"
+	else
+		gh release upload "$tag" "$zipfile" --clobber || die 1 "gh release upload failed (does the release exist? --create makes it)"
+	fi
+	say "done"
+	;;
+esac
