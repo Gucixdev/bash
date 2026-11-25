@@ -12,6 +12,10 @@
 #   gh lens [REPO|URL [PATH [REF]]] [--search QUERY]
 #                          a repo's files without cloning it: read, grab files and folders, search its code;
 #                          no REPO: the GitHub repo behind this one's origin (also spelled lense)
+#   gh peek REPO|URL [PATH [REF]] [-n LINES] [-g PATTERN]
+#                          look at a repo without a terminal UI and without saving anything: no PATH lists the top of
+#                          the repo and its README, a folder lists its entries, a file prints its first 200 lines
+#                          numbered (-n 0: all, -g: only the lines that match); a binary file says so
 #   gh grab REPO|URL [PATH [REF]] [-o OUT] [-f]
 #                          no PATH: a shallow clone; PATH: one file, never overwritten without -f (-o - prints
 #                          it); a blob, raw or tree URL picks the file or folder itself
@@ -507,6 +511,60 @@ grab() {
 		echo "gh: could not fetch $url (wrong path or ref, a folder - gh grabdir - or a private repo without a token)" >&2
 		exit 1
 	fi
+}
+
+peek() {   # REPO|URL [PATH [REF]] [-n LINES] [-g PATTERN] -> a folder's listing or a file's text, nothing is saved
+	_pn=200 _pg= n=0 a1= a2= a3=
+	while [ $# -gt 0 ]; do
+		case $1 in
+			-n) [ $# -ge 2 ] || usage "peek REPO|URL [PATH [REF]] [-n LINES] [-g PATTERN]"; _pn=$2; shift ;;
+			-g) [ $# -ge 2 ] || usage "peek REPO|URL [PATH [REF]] [-n LINES] [-g PATTERN]"; _pg=$2; shift ;;
+			-?*) echo "gh: unknown option $1" >&2; exit 2 ;;
+			*) n=$((n + 1)); case $n in 1) a1=$1 ;; 2) a2=$1 ;; 3) a3=$1 ;; esac ;;
+		esac
+		shift
+	done
+	[ "$n" -ge 1 ] && [ "$n" -le 3 ] || usage "peek REPO|URL [PATH [REF]] [-n LINES] [-g PATTERN]"
+	case $_pn in '' | *[!0-9]*) die "-n needs a number of lines (0 is all of them)" ;; esac
+	case $a1 in
+		*github.com/*/blob/* | *github.com/*/tree/*)   # a browser URL: its ref is the part before the first /
+			_r=${a1#*github.com/}; _o=${_r%%/*}; _r=${_r#*/}; _nm=${_r%%/*}; _r=${_r#*/}; _r=${_r#*/}
+			_r=${_r%%[?#]*}; a3=${_r%%/*}; a2=${_r#*/}; [ "$a2" != "$_r" ] || a2=
+			r=$_o/$_nm ;;
+		*) r=$(full "$a1") || exit 2 ;;
+	esac
+	token
+	_q="repos/$r/contents"; [ -z "$a2" ] || _q="$_q/$(urlpath "$a2")"
+	[ -z "$a3" ] || _q="$_q?ref=$(urlenc "$a3")"
+	_pj=$(api GET "$_q") || exit 1
+	_pt=$(printf '%s' "$_pj" | json_rows 'if type == "array" then "dir" else .type end' 'print("dir" if isinstance(d, list) else d.get("type", ""))')
+	if [ "$_pt" = dir ]; then
+		printf '%s' "$_pj" | json_rows '.[] | [(if .type == "dir" then "d" else "f" end), (.size | tostring), .path] | @tsv' \
+			'for e in d: print("\t".join(["d" if e["type"] == "dir" else "f", str(e.get("size", 0)), e["path"]]))' |
+			awk -F'\t' '{ printf "%s %9s  %s%s\n", $1, $2, $3, ($1 == "d" ? "/" : "") }'
+		if [ -z "$a2" ]; then   # the top of a repo: its README as well, the part people read first
+			_pm=$(fetch "$RAW/$r/${a3:-HEAD}/README.md" 2>/dev/null | head -n 40) &&
+				[ -n "$_pm" ] && printf '\n--- README.md (first 40 lines)\n%s\n' "$_pm"
+		fi
+		return 0
+	fi
+	[ "$_pt" = file ] || die "$a2 is a $_pt, not a file or a folder"
+	_ptmp=$(mktemp) || exit 1
+	if ! fetch "$RAW/$r/${a3:-HEAD}/$(urlpath "$a2")" >"$_ptmp"; then
+		rm -f "$_ptmp"; die "could not fetch $a2 (wrong ref, or a private repo without a token)"
+	fi
+	if [ "$(head -c 8192 "$_ptmp" | wc -c)" != "$(head -c 8192 "$_ptmp" | tr -d '\000' | wc -c)" ]; then
+		echo "(binary, $(wc -c <"$_ptmp") bytes - gh grab $r $a2 saves it)"
+	elif [ -n "$_pg" ]; then
+		grep -n -- "$_pg" "$_ptmp" || echo "(no line matches $_pg)" >&2
+	elif [ "$_pn" = 0 ]; then
+		cat -n "$_ptmp"
+	else
+		head -n "$_pn" "$_ptmp" | cat -n
+		_pl=$(wc -l <"$_ptmp")
+		[ "$_pl" -le "$_pn" ] || echo "... $((_pl - _pn)) more lines (-n 0 for all, -g PATTERN to search)" >&2
+	fi
+	rm -f "$_ptmp"
 }
 
 clone() {   # OWNER/NAME [DEST] -> a shallow clone
@@ -1155,6 +1213,7 @@ case $cmd in
 		interactive || real search "$@"
 		view_search "$@" ;;
 	lens | lense) view_lens "$@" ;;
+	peek) peek "$@" ;;
 	grab) grab "$@" ;;
 	grabdir) grabdir "$@" ;;
 	create) create "$@" ;;
